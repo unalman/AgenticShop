@@ -1,0 +1,103 @@
+@host = http://localhost:5082
+@productId = 11111111-1111-1111-1111-111111111111
+@orderId = 22222222-2222-2222-2222-222222222222
+
+### Health
+GET {{host}}/health
+
+### Provision stock for a product
+# Stock does not resolve productId against Catalog: it is a leaf service.
+# @name setStock
+POST {{host}}/api/v1/stock
+Content-Type: application/json
+X-Correlation-Id: stock-smoke
+
+{
+  "productId": "{{productId}}",
+  "quantityOnHand": 10
+}
+
+### Provisioning the same product again -> 409
+POST {{host}}/api/v1/stock
+Content-Type: application/json
+
+{
+  "productId": "{{productId}}",
+  "quantityOnHand": 5
+}
+
+### Read the position
+GET {{host}}/api/v1/stock/{{productId}}
+
+### Update the physical count (cannot go below what is reserved)
+PUT {{host}}/api/v1/stock/{{productId}}
+Content-Type: application/json
+
+{
+  "quantityOnHand": 25
+}
+
+### Reserve 4 units for an order
+# @name reserve
+POST {{host}}/api/v1/stock/{{productId}}/reservations
+Content-Type: application/json
+
+{
+  "orderId": "{{orderId}}",
+  "quantity": 4
+}
+
+### Reserve again for the same order and product -> 409 (natural idempotency)
+POST {{host}}/api/v1/stock/{{productId}}/reservations
+Content-Type: application/json
+
+{
+  "orderId": "{{orderId}}",
+  "quantity": 4
+}
+
+### Reserve more than is available -> 409 with both numbers
+POST {{host}}/api/v1/stock/{{productId}}/reservations
+Content-Type: application/json
+
+{
+  "orderId": "33333333-3333-3333-3333-333333333333",
+  "quantity": 100000
+}
+
+### List every reservation for an order (the compensation path)
+GET {{host}}/api/v1/reservations?orderId={{orderId}}
+
+### List without an orderId -> 400
+GET {{host}}/api/v1/reservations
+
+### Confirm a reservation -> on-hand and reserved both drop
+# Replace the id with the one returned by `reserve`.
+POST {{host}}/api/v1/reservations/00000000-0000-0000-0000-000000000000/confirm
+
+### Confirm the same reservation again -> 409 already confirmed
+POST {{host}}/api/v1/reservations/00000000-0000-0000-0000-000000000000/confirm
+
+### Release a reservation -> reserved drops, on-hand untouched
+POST {{host}}/api/v1/reservations/00000000-0000-0000-0000-000000000000/release
+
+### Unknown reservation -> 404
+POST {{host}}/api/v1/reservations/44444444-4444-4444-4444-444444444444/confirm
+
+### Unknown product -> 404
+GET {{host}}/api/v1/stock/55555555-5555-5555-5555-555555555555
+
+### Negative quantity -> 400 ValidationProblemDetails
+POST {{host}}/api/v1/stock
+Content-Type: application/json
+
+{
+  "productId": "66666666-6666-6666-6666-666666666666",
+  "quantityOnHand": -5
+}
+
+### Malformed JSON -> 400 ProblemDetails (never a 500)
+POST {{host}}/api/v1/stock
+Content-Type: application/json
+
+{

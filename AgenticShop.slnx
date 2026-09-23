@@ -1,9 +1,12 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/AgenticShop.Catalog/AgenticShop.Catalog.csproj" />
+    <Project Path="src/AgenticShop.Stock/AgenticShop.Stock.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/AgenticShop.Catalog.IntegrationTests/AgenticShop.Catalog.IntegrationTests.csproj" />
     <Project Path="tests/AgenticShop.Catalog.UnitTests/AgenticShop.Catalog.UnitTests.csproj" />
+    <Project Path="tests/AgenticShop.Stock.IntegrationTests/AgenticShop.Stock.IntegrationTests.csproj" />
+    <Project Path="tests/AgenticShop.Stock.UnitTests/AgenticShop.Stock.UnitTests.csproj" />
   </Folder>
 </Solution>
