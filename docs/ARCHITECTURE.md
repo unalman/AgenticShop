@@ -21,8 +21,12 @@ Three independently deployed ASP.NET Core hosts communicating over HTTP only:
 | Service | Port | Database | Role | Status |
 |---|---|---|---|---|
 | Catalog | 5081 | `agenticshop_catalog` | `catalog_svc` | **implemented** |
-| Stock | 5082 | `agenticshop_stock` | `stock_svc` | not created |
+| Stock | 5082 | `agenticshop_stock` | `stock_svc` | **implemented** |
 | Ordering | 5083 | `agenticshop_ordering` | `ordering_svc` | not created |
+
+Catalog is the reference implementation (§4); Stock is the worked example of adapting it (§5),
+and its five deliberate divergences are the evidence that the conventions transfer rather than
+merely copy.
 
 Ports are fixed in each service's `Properties/launchSettings.json` so cross-service
 configuration never drifts. In Phase 0 only PostgreSQL is containerised; the APIs run on the
@@ -434,7 +438,237 @@ disagree with the page under concurrent writes. Standard for offset paging and a
 
 ---
 
-## 5. Testing architecture
+## 5. Stock service
+
+The second service, and the test of whether Catalog's conventions transfer rather than merely
+copy. Stock owns inventory: it holds quantity against an order, then settles that hold as either
+shipped or cancelled.
+
+### 5.1 Position in the topology — a leaf service
+
+**Stock makes no outbound calls.** It has no `Clients/` folder, registers no `HttpClient` or
+`IHttpClientFactory`, and never resolves a product against Catalog. Only Ordering orchestrates.
+
+This is enforced at three levels: `Directory.Build.targets` rejects a compile-time reference;
+`LeafServiceBoundaryTests` asserts at runtime that no `HttpClient`/`IHttpClientFactory` is
+registered and that the assembly references no other `AgenticShop.*` assembly; and PostgreSQL
+refuses `catalog_svc` a connection to `agenticshop_stock`.
+
+Consequences accepted deliberately: Stock cannot tell you whether a product exists, so you *can*
+provision stock for a nonexistent `ProductId`. That is tolerable because the only caller in the
+real flow is Ordering, which validates against Catalog first. Stock also never learns a product's
+name or price — snapshotting those is Ordering's job.
+
+### 5.2 Domain
+
+`StockItem` — the inventory counter, one row per product:
+
+| Member | Notes |
+|---|---|
+| `ProductId` | **unique**; a plain `Guid`, because the product lives in Catalog's database |
+| `QuantityOnHand` | physical count |
+| `Reserved` | currently held, not yet shipped |
+| `Available` | **computed** `QuantityOnHand - Reserved`; `builder.Ignore`d, never persisted |
+| `MaxQuantity` | `1_000_000`, shared with the contracts so the counters cannot overflow `int` |
+
+Methods `Create`, `SetQuantityOnHand`, `Reserve`, `ConfirmReservation`, `ReleaseReservation`, all
+with guards before mutation. `SetQuantityOnHand` refuses to go below `Reserved`, or in-flight holds
+would stop being coverable.
+
+`StockReservation` — one row per hold: `StockItemId`, `OrderId`, `Quantity`, `Status`, timestamps,
+plus a computed `IsPending`. No navigation property to `StockItem`; endpoints load both explicitly.
+
+Two domain exceptions carry **typed properties rather than relying on `Message`**:
+`InsufficientStockException(Available, Requested)` and
+`InvalidReservationStateException(CurrentStatus, AttemptedStatus)`. The handler builds client-facing
+text from those properties, so a reworded exception cannot silently change the public contract.
+
+### 5.3 Why `Reserved` is a stored column
+
+It could be derived as `SUM(quantity)` over pending reservations. It is stored instead because that
+keeps the availability check and the mutation a **single-row operation guarded by one `xmin`
+token**. Deriving it would require an aggregate read plus a write in one transaction, and
+`StockItem`'s token would no longer cover reservation changes.
+
+The reservation table is the *audit trail of intent*; `Reserved` is the *counter that makes the
+check atomic*. Both are written by the **same `SaveChangesAsync`**, so they cannot disagree — and
+that single-transaction property is precisely what Phase 2's outbox will rely on, since an outbox
+row added to this context would commit atomically with both.
+
+### 5.4 Reservation lifecycle
+
+```
+                 reserve(q)
+   (no row) ─────────────────► PENDING
+                                 │  │
+                    confirm(q)   │  │   release(q)
+                                 ▼  ▼
+                           CONFIRMED  RELEASED      ← both terminal
+```
+
+| Transition | Effect on `StockItem` | Rationale |
+|---|---|---|
+| `reserve(q)` | `Reserved += q` | Holds the goods. `Available` drops immediately; `QuantityOnHand` is untouched |
+| `confirm(q)` | `QuantityOnHand -= q`, `Reserved -= q` | Goods leave. `Available` is unchanged — it already fell at reserve time |
+| `release(q)` | `Reserved -= q` | Order cancelled; hold lifted, `QuantityOnHand` untouched |
+
+`Reserved <= QuantityOnHand` holds after all three, so `Available` can never go negative.
+
+**Transitions are strict, not idempotent.** Confirming an already-`Confirmed` or `Released`
+reservation throws rather than succeeding quietly, because a silent no-op would hide a
+double-settle from the caller. The known cost: a retry after a successful confirm gets a 409.
+Phase 2's at-least-once delivery will require idempotency — that is what Phase 1's idempotency
+keys and the Inbox exist for. Until then **Ordering must treat "409 because already confirmed" as
+success.**
+
+There is no reservation expiry: no `ExpiresAtUtc`, no background worker. Release is an explicit
+call only. The expiry worker is Phase 3.
+
+### 5.5 Schema
+
+```
+stock_items
+  id                uuid         PK
+  product_id        uuid         NOT NULL, UNIQUE  (ix_stock_items_product_id)
+  quantity_on_hand  integer      NOT NULL   CHECK >= 0
+  reserved          integer      NOT NULL   CHECK >= 0, CHECK <= quantity_on_hand
+  updated_at_utc    timestamptz  NOT NULL
+  xmin              (system column — emits no DDL)
+
+stock_reservations
+  id              uuid         PK
+  stock_item_id   uuid         NOT NULL  FK → stock_items(id) ON DELETE RESTRICT
+  order_id        uuid         NOT NULL
+  quantity        integer      NOT NULL   CHECK > 0
+  status          varchar(20)  NOT NULL   CHECK IN ('Pending','Confirmed','Released')
+  created_at_utc  timestamptz  NOT NULL
+  updated_at_utc  timestamptz  NOT NULL
+  xmin            (system column — emits no DDL)
+  UNIQUE (order_id, stock_item_id)   ix_stock_reservations_order_id_stock_item_id
+  INDEX  (order_id)                  ix_stock_reservations_order_id
+```
+
+Two indexes carry real weight:
+
+- **`UNIQUE(order_id, stock_item_id)`** gives reserve natural idempotency, exactly as Catalog's
+  unique SKU does. Because `stock_items.product_id` is itself unique, `stock_item_id` is 1:1 with
+  `product_id` — so this enforces *one reservation per product per order* **without denormalising
+  `ProductId` onto the reservation**. A side effect worth stating: Ordering must combine duplicate
+  product lines.
+- **`INDEX(order_id)`** supports listing and releasing every reservation for an order — the
+  compensation path.
+
+The foreign key is legitimate *because both tables are in Stock's own database*. The prohibition is
+on keys crossing a service boundary, not on relational integrity within one.
+
+Status is stored as a **string** with a `CHECK`, so `psql` shows `Pending` rather than `0`. Being
+able to read reservation state directly matters once Phase 2 adds sagas. Cost: a
+`HasConversion<string>()` and a `varchar(20)`.
+
+Migration `20260923190112_InitialStock`, applied as `stock_svc`. Verified against the live
+database: `information_schema.columns` returns **0 rows for `xmin`** on both tables, and all three
+`stock_items` CHECK constraints are present in `pg_constraint`.
+
+### 5.6 Endpoints
+
+```
+GET    /api/v1/stock/{productId}                       200 | 404
+POST   /api/v1/stock                                   201 | 409 record exists | 400
+PUT    /api/v1/stock/{productId}                       200 | 404 | 409 xmin | 400
+POST   /api/v1/stock/{productId}/reservations          201 | 404 | 409 insufficient|duplicate | 400
+POST   /api/v1/reservations/{id}/confirm               200 | 404 | 409 wrong state|xmin
+POST   /api/v1/reservations/{id}/release               200 | 404 | 409 wrong state|xmin
+GET    /api/v1/reservations?orderId=                   200 | 400 when orderId missing
+GET    /health                                         200
+```
+
+There is **no list or paging endpoint for stock**. Catalog's paging convention is deliberately
+unexercised here; adding it "for symmetry" would be exactly the speculative generality the project
+avoids. `GET /reservations?orderId=` exists because it is cheap, indexed, and is the reconciliation
+path for a half-failed order.
+
+`orderId` is a required parameter, so omitting it is a `BadHttpRequestException` binding failure
+→ 400 from the handler, not a 500 and not an unbounded scan.
+
+### 5.7 Concurrency design
+
+Both entities carry the token:
+
+```csharp
+builder.Property<uint>("xmin").IsConcurrencyToken().ValueGeneratedOnAddOrUpdate();
+```
+
+How it prevents overselling: two requests both read `xmin=5`, `Available=5`, and both try to
+reserve 5. The first commits (`xmin` → 6). The second's `UPDATE ... WHERE id=@id AND xmin=5`
+matches zero rows → `DbUpdateConcurrencyException` → **409**. Without the token both would succeed
+and stock would go negative.
+
+**There is no server-side retry on conflict.** Resilience libraries are Phase 1, and the 409 is the
+honest signal that Ordering must learn to handle. It is also largely dissolved by Phase 2 — a queue
+with a single consumer serialises reservations, so contention disappears rather than being retried
+away.
+
+The measured cost, from a live 40-way burst against 10 units:
+
+```
+201=4   409=36   5xx=0   other=0   total=40
+reserved=4   quantity_on_hand=10   available=6
+pending reservation rows=4   sum(quantity)=4
+```
+
+**Only 4 of 10 units were held.** Safety is perfect; liveness under burst is poor, because 36
+requests lost the `xmin` race and were told 409 despite stock being available. A 20-way parallel
+confirm of one reservation produced `200=1, 409=19, 5xx=0` and shipped exactly once.
+
+This is the single most important input to the Ordering design: a synchronous order placement that
+reserves line by line will fail often under load, and Ordering must decide whether to retry,
+partial-fill, or fail the order.
+
+### 5.8 Divergences from Catalog
+
+Each was the right call for this service, and each is the evidence that the conventions transfer:
+
+| Catalog | Stock | Why |
+|---|---|---|
+| soft delete + `HasQueryFilter` | **none** | a filtered stock row reads as "no stock", which is more dangerous than a deleted product |
+| offset paging + `ProductPage` | **no list endpoint** | nothing needed it |
+| `decimal` money + currency | **`int` counters only** | stock is not money |
+| light concurrency test | **parallel overselling tests** | on `Product` a missed token loses a price edit; on `StockItem` it oversells |
+| DTO-limit vs column-limit guard | **enum/CHECK and bound guards** | copying the original verbatim would have matched nothing and passed vacuously |
+
+Copied verbatim, namespace only: `DataAnnotationValidationFilter`, `CorrelationIdMiddleware`,
+`IRequestContract`, the test harness, and the error-handler skeleton.
+
+### 5.9 Error classification specific to Stock
+
+| Case | Status | Note |
+|---|---|---|
+| `InsufficientStockException` | 409 | detail built from `Available`/`Requested` |
+| `InvalidReservationStateException` | 409 | detail names both states |
+| `DbUpdateConcurrencyException` | 409 | Stock-specific wording, not Catalog's "product" |
+| `23505` on `ix_stock_items_product_id` | 409 | "A stock record for that product already exists." |
+| `23505` on `ix_stock_reservations_order_id_stock_item_id` | 409 | "That order already has a reservation for this product." |
+| **`23514` CHECK violation** | **500** | deliberate — see below |
+
+**The CHECK-violation mapping reverses the original Stock plan**, which called for a 4xx. Every
+CHECK on these tables restates an invariant `StockItem` already guards, and `xmin` closes the
+concurrent path, so a violation can only mean *our* code has a bug. Reporting it as 409 would hide
+our own defect inside the caller's error budget. The invariant runs in both directions: a client
+error is never a 5xx, **and a server fault is never a 4xx**. No handler arm was added; the default
+arm already yields 500 at Error level, and `ACheckConstraintViolation_IsAServerFaultNotACallerError`
+pins it so nobody "fixes" it later.
+
+### 5.10 What Stock still does not exercise
+
+Stock is a leaf service with no outbound calls, so it did **not** test: the typed `HttpClient`
+seam, outbound correlation-id propagation, real nested request DTOs (the validation cascade is
+still proven only by synthetic contracts), order-line snapshotting, compensation across services,
+or a sequence-generated business number. Ordering will be the first service to exercise any of
+them.
+
+---
+
+## 6. Testing architecture
 
 Two projects per service — `<Service>.UnitTests` and `<Service>.IntegrationTests` — rather
 than one shared test project, so fixtures do not multiply inside a single assembly.
@@ -445,9 +679,17 @@ than one shared test project, so fixtures do not multiply inside a single assemb
 | I/O | none | one Testcontainers container per collection |
 | Docker | not needed | required |
 
-Current counts: **99 unit, 39 integration, 138 total, all passing.**
+Current counts, all passing:
 
-### 5.1 Why Testcontainers and never a mocked DbContext
+| Project | Unit | Integration |
+|---|---|---|
+| Catalog | 99 | 39 |
+| Stock | 77 | 61 |
+| **Total** | **176** | **100** |
+
+**276 total.** Build is clean under `TreatWarningsAsErrors`.
+
+### 6.1 Why Testcontainers and never a mocked DbContext
 
 Mocks pass while the real query fails. Concretely, only a real PostgreSQL could have surfaced:
 
@@ -456,32 +698,76 @@ Mocks pass while the real query fails. Concretely, only a real PostgreSQL could 
 - the `xmin` concurrency token — a PostgreSQL system column with no in-memory equivalent
 - the soft-delete query filter — real SQL translation
 
-### 5.2 Harness design
+Stock adds four more that no in-memory provider could produce: the `UNIQUE(order_id,
+stock_item_id)` duplicate-hold `409`, the `CHECK` constraints and their `23514` SQLSTATE, the
+`RESTRICT` foreign key, and the enum-to-string conversion inside the `status IN (...)` check.
 
-- `CatalogApiFactory : WebApplicationFactory<Program>` calls `builder.UseEnvironment("Development")`
+### 6.2 Harness design
+
+Identical in shape for both services, and deliberately duplicated rather than shared — the two
+integration assemblies must not reference each other.
+
+- `<Service>ApiFactory : WebApplicationFactory<Program>` calls `builder.UseEnvironment("Development")`
   **explicitly** rather than inheriting the framework default, because the suite depends on it:
   `Program.cs` runs `MigrateAsync()` only when `IsDevelopment()`. It also overrides
-  `ConnectionStrings:Catalog` through `ConfigureAppConfiguration`.
-- `CatalogApiFixture : IAsyncLifetime` owns one `PostgreSqlContainer` built from
-  `TestPostgreSql.Image`, exposed as `ICollectionFixture` via `CatalogApiCollection` with
-  `[Collection("Catalog API")]`. xunit runs a collection sequentially, which is what makes
+  `ConnectionStrings:<Service>` through `ConfigureAppConfiguration`.
+- `<Service>ApiFixture : IAsyncLifetime` owns one `PostgreSqlContainer` built from that project's
+  own `TestPostgreSql.Image`, exposed as `ICollectionFixture` via `<Service>ApiCollection` with
+  `[Collection("<Service> API")]`. xunit runs a collection sequentially, which is what makes
   per-test `ResetDatabaseAsync()` safe.
-- `ResetDatabaseAsync()` uses `ExecuteDeleteAsync` with `IgnoreQueryFilters()` so soft-deleted
-  rows are removed too. It does not reset sequences.
+- `ResetDatabaseAsync()` deletes every table. Catalog uses `IgnoreQueryFilters()` so soft-deleted
+  rows go too; Stock deletes `stock_reservations` **before** `stock_items`, because the foreign
+  key is `RESTRICT`. Neither resets sequences.
 - `CreateScope()` exposes the host's services so a test can open independent units of work
   against the same database — which is what an optimistic-concurrency conflict needs.
-- Disposal order is `Client` → factory → container.
+- Disposal order is `Client` → factory → container. **Stock guards this with `try/finally`;
+  Catalog does not** — a known divergence recorded in `KNOWN-ISSUES.md`.
 - Tests that assert on `ProblemDetails` deserialise the response body rather than depending on
   an internal result type.
 
-### 5.3 Gotchas that have already bitten
+### 6.3 Concurrency testing
+
+**Anything with a mutable counter needs a parallel test, and a sequential one is not a
+substitute.** This is the strongest testing lesson Stock produced.
+
+In a verified 20-way parallel confirm burst against a single reservation, **all 20 requests
+passed the state-machine check** — every one loaded the row while it was still `Pending` — and
+only the `xmin` token stopped 19 of them. Across a full Stock run the split was **55 rejections
+from the concurrency token versus 2 from the state machine**, and those 2 came from *sequential*
+smoke checks. So `Confirm_Twice_Returns409AndDoesNotShipTwice` would still pass with the `xmin`
+declaration deleted entirely.
+
+The rules that follow:
+
+- **Parallel assertions are inequalities, never exact counts.** Under contention the number of
+  winners depends on interleaving, and Phase 0 does not retry server-side. A burst of 40 against
+  10 units produced 4 successes, not 10. Assert what must hold every time: never oversold, no
+  5xx, counters agree with committed rows, every request answered.
+- **Cover the exact boundary in a separate sequential test.** Ten reserves succeed, the eleventh
+  is 409 — deterministic, and it is the assertion the parallel test cannot make.
+- **Assert against the database, not only the API.** After the burst, the pending reservation
+  count and `SUM(quantity)` must equal `reserved`. That is the transaction-boundary check, and
+  it is what proves the counter and the audit rows committed together.
+- **Assert no 5xx under contention.** A misclassified `DbUpdateConcurrencyException` or an
+  unmapped SQLSTATE would otherwise hide behind "the test passed".
+
+Stock's `OversellingConcurrencyTests` holds all of these: the parallel burst, the sequential
+boundary, the parallel confirm race, the parallel release race, a stale-writer rejection via two
+independent scopes, first-writer-survives, sequential-writes-both-succeed, and the
+counter-vs-rows agreement check.
+
+Catalog has no equivalent, and deliberately so: `Product` has no contended numeric resource. Its
+`ConcurrencyTests` cover the token at the `DbContext` level only.
+
+### 6.4 Gotchas that have already bitten
 
 - **The connection string must be resolved lazily inside the `AddDbContext` callback.**
   `WebApplicationFactory.ConfigureAppConfiguration` applies its override *during* `Build()`.
   Reading the value into a local beforehand freezes it, and the tests then run silently against
   the developer's own compose database while the Testcontainers container sits unused. This
   happened. `TestHostIsolationTests` now fails the suite if it recurs; it can also be proven by
-  running the integration tests with `docker compose stop db`.
+  running the integration tests with `docker compose stop db`. Both services were verified this
+  way — Stock's 61 integration tests pass with port 5432 closed.
 - `ProblemHttpResult.ExecuteAsync` resolves `ILoggerFactory` and `JsonOptions` from
   `HttpContext.RequestServices`, so a bare `DefaultHttpContext` throws. Build one with
   `.AddOptions().AddLogging()`.
@@ -493,22 +779,35 @@ Mocks pass while the real query fails. Concretely, only a real PostgreSQL could 
   serialised wire body instead.
 - `Validator.TryValidateObject` reports only the first failure per property when `[Required]`
   is among them, so aggregation tests must use two independent rules.
-- `TestPostgreSql.Image` is the single declaration of the PostgreSQL image tag;
-  `docker-compose.yml` states its own and `ComposeConfigurationTests` fails if they diverge.
+- **`GetCheckConstraints()` throws against EF's read-optimised runtime model.** Reading a CHECK
+  constraint back in a test requires `db.GetService<IDesignTimeModel>().Model`, and the type
+  lives in `Microsoft.EntityFrameworkCore.Metadata`, not `.Infrastructure`.
+- FluentAssertions: `ThrowAsync<T>().And` (not `.Subject`) yields the exception;
+  `NotContain(char)` has no overload, so use a string.
+- `TestPostgreSql.Image` is each project's single declaration of the PostgreSQL image tag;
+  `docker-compose.yml` states its own and both `ComposeConfigurationTests` fail if they diverge.
 
-### 5.4 Structural guards
+### 6.5 Structural guards
 
 A convention enforced only by prose will be violated. These fail the build or the suite:
 
-| Guard | Protects |
-|---|---|
-| `Directory.Build.targets` | no cross-service `ProjectReference` (build time) |
-| `RequestContractCoverageTests` | every `*Request` in `Contracts/` implements `IRequestContract`, and the check does not pass vacuously |
-| `ContractSchemaAlignmentTests` | DTO length limits equal EF column limits; `[Range]` respects `numeric(18,2)` |
-| `ComposeConfigurationTests` | compose image matches `TestPostgreSql.Image`; port is loopback-only; no literal credentials; the isolation script is mounted |
-| `TestHostIsolationTests` | the app under test really uses the Testcontainers database |
-| `scripts/verify-db-isolation.sh` | PostgreSQL role isolation, 22 checks |
+| Guard | Protects | Present in |
+|---|---|---|
+| `Directory.Build.targets` | no cross-service `ProjectReference` (build time) | repo root |
+| `RequestContractCoverageTests` | every `*Request` implements `IRequestContract`, and the check does not pass vacuously | both |
+| `ContractSchemaAlignmentTests` | schema and contracts agree — see below | both, differently |
+| `ComposeConfigurationTests` | compose image matches `TestPostgreSql.Image`; port is loopback-only; no literal credentials; isolation script mounted | both |
+| `TestHostIsolationTests` | the app under test really uses the Testcontainers database | both |
+| `LeafServiceBoundaryTests` | a service that makes no outbound calls registers no `HttpClient` | Stock |
+| `scripts/verify-db-isolation.sh` | PostgreSQL role isolation, 22 checks | repo root |
 
-`ContractSchemaAlignmentTests` reads limits from the EF model rather than restating them, so
-it tracks `ProductConfiguration` instead of a second copy that could itself drift. That is the
-guard which would have prevented the original over-length-SKU 500.
+`ContractSchemaAlignmentTests` reads limits from the EF model rather than restating them, so it
+tracks the configuration instead of a second copy that could itself drift. Catalog's version
+compares DTO string limits against column limits — the guard that would have prevented the
+original over-length-SKU 500. **Stock's version had to be rewritten**, because Stock has almost
+no length-constrained strings: copied verbatim it would have matched nothing and passed without
+proving anything. It instead asserts the enum vocabulary equals its `CHECK` list, the status
+column is wide enough, every quantity bound matches `StockItem.MaxQuantity`, the bound fits an
+`integer` column, derived values are not persisted, and every entity carries an `xmin` token.
+
+That is the concrete reason a structural guard must be re-derived per service rather than copied.

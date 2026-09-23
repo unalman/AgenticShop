@@ -12,42 +12,48 @@ deferral is in `DECISIONS.md`.
 
 ---
 
-## Phase 0 — Foundation *(current, complete for Catalog)*
+## Phase 0 — Foundation *(current: Catalog and Stock complete, Ordering outstanding)*
 
 Three independently deployed hosts, synchronous HTTP between them, one database per service with
 its own migrations and its own least-privilege PostgreSQL role, Testcontainers-backed integration
 tests, PostgreSQL in compose.
 
-**Done:** Catalog, end to end, as the reference implementation — domain, EF configuration, two
+**Catalog — done.** The reference implementation: `Product` domain, EF configuration, two
 migrations, five endpoints, validation filter, exception handler, correlation id, soft delete,
-paging, `xmin` concurrency, 138 passing tests, build-time and database-level boundary
-enforcement.
+paging, `xmin` concurrency. 138 tests.
 
-**Not done:** Stock and Ordering do not exist. Their databases and roles are provisioned; there
-is no project, no code and no client seam yet.
+**Stock — done.** The second service and the proof that the conventions transfer rather than merely
+copy: `StockItem` + `StockReservation` domains, one migration, seven endpoints plus `/health`, the
+reservation lifecycle (`Pending → Confirmed | Released`, both terminal), `xmin` on both entities,
+`CHECK` constraints, a `RESTRICT` foreign key, natural reserve idempotency via
+`UNIQUE(order_id, stock_item_id)`, and parallel overselling tests. 138 tests.
+
+Together **276 tests passing**, build clean under `TreatWarningsAsErrors`, database isolation
+verified 22/22, and both integration suites proven isolated by running with the compose database
+stopped.
+
+Stock's five deliberate divergences from Catalog — no soft delete, no paging, no money, parallel
+rather than sequential concurrency tests, rewritten structural guards — are tabulated in
+`ARCHITECTURE.md` §5.8.
+
+**Not done:** Ordering. Its database and role are provisioned; there is no project, no code and no
+client seam.
 
 ---
 
-## Next: build out Stock and Ordering
+## Next: build Ordering
 
-Still Phase 0. The point is to prove the reference implementation replicates, and to create the
-first real network hops.
+Still Phase 0. The point is to create the first real network hops and to prove the conventions
+survive a service that orchestrates rather than owns a single resource.
 
-Both follow Catalog's conventions, subject to the judgement calls in `AGENTS.md` §10 — soft
-delete probably does not suit either, and `xmin` is far higher-stakes on stock than on a product.
-
-**Stock** introduces the reservation lifecycle that the whole later roadmap depends on: hold
-quantity against an order, then confirm or release it. `Available` is
-`QuantityOnHand - Reserved`, computed rather than stored. The domain must reject a reservation
-it cannot honour — that is business logic, not a copied guard clause.
-
-**Ordering** introduces everything Catalog lacks:
+Ordering introduces everything Catalog and Stock lack:
 
 - **A typed `HttpClient` plus an interface seam per downstream service.** The one abstraction
   justified in advance, because it is a real network boundary: the seam the integration tests
   fake, and the seam a broker-based implementation later swaps into.
 - **Outbound correlation-id propagation** via a `DelegatingHandler`. Without it a trace breaks
-  at the first hop.
+  at the first hop. Neither existing service makes an outbound call, so this is untested
+  territory.
 - **Real nested request DTOs.** `CreateOrderRequest` with a `Lines` collection is the first
   genuine exercise of the validation cascade, which until now is proven only by synthetic
   contracts.
@@ -59,13 +65,26 @@ it cannot honour — that is business logic, not a copied guard clause.
 - **A sequence or equivalent for `OrderNumber`** — which also means the test fixture must reset
   sequences, not just truncate rows (see `KNOWN-ISSUES.md`).
 
-Expect the conventions to need revision here. Catalog is single-entity CRUD and exercises nothing
-distributed. **When a convention proves wrong for the second service, fix it in Catalog too** —
-divergent conventions across three services are worse than one imperfect convention applied
-consistently.
+Two things Stock established that Ordering must honour rather than rediscover:
 
-This is also the point at which the shared-library trigger may fire early: `CatalogExceptionHandler`'s
-chain-describing logic is already entirely generic, so a third copy is the signal, not Phase 1.
+- **Reserve is naturally idempotent** via `UNIQUE(order_id, stock_item_id)`, so a retried reserve
+  returns 409 rather than double-holding. Ordering must combine duplicate product lines in an
+  order, or the second will be rejected.
+- **Settling is strict, not idempotent.** A retried confirm returns 409 "already confirmed", and
+  Ordering must treat that as success. This is decision D3 and it changes in Phase 1/2.
+
+Ordering must also decide how to handle contention: a live 40-way burst against 10 units held only
+**4**, because there is no server-side retry on `xmin` conflict (decision D9). Whether Ordering
+retries, partial-fills, or fails the order is an open design question, not an implementation
+detail.
+
+Expect the conventions to need revision here. **When a convention proves wrong for a later
+service, fix it in the earlier ones too** — divergent conventions across three services are worse
+than one imperfect convention applied consistently.
+
+This is also where the shared-library trigger fires: the filter, exception handler and correlation
+middleware are already copied twice (~517 lines in Stock), and the error handler's
+chain-describing logic is entirely generic. Raise the decision **before** the third copy.
 
 ---
 
@@ -84,9 +103,21 @@ Now that a network hop exists, make its failure modes survivable and visible.
 - Dockerfiles for all three services plus a `full` compose profile
 - CI: build, test, and `dotnet ef migrations has-pending-model-changes` as a drift gate
 
-Also resolves, or forces a decision on, both open observability items in `KNOWN-ISSUES.md` — the
-`Database.Command` Error entry for handled 409s, and the fact that validation rejections are
-invisible.
+Also resolves, or forces a decision on, the three open observability items in `KNOWN-ISSUES.md`:
+the `Database.Command` Error entry for handled 409s, the fact that validation rejections are
+invisible, and the verbose `DbUpdateConcurrencyException` log line that dominates Stock's output
+under contention. The last is the cheapest and is a candidate to fix earlier — but it belongs in
+**both** handlers, so it is naturally batched with the shared-library decision that Ordering
+triggers.
+
+**Contention is the phase's real driver.** Stock measured a 40-way burst holding only 4 of 10
+units because there is no server-side retry on `xmin` conflict (decision D9). Retry policies plus
+idempotency keys are what turn that 409 into a transparent retry, which is exactly why idempotency
+comes first: retrying a reserve without a key double-holds stock.
+
+Note that Phase 2 largely dissolves this problem rather than solving it — a single-consumer queue
+serialises reservations, so the contention disappears. If Phase 2 arrives quickly, the retry work
+here may be worth less than it looks.
 
 ---
 

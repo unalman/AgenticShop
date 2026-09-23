@@ -107,14 +107,24 @@ shared assembly is needed.
 **Why.** A shared assembly created on day one becomes a coupling magnet and a version-lock
 across independently deployable services.
 
-**Revisit — this one is live.** `DataAnnotationValidationFilter` (185 lines),
-`CatalogExceptionHandler` (214) and `CorrelationIdMiddleware` (67) are cross-cutting and will
-be copied into Stock and Ordering. That is a conscious choice for now. The trigger is
-**Phase 1**, when Serilog configuration, OpenTelemetry setup, resilience registration and
-health-check wiring join them and duplication reaches roughly 400 lines × 3. Note that
-`CatalogExceptionHandler`'s chain-describing logic is already entirely generic — only
-`UniqueViolationDetail` and the `ILogger<T>` category are Catalog-specific — so **a third copy
-is the point at which the trigger fires, not Phase 1.**
+**Revisit — this one is live, and the counter is now 2 of 3.** The filter, handler and
+middleware have been copied into Stock: `DataAnnotationValidationFilter` (192 lines),
+`StockExceptionHandler` (253) and `CorrelationIdMiddleware` (72) — roughly 517 lines of
+near-identical infrastructure. That was the agreed plan, and Stock proves the copies are cheap
+to make correctly because the structural guards travel with them.
+
+The trigger is **Phase 1**, when Serilog configuration, OpenTelemetry setup, resilience
+registration and health-check wiring join these three and duplication reaches roughly 400
+lines × 3. But note that the error handler's chain-describing logic is already entirely generic
+— only `UniqueViolationDetail`, the conflict wording and the two domain arms are
+service-specific — so **building Ordering is the point at which the trigger fires, not Phase 1.**
+Raise the decision before the third copy, not after.
+
+**What must not be shared regardless:** the per-service structural guards
+(`TestPostgreSql.Image`, `ComposeConfigurationTests`, `TestHostIsolationTests`,
+`ContractSchemaAlignmentTests`). Sharing them would require the integration assemblies to
+reference each other, which is the coupling the whole design avoids, and Stock's
+`ContractSchemaAlignmentTests` had to be rewritten anyway — see that entry below.
 
 ### One PostgreSQL container hosting three databases
 
@@ -376,8 +386,8 @@ when OpenTelemetry arrives, or there will be two parallel correlation concepts.
 
 ### Testcontainers, never a mocked `DbContext`
 
-See `ARCHITECTURE.md` §5.1 for the four concrete cases only a real PostgreSQL could surface.
-This decision has paid for itself repeatedly.
+See `ARCHITECTURE.md` §6.1 for the concrete cases only a real PostgreSQL could surface — four
+from Catalog and four more from Stock. This decision has paid for itself repeatedly.
 
 ### Per-service test projects, not one shared suite
 
@@ -398,6 +408,40 @@ parser dependency.
 Needed to unit-test `IEndpointFilter` and `IExceptionHandler`, which are ASP.NET Core types. It
 makes the "unit" project depend on the ASP.NET Core shared framework, which is acceptable: these
 are components of a web service, and the tests still perform no I/O.
+
+### Parallel concurrency tests are mandatory for any mutable counter
+
+**Context.** Stock's sequential state-machine tests looked thorough and proved almost nothing
+about concurrency. Log evidence from a live run: in a 20-way parallel confirm burst **all 20
+requests passed the state-machine check**, and only the `xmin` token stopped 19. Across the whole
+run, 55 rejections came from the concurrency token and 2 from the state machine — and those 2 were
+from sequential smoke checks.
+
+**Decision.** Any entity with a mutable counter gets a parallel test. Parallel assertions are
+**inequalities** (never oversold, no 5xx, counters agree with committed rows, every request
+answered), never exact success counts, because winners depend on interleaving. The exact boundary
+gets its own *sequential* test. Results are asserted against the database, not only the API.
+
+**Why.** `Confirm_Twice_Returns409AndDoesNotShipTwice` passes with the `xmin` declaration
+deleted. A test that cannot fail when the safety mechanism is removed is not testing the
+mechanism.
+
+**Rejected.** Exact-count assertions — flaky, and they test the scheduler rather than the design.
+
+### Structural guards are re-derived per service, not copied
+
+**Context.** Catalog's `ContractSchemaAlignmentTests` compares DTO string limits against column
+limits. Stock has almost no length-constrained strings, so a verbatim copy would have matched
+nothing and passed vacuously — the exact failure mode its own non-vacuity assertion exists to
+catch.
+
+**Decision.** Each service writes guards for the drift *it* can suffer. Stock's asserts the enum
+vocabulary equals its `CHECK` list, the status column is wide enough, quantity bounds match
+`StockItem.MaxQuantity` and fit an `integer` column, derived values are not persisted, and every
+entity carries an `xmin` token.
+
+**Consequence accepted.** More duplicated guard scaffolding. It is the price of the guards being
+worth anything.
 
 ---
 
@@ -434,6 +478,135 @@ pins `ASPNETCORE_ENVIRONMENT=Development` and overrides the command line. Use
 
 ---
 
+## Stock service
+
+Fourteen decisions were approved before implementation. Each is recorded with what was chosen
+and why; the numbering matches the approval request. Design detail lives in
+`ARCHITECTURE.md` §5.
+
+### D1 · `Reserved` is a stored column, not derived from reservations
+
+**Alternative rejected:** `SUM(quantity)` over pending reservations.
+
+**Why stored.** It keeps the availability check and the mutation a single-row operation guarded by
+one `xmin` token. Deriving it would need an aggregate read plus a write in one transaction, and
+`StockItem`'s token would no longer cover reservation changes. The reservation table is the audit
+trail; `Reserved` is the counter that makes the check atomic. Both are written by the same
+`SaveChangesAsync`, which preserves the outbox-readiness Phase 2 depends on.
+
+### D2 · `UNIQUE(order_id, stock_item_id)`
+
+Gives reserve natural idempotency, exactly as Catalog's unique SKU does — a retry conflicts
+instead of double-holding. Because `stock_items.product_id` is itself unique, `stock_item_id` is
+1:1 with `product_id`, so this enforces one reservation per product per order **without
+denormalising `ProductId` onto the reservation**.
+
+**Consequence accepted:** Ordering must combine duplicate product lines in an order.
+
+### D3 · Transitions are strict, not idempotent
+
+Confirming an already-settled reservation throws rather than returning success.
+
+**Why.** A silent no-op would hide a double-settle from the caller.
+
+**Known cost.** A retry after a successful confirm gets a 409. Phase 2's at-least-once delivery
+requires idempotency, which is what Phase 1's idempotency keys and the Inbox exist for. Until then
+**Ordering must treat "409 because already confirmed" as success.**
+
+**Revisit:** Phase 1/2, alongside idempotency keys.
+
+### D4 · Stock does not call Catalog — it is a leaf service
+
+Only Ordering orchestrates. If Stock also called Catalog it would add a hop, a Stock→Catalog
+coupling and a trace path that nothing in Phase 0 needs.
+
+**Consequence accepted:** Stock cannot tell you whether a product exists, so stock can be
+provisioned for a nonexistent `ProductId`. Tolerable because the only caller in the real flow is
+Ordering, which validates first. Enforced by `LeafServiceBoundaryTests`.
+
+### D5 · `CHECK` constraints on `stock_items` — **with a reversal**
+
+The constraints were approved as defence-in-depth, and the plan said to map SQLSTATE `23514` to a
+client error so a violation would not surface as a 500.
+
+**The mapping was reversed during implementation.** Every CHECK restates an invariant `StockItem`
+already guards, and `xmin` closes the concurrent path, so a violation can only mean *our* code has
+a bug. Reporting it as 4xx would hide our defect inside the caller's error budget. The invariant
+runs in both directions: a client error is never a 5xx, **and a server fault is never a 4xx**.
+
+No handler arm was added — the default arm already yields 500 at Error level.
+`ACheckConstraintViolation_IsAServerFaultNotACallerError` pins it so nobody "fixes" it later.
+
+### D6 · Real foreign key `stock_reservations.stock_item_id → stock_items.id`
+
+Both tables are in Stock's own database, so the key is legitimate; the prohibition is on keys
+*crossing* a service boundary. `DeleteBehavior.Restrict` with `WithMany()` — no navigation
+property, so the object graph stays flat and there is no cascade behaviour to reason about.
+
+**Consequence for tests:** `ResetDatabaseAsync` must delete reservations before stock items.
+
+### D7 · `POST /stock` plus `PUT /stock/{productId}`, not a single upsert
+
+Explicit create-versus-update mirrors Catalog, and a silent upsert would hide a
+duplicate-provisioning bug. The unique index on `product_id` makes the race safe.
+
+### D8 · `/stock/{productId}/reservations`, not `/stock/{productId}/reserve`
+
+Resource-oriented, matching `POST /api/v1/products`.
+
+### D9 · No server-side retry on `xmin` conflict — deferred to Phase 1
+
+**Why.** Resilience libraries are Phase 1, and the 409 is the honest signal Ordering must learn to
+handle. Phase 2 largely dissolves the problem: a queue with a single consumer serialises
+reservations, so contention disappears rather than being retried away.
+
+**Measured cost.** A live 40-way burst against 10 units held only **4** — 36 requests lost the
+`xmin` race and were told 409 despite stock being available. Safety is perfect; liveness under
+burst is poor. This is the most important input to the Ordering design, which must decide whether
+to retry, partial-fill, or fail the order.
+
+### D10 · `GET /api/v1/reservations?orderId=` is included
+
+Cheap, supported by the `order_id` index, and needed for Phase 2 reconciliation and for debugging a
+half-failed order. `orderId` is required, so omitting it is a binding failure → 400, not an
+unbounded scan.
+
+### D11 · A test asserts Stock registers no `HttpClient`
+
+`LeafServiceBoundaryTests` locks in the leaf-service boundary at runtime, covering what
+`Directory.Build.targets` cannot — a dependency introduced through DI rather than a project
+reference.
+
+### D12 · Do not duplicate the validation filter's recursion tests
+
+The filter is byte-identical to Catalog's. Stock asserts only that it is *wired* to its endpoint
+groups; the recursion behaviour is specified once, in Catalog's suite. Re-testing identical code
+creates a second place to update and proves nothing.
+
+### D13 · Stock gets its own `TestPostgreSql.Image` and compose guard
+
+Otherwise the image-drift guard has a hole. The two integration assemblies must not reference each
+other, so the constant and `ComposeConfigurationTests` are duplicated deliberately.
+
+### D14 · Status stored as a string with a `CHECK`, not an integer
+
+So reservation state is readable in `psql`, which matters once Phase 2 adds sagas and
+reconciliation. Cost: `HasConversion<string>()` plus a `varchar(20)`. A new enum member without a
+matching CHECK update fails loudly at insert time — the intended behaviour, since the schema and
+the enum are one vocabulary. `ContractSchemaAlignmentTests` asserts the two lists agree.
+
+### Not in the approval list, decided during implementation
+
+- **Domain exceptions carry typed properties**, and the handler builds client text from them rather
+  than from `Message`. Prevents a reworded exception from silently changing the public contract.
+- **A diverged-counter fault is a 500.** `StockItem.RequireCoveredByReserved` throws
+  `InvalidOperationException` when `Reserved` has drifted from the reservation rows. No caller
+  input can produce it, so blaming the caller would be wrong.
+- **`StockApiFixture.DisposeAsync` uses `try/finally`**, unlike Catalog's. Fixed forward rather
+  than copied; the Catalog divergence is recorded in `KNOWN-ISSUES.md`.
+
+---
+
 ## Deliberately not done
 
 Each was considered and declined, with the phase that would justify it:
@@ -441,17 +614,19 @@ Each was considered and declined, with the phase that would justify it:
 | Declined | Why not yet |
 |---|---|
 | RabbitMQ / any broker | Nothing is asynchronous |
-| Outbox / Inbox | An outbox makes "write a row and publish an event" atomic; there are no events. Note the design is already outbox-ready: every write path is a single `SaveChangesAsync`, so an entity and an outbox row would already be atomic |
+| Outbox / Inbox | An outbox makes "write a row and publish an event" atomic; there are no events. Note the design is already outbox-ready: every write path is a single `SaveChangesAsync`, so an entity and an outbox row would already be atomic. Stock's reserve commits the counter and the reservation row together, which is the same property |
 | Redis | No cache pressure, no distributed idempotency store to hold |
-| Polly / resilience | Retrying without idempotency keys double-reserves stock |
-| OpenTelemetry | One process; nothing distributed to trace |
+| Polly / resilience | Retrying without idempotency keys double-reserves stock. Also see D9: Stock deliberately returns 409 on `xmin` conflict rather than retrying |
+| OpenTelemetry | No service makes an outbound call yet, so there is nothing distributed to trace |
 | Serilog | Built-in logging suffices and the configuration is about to change |
-| Shared infrastructure library | See the trigger above |
+| Shared infrastructure library | See the trigger above — the counter is now 2 of 3 |
 | Authentication / authorization | Deferred by the project owner. Adding it later needs a customer identity column on `Order` plus a cross-cutting policy — a migration and a concern, which is why no placeholder seam was pre-built |
 | Kubernetes / Helm, YARP gateway | Phase 4 |
 | CQRS, DDD tactical patterns, event sourcing | No read pressure, no aggregate boundaries to enforce |
-| Idempotency keys | Phase 1. Note `POST /products` is already naturally idempotent: the unique SKU means a retry returns 409 rather than duplicating |
+| Idempotency keys | Phase 1. Two operations are already naturally idempotent through unique constraints: `POST /products` (unique SKU) and `POST /stock/{id}/reservations` (unique order + stock item) |
+| Reservation expiry / `ExpiresAtUtc` | Phase 3. Release is an explicit call only; no background worker |
 | Service Dockerfiles | Phase 0 runs APIs on the host for a fast inner loop |
 | CI pipeline | Phase 1 |
 | CORS policy | No browser client |
 | Rate limiting, HTTPS, HSTS, tightened `AllowedHosts` | No non-local deployment |
+| Stock list/paging endpoint | Nothing needed it; symmetry is not a reason |

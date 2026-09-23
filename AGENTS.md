@@ -13,18 +13,18 @@ AgenticShop is an educational .NET backend for learning agentic software develop
 evolved gradually into a distributed e-commerce backend. The deferrals in §8 are deliberate —
 do not "improve" the project by adding infrastructure it has declined.
 
-**Phase 0 — exactly one service exists:**
+**Phase 0 — two of three services exist:**
 
 | Service | Status |
 |---|---|
-| **Catalog** | **Implemented.** The reference implementation. Everything under `src/` and `tests/`. |
-| Stock | **Does not exist.** Database and role provisioned; no project, no code. |
+| **Catalog** | **Implemented.** The reference implementation; every convention originates here. |
+| **Stock** | **Implemented.** Follows Catalog's conventions, with the deliberate divergences recorded in §10. |
 | Ordering | **Does not exist.** Database and role provisioned; no project, no code. |
 
-Do not assume Stock or Ordering exist, and do not create them unless asked.
+Do not assume Ordering exists, and do not create it unless asked.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **138 pass**
-(99 unit, 39 integration).
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **276 pass**
+(Catalog 99 unit + 39 integration, Stock 77 unit + 61 integration).
 
 ## 2. Service boundaries
 
@@ -89,7 +89,7 @@ docker compose exec db bash /usr/local/bin/verify-db-isolation   # 22 checks; no
 
 ## 5. Coding conventions
 
-Full detail and rationale: `docs/ARCHITECTURE.md` §4.
+Full detail and rationale: `docs/ARCHITECTURE.md` §4 (Catalog) and §5 (Stock).
 
 **Structure.** One project per service. **No** `Api`/`Core`/`Application` split, no repository,
 service or mediator layer — handlers call the `DbContext` directly.
@@ -107,9 +107,18 @@ Validation/  DataAnnotationValidationFilter
 **Entities.** `private set` everywhere; `private` parameterless constructor for EF; `static
 Create(...)` factory; explicit mutation methods, not public setters. **Guards run before any
 mutation**, so a rejected call leaves the entity untouched. Length limits are `public const int`,
-shared by `Contracts/` and `Data/`. `DateTimeOffset` for all timestamps. Money is `decimal` plus
-a separate `Currency` string — no `Money` value object — rounded 2dp `AwayFromZero`. Identity
-fields other services hold are immutable.
+shared by `Contracts/` and `Data/`. `DateTimeOffset` for all timestamps. Identity fields other
+services hold are immutable.
+
+- **Derived values are computed properties, never stored** — Stock's
+  `Available = QuantityOnHand - Reserved` is the template. Mark them `builder.Ignore(...)` so a
+  second copy of the truth cannot drift.
+- Money is `decimal` plus a separate `Currency` string — no `Money` value object — rounded 2dp
+  `AwayFromZero`. **Stock has no money at all**; do not add fields a service does not need.
+- **Domain rejections get their own exception type carrying typed properties**, e.g.
+  `InsufficientStockException(Available, Requested)`. The handler builds the client message from
+  those properties, never from `Message` (logs only). `ArgumentException` is not enough when the
+  correct status is 409 rather than 400.
 
 **EF Core.** One `IEntityTypeConfiguration<T>` per entity via `ApplyConfigurationsFromAssembly`.
 Explicit snake_case `ToTable`. `HasPrecision(18, 2)` on money. `UseSnakeCaseNamingConvention()`
@@ -121,6 +130,14 @@ on it.
   `UseXminAsConcurrencyToken()` **does not exist in Npgsql 10**. This emits no DDL.
 - **Never `HasDefaultValue` on a non-nullable `bool`** — EF's sentinel is `false`, so an explicit
   `false` is dropped from the INSERT and silently comes back as the default.
+- **A foreign key is fine within one service's database** — Stock's `stock_reservations →
+  stock_items` uses one, with `DeleteBehavior.Restrict` and `WithMany()` (no navigation property).
+  Only a key crossing a service boundary is forbidden.
+- **`CHECK` constraints** are legitimate defence-in-depth, but their SQL is verbatim, so it must
+  name columns *after* snake_case renaming. Reading them back needs
+  `db.GetService<IDesignTimeModel>().Model`; `GetCheckConstraints()` throws against the runtime model.
+- Enums map with `.HasConversion<string>()` plus a `CHECK` listing the names, so state is readable
+  in `psql`.
 
 **Migrations.** Per service under `Data/Migrations/`. Set `ASPNETCORE_ENVIRONMENT=Development`
 first so `appsettings.Development.json` supplies the connection string:
@@ -158,17 +175,25 @@ positional parameters); domain guards protect invariants. Both, deliberately.
 |---|---|
 | `OperationCanceledException` **and** `RequestAborted` | not handled — `LogDebug`, `return false` |
 | `BadHttpRequestException` | **`badRequest.StatusCode`** — never hardcode 400; an oversized body is 413 |
-| `DbUpdateConcurrencyException` | 409 (must precede `DbUpdateException`) |
+| domain conflict exceptions | 409 — Stock: `InsufficientStockException`, `InvalidReservationStateException`. Place before the EF arms |
+| `DbUpdateConcurrencyException` | 409 (must precede `DbUpdateException`, which it derives from) |
 | `DbUpdateException` + SQLSTATE `23505` | 409, message keyed on the **constraint name** |
 | `DbUpdateException` + SQLSTATE `22001` / `22003` | 400 |
 | `ArgumentException` | 400 |
 | anything else | 500 |
 
-Three invariants: **(1)** a client error is never a 5xx — 5xx rates decide whether someone gets
-paged; **(2)** no exception message reaches the client, so `detail` is `null` for domain 400s and
-all 500s; **(3)** the handler decides severity, not EF Core — handled rejections log one `Warning`
-line with no exception object, unhandled failures log `Error` *with* it. Non-5xx lines log the
-whole exception chain (`DescribeForLog`, depth cap 5).
+**Do not add an arm for a CHECK-constraint violation (`23514`).** Every CHECK restates an
+invariant the entity already guards, and `xmin` closes the concurrent path, so a violation means
+*our* code has a bug. It belongs in the 5xx bucket at Error level; mapping it to 409 would hide
+our defect inside the caller's error budget. The invariant runs both ways: a client error is never
+a 5xx, **and a server fault is never a 4xx**.
+
+Four invariants: **(1)** a client error is never a 5xx — 5xx rates decide whether someone gets
+paged; **(2)** a server fault is never a 4xx; **(3)** no exception message reaches the client, so
+`detail` is `null` for domain 400s and all 500s, and built from typed properties for domain 409s;
+**(4)** the handler decides severity, not EF Core — handled rejections log one `Warning` line with
+no exception object, unhandled failures log `Error` *with* it. Non-5xx lines log the whole
+exception chain (`DescribeForLog`, depth cap 5).
 `Microsoft.EntityFrameworkCore.Update` is `"None"` in `appsettings.json`.
 
 **Correlation ID.** Use the constant `CorrelationIdMiddleware.HeaderName`; never hardcode the
@@ -177,13 +202,23 @@ untrusted:** accept only 1–128 characters of ASCII letters, digits and `-_.`; 
 **replace** with a minted id, never reject the request. Registered first, before
 `UseExceptionHandler`. Inbound-only for now.
 
-**Soft delete.** `IsActive` + `Deactivate()` + `HasQueryFilter`; `DELETE` returns `204` and never
-removes a row; `includeInactive=true` applies `IgnoreQueryFilters()`. Deactivated entities 404 on
-`GET`/`PUT`/`DELETE`; there is no reactivation path.
+**Soft delete — Catalog-specific, not a house style.** `IsActive` + `Deactivate()` +
+`HasQueryFilter`; `DELETE` returns `204` and never removes a row; `includeInactive=true` applies
+`IgnoreQueryFilters()`. **Stock has none of this** — a filtered stock row reads as "no stock",
+which is more dangerous than a deleted product.
 
-**Paging.** `page` is 1-based and clamped to `>= 1`, `size` to `1..MaxPageSize` (Catalog: 20 /
-100). Response is a `<Resource>Page` record: `Items`, `Page`, `Size`, `TotalCount`. **Order by a
-unique column** — Catalog uses `Sku` — or the paging window is unstable.
+**Paging — Catalog-specific so far.** `page` is 1-based, clamped `>= 1`; `size` clamped
+`1..MaxPageSize` (Catalog: 20 / 100). Response is a `<Resource>Page` record: `Items`, `Page`,
+`Size`, `TotalCount`. **Order by a unique column** or the window is unstable. Stock has no list
+endpoint; add one only when something needs it.
+
+**Multi-entity writes commit in one `SaveChangesAsync`** so EF wraps them in one transaction —
+Stock's counter update and reservation insert can never disagree. This is what Phase 2's outbox
+will depend on. Needing a transaction across several saves is a design smell; raise it first.
+
+**Let the database reject duplicates; do not pre-check.** `SELECT`-then-`INSERT` has a race window
+under retry; a unique index does not. Stock's `UNIQUE(order_id, stock_item_id)` is what makes a
+retried reserve idempotent instead of a double-hold.
 
 ## 6. Testing rules
 
@@ -199,24 +234,40 @@ Two projects per service: `<Service>.UnitTests` and `<Service>.IntegrationTests`
   rejection, the `xmin` system column, or query-filter SQL translation.
 - Unit-testing ASP.NET Core types needs
   `<FrameworkReference Include="Microsoft.AspNetCore.App" />` in the unit test project.
-- One container per collection: `ICollectionFixture<CatalogApiFixture>` +
-  `[Collection("Catalog API")]`. xunit runs a collection sequentially, which is what makes
-  per-test `ResetDatabaseAsync()` safe.
+- One container per collection: `ICollectionFixture<<Service>ApiFixture>` +
+  `[Collection("<Service> API")]`. xunit runs a collection sequentially, which is what makes
+  per-test `ResetDatabaseAsync()` safe. Dispose the container in a `finally` so a throw from the
+  factory cannot leak it.
 - `Program.cs` must end with `public partial class Program;` — the `WebApplicationFactory` anchor.
 - **Resolve the connection string lazily inside the `AddDbContext` callback.** Reading it into a
   local first freezes it before `WebApplicationFactory` applies its override, and the tests
   silently run against the developer's own database.
 - **Assert failure paths as rigorously as success paths.** The missing 400/404/409 assertions are
   exactly what shipped as 500s.
+- **Anything with a mutable counter needs a parallel test.** Sequential state-machine tests prove
+  almost nothing about concurrency: in a verified 20-way parallel confirm burst **all 20 passed the
+  state-machine check** and only `xmin` stopped 19. Across a full Stock run, 55 rejections came
+  from the concurrency token and 2 from the state machine — a sequential "confirm twice → 409"
+  test still passes with the token deleted.
+- **Parallel assertions are inequalities, never exact counts.** Winners depend on interleaving and
+  Phase 0 does not retry server-side. Assert what must always hold — never oversold, no 5xx,
+  counters agree with committed rows, every request answered — and cover the exact boundary in a
+  separate *sequential* test.
 - **Structural conventions get automated guards** — a convention enforced only by prose will be
   violated: `RequestContractCoverageTests`, `ContractSchemaAlignmentTests`,
-  `ComposeConfigurationTests`, `TestHostIsolationTests`, `Directory.Build.targets`,
+  `ComposeConfigurationTests`, `TestHostIsolationTests`, `LeafServiceBoundaryTests` (a service
+  that makes no outbound calls must register no `HttpClient`), `Directory.Build.targets`,
   `scripts/verify-db-isolation.sh`.
+- **These guards are duplicated per service on purpose.** `TestPostgreSql.Image`,
+  `ComposeConfigurationTests` and `TestHostIsolationTests` exist in both integration projects —
+  the assemblies must not reference each other, and each needs its own drift check. Copy them;
+  do not try to share them.
 - **Build and run the tests before declaring a task complete.** Report actual numbers, not
-  "tests pass".
+  "tests pass". Also run the integration tests once with `docker compose stop db` to prove the
+  harness is isolated — a suite that quietly uses the developer's database still passes.
 - Clean up any rows a smoke or E2E check creates.
 
-Further harness gotchas: `docs/ARCHITECTURE.md` §5.3.
+Further harness gotchas: `docs/ARCHITECTURE.md` §6.4. Concurrency-testing rules: §6.3.
 
 ## 7. Configuration and security
 
@@ -272,26 +323,47 @@ a broker is dead weight; CQRS without read pressure is ceremony.
 
 ## 10. Reference implementation rules
 
-**Catalog is the reference for Stock and Ordering.** Before copying a convention, verify it still
-fits the target service; do not duplicate Catalog-specific behaviour blindly.
+**Catalog is the structural reference; Stock is the worked example of adapting it.** Before
+copying a convention into Ordering, verify it still fits — Stock diverged from Catalog in five
+deliberate ways, each of which was the right call for that service:
 
-**Must change per service:** the connection-string key (`"Catalog"`), all `Catalog*` type names,
-the constraint names in `UniqueViolationDetail`, conflict-message wording, the entity under test
-in `ContractSchemaAlignmentTests`, and the port / database / role.
+| Catalog | Stock | Why |
+|---|---|---|
+| soft delete + `HasQueryFilter` | **none** | a filtered stock row looks like "no stock"; far more dangerous than a deleted product |
+| offset paging + `ProductPage` | **no list endpoint** | nothing needed it; symmetry is not a reason |
+| `decimal` money + currency | **`int` counters only** | stock is not money |
+| light concurrency test | **parallel overselling tests** | on `Product` a missed token loses a price edit; on `StockItem` it oversells |
+| DTO-limit vs column-limit guard | **enum/CHECK and bound guards** | copying the original verbatim would have matched nothing and passed vacuously |
 
-**Needs judgement, not copying:**
+**Must change per service:** the connection-string key, all `<Service>*` type names, the
+constraint names in `UniqueViolationDetail`, conflict-message wording, the entities under test in
+`ContractSchemaAlignmentTests`, and the port / database / role.
 
-- **Soft delete may not fit.** A product retires; a stock row should not be soft-deleted and an
-  order must never vanish from a list.
-- **`xmin` is low-stakes on `Product`, critical on `StockItem`**, where it prevents overselling.
-  Copy the mechanism; test it far harder.
-- **Domain guards differ.** Stock must enforce `QuantityOnHand - Reserved >= 0` — business logic,
-  not a copied guard clause.
+**Needs judgement, not copying:** soft delete, paging, money, domain guards (Stock enforces
+`Reserved <= QuantityOnHand` and `Available >= 0`), and which structural guards are meaningful for
+the entities at hand.
 
-Catalog is single-entity CRUD and exercises nothing distributed. Stock and Ordering will need what
-it lacks: a typed `HttpClient` plus interface seam, outbound correlation-id propagation, real
-nested request DTOs, order-line snapshotting, compensation, and a sequence for `OrderNumber`.
-Detail in `docs/ROADMAP.md`.
+**Copy verbatim, namespace only:** `DataAnnotationValidationFilter`, `CorrelationIdMiddleware`,
+`IRequestContract`, the test harness (`<Service>ApiFactory` / `Fixture` / `Collection`,
+`TestPostgreSql`, `TestHostIsolationTests`, `ComposeConfigurationTests`), and the error-handler
+skeleton — `DescribeForLog`, `Describe`, `DescribePostgres`, `SqlStateOf`, the cancellation arm,
+the `BadHttpRequestException` arm and the four invariants.
 
-**When a convention proves wrong for the second service, fix it in Catalog too.** Divergent
-conventions across three services are worse than one imperfect convention applied consistently.
+**Do not re-test copied infrastructure.** Stock asserts only that the filter is *wired* to its
+endpoint groups; its recursion behaviour is specified once, in Catalog's
+`DataAnnotationValidationFilterTests`. Re-testing identical code creates a second place to update
+and proves nothing.
+
+**Ordering will need what neither service has:** a typed `HttpClient` plus interface seam per
+downstream service, outbound correlation-id propagation via a `DelegatingHandler`, real nested
+request DTOs (the first genuine exercise of the validation cascade), order-line snapshotting of
+`ProductName` and `UnitPrice`, compensation that releases reservations when a later step fails,
+and a sequence for `OrderNumber`. Detail in `docs/ROADMAP.md`.
+
+**Duplication counter: 2 of 3.** The filter, middleware and error handler are now copied twice
+(~517 lines in Stock alone). Per `docs/DECISIONS.md`, **building Ordering is where the
+shared-library trigger fires** — raise it before the third copy, not after.
+
+**When a convention proves wrong for a later service, fix it in the earlier ones too.** One
+divergence is currently open: `StockApiFixture.DisposeAsync` guards disposal with `try/finally`
+while Catalog's does not.
