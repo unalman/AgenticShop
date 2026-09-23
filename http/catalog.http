@@ -1,0 +1,78 @@
+@host = http://localhost:5081
+
+### Health
+GET {{host}}/health
+
+### Create a product
+# @name createProduct
+POST {{host}}/api/v1/products
+Content-Type: application/json
+X-Correlation-Id: manual-smoke-test
+
+{
+  "sku": "ESP-001",
+  "name": "Espresso Machine",
+  "description": "Dual boiler, PID controlled.",
+  "price": 199.99,
+  "currency": "USD"
+}
+
+### Create a second product (currency omitted, defaults to USD)
+# @name createSecond
+POST {{host}}/api/v1/products
+Content-Type: application/json
+
+{
+  "sku": "GRD-001",
+  "name": "Burr Grinder",
+  "description": null,
+  "price": 89.5
+}
+
+### List products, page 1
+GET {{host}}/api/v1/products?page=1&size=20
+
+### List products including soft-deleted ones
+GET {{host}}/api/v1/products?includeInactive=true
+
+### Get a single product
+# Replace the id with the one returned by createProduct.
+GET {{host}}/api/v1/products/00000000-0000-0000-0000-000000000000
+
+### Update a product (SKU cannot change)
+PUT {{host}}/api/v1/products/00000000-0000-0000-0000-000000000000
+Content-Type: application/json
+
+{
+  "name": "Espresso Machine Pro",
+  "description": "Upgraded group head.",
+  "price": 249.50
+}
+
+### Soft delete a product (204, then invisible to the default list)
+DELETE {{host}}/api/v1/products/00000000-0000-0000-0000-000000000000
+
+### Duplicate SKU -> 409 Conflict with ProblemDetails
+POST {{host}}/api/v1/products
+Content-Type: application/json
+
+{
+  "sku": "ESP-001",
+  "name": "Duplicate",
+  "description": null,
+  "price": 1.00
+}
+
+### Negative price -> 400 ValidationProblemDetails
+POST {{host}}/api/v1/products
+Content-Type: application/json
+
+{
+  "sku": "BAD-001",
+  "name": "Invalid",
+  "description": null,
+  "price": -5.00
+}
+
+### Unknown product -> 404
+GET {{host}}/api/v1/products/11111111-1111-1111-1111-111111111111

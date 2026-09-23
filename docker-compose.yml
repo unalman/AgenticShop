@@ -1,0 +1,36 @@
+name: agenticshop
+
+# Phase 0 runs only PostgreSQL here. The three APIs run on the host via `dotnet watch`
+# for a fast inner loop; they get Dockerfiles and a `full` profile in Phase 1.
+#
+# POSTGRES_USER is a superuser used only to bootstrap databases and roles. The services
+# themselves connect with the per-service non-superuser roles created by init-dbs.sh, so
+# Catalog physically cannot reach the Stock or Ordering databases.
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: agenticshop-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agenticshop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?create a .env file from .env.example}
+      POSTGRES_DB: agenticshop_catalog
+      CATALOG_DB_PASSWORD: ${CATALOG_DB_PASSWORD:?create a .env file from .env.example}
+      STOCK_DB_PASSWORD: ${STOCK_DB_PASSWORD:?create a .env file from .env.example}
+      ORDERING_DB_PASSWORD: ${ORDERING_DB_PASSWORD:?create a .env file from .env.example}
+    ports:
+      # Bound to the loopback interface only. Publishing on 0.0.0.0 would expose a
+      # superuser login to everything else on the local network.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - agenticshop-db-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-dbs.sh:/docker-entrypoint-initdb.d/10-init-dbs.sh:ro
+      - ./scripts/verify-db-isolation.sh:/usr/local/bin/verify-db-isolation:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agenticshop} -d agenticshop_catalog"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  agenticshop-db-data:

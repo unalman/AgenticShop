@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AgenticShop.Catalog/AgenticShop.Catalog.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AgenticShop.Catalog.IntegrationTests/AgenticShop.Catalog.IntegrationTests.csproj" />
+    <Project Path="tests/AgenticShop.Catalog.UnitTests/AgenticShop.Catalog.UnitTests.csproj" />
+  </Folder>
+</Solution>

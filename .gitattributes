@@ -1,0 +1,9 @@
+# .NET normalises line endings; these files must keep theirs to stay executable.
+* text=auto
+
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.sln text eol=crlf
+*.slnx text eol=lf

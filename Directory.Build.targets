@@ -1,0 +1,37 @@
+<Project>
+
+  <!--
+    Service boundary guard.
+
+    AgenticShop services communicate over HTTP only. A ProjectReference from one service to
+    another would quietly turn the solution into a distributed monolith: compile-time
+    coupling, one deployment unit in all but name, and no way to exercise the failure modes
+    that the later roadmap phases exist to teach.
+
+    This lives in Directory.Build.targets rather than in a test so that it fails at build
+    time, and so that Stock and Ordering inherit the rule the moment their projects are
+    created under src/ — there is no test anyone has to remember to write.
+
+    Test projects are exempt: they live under tests/ and are supposed to reference the
+    service they exercise.
+  -->
+  <PropertyGroup>
+    <_AgenticShopProjectDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)').Replace('\','/'))</_AgenticShopProjectDir>
+    <_AgenticShopRepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)').Replace('\','/'))</_AgenticShopRepoRoot>
+    <_AgenticShopIsService Condition="$(_AgenticShopProjectDir.StartsWith('$(_AgenticShopRepoRoot)src/'))">true</_AgenticShopIsService>
+  </PropertyGroup>
+
+  <Target Name="EnforceServiceBoundaries"
+          BeforeTargets="BeforeBuild"
+          Condition="'$(_AgenticShopIsService)' == 'true'">
+
+    <ItemGroup>
+      <_AgenticShopCrossServiceReference Include="@(ProjectReference)"
+          Condition="$([System.String]::Copy('%(ProjectReference.FullPath)').Replace('\','/').Contains('/src/'))" />
+    </ItemGroup>
+
+    <Error Condition="'@(_AgenticShopCrossServiceReference)' != ''"
+           Text="Service boundary violation: $(MSBuildProjectName) references @(_AgenticShopCrossServiceReference->'%(Filename)'). AgenticShop services communicate over HTTP only. Remove the ProjectReference and instead define the contract you need in this service — an interface plus a typed HttpClient, as Ordering will do for Catalog and Stock." />
+  </Target>
+
+</Project>
