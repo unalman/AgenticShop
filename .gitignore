@@ -480,3 +480,7 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Qwen Code tool state (permissions, session settings).
+# Local agent configuration, not project content — never commit it.
+.qwen/
