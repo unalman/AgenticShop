@@ -1,8 +1,15 @@
 # Architecture
 
-Design detail behind the rules in `AGENTS.md`. Rationale for individual choices is in
-`DECISIONS.md`; open and resolved defects are in `KNOWN-ISSUES.md`; the phase sequence is in
-`ROADMAP.md`.
+**Global** design detail behind the rules in `AGENTS.md`: topology, boundary enforcement, the
+build system, the conventions every service shares, and the testing architecture.
+
+Service-specific design lives with the service:
+
+- `src/AgenticShop.Catalog/docs/ARCHITECTURE.md`
+- `src/AgenticShop.Stock/docs/ARCHITECTURE.md`
+
+Rationale for individual choices is in `DECISIONS.md` (and each service's own); open and
+resolved defects in `KNOWN-ISSUES.md` (likewise); the phase sequence in `ROADMAP.md`.
 
 Everything here describes the verified current state. Where something is planned but not
 built, it is marked as such.
@@ -24,9 +31,10 @@ Three independently deployed ASP.NET Core hosts communicating over HTTP only:
 | Stock | 5082 | `agenticshop_stock` | `stock_svc` | **implemented** |
 | Ordering | 5083 | `agenticshop_ordering` | `ordering_svc` | not created |
 
-Catalog is the reference implementation (§4); Stock is the worked example of adapting it (§5),
-and its five deliberate divergences are the evidence that the conventions transfer rather than
-merely copy.
+Catalog is the reference implementation and Stock is the worked example of adapting it; Stock's
+five deliberate divergences are the evidence that the conventions transfer rather than merely
+copy. Both are documented in their own `docs/ARCHITECTURE.md`. §4 below holds only what the two
+genuinely share.
 
 Ports are fixed in each service's `Properties/launchSettings.json` so cross-service
 configuration never drifts. In Phase 0 only PostgreSQL is containerised; the APIs run on the
@@ -140,18 +148,24 @@ code changes.
 
 ---
 
-## 4. Catalog reference implementation
+## 4. Shared service conventions
+
+These apply to every service identically. They are documented here rather than in a service
+folder because the code is copied per service — `DataAnnotationValidationFilter`,
+`CorrelationIdMiddleware`, `IRequestContract` and the exception-handler skeleton are
+byte-identical apart from namespace. Service-specific application of these conventions lives in
+`src/<Service>/docs/ARCHITECTURE.md`.
 
 ### 4.1 Project structure
 
 ```
-src/AgenticShop.Catalog/
+src/AgenticShop.<Service>/
 ├── Program.cs              composition root
 ├── Contracts/              request/response records + IRequestContract marker
-├── Data/                   CatalogDbContext, ProductConfiguration, Migrations/
-├── Domain/                 Product — invariants only, no EF, no ASP.NET
-├── Endpoints/              ProductEndpoints
-├── Errors/                 CatalogExceptionHandler
+├── Data/                   <Service>DbContext, <Entity>Configuration, Migrations/
+├── Domain/                 entities and invariants — no EF, no ASP.NET
+├── Endpoints/              one static class per resource
+├── Errors/                 <Service>ExceptionHandler
 ├── Middleware/             CorrelationIdMiddleware
 ├── Validation/             DataAnnotationValidationFilter
 └── Properties/launchSettings.json
@@ -161,51 +175,49 @@ One project per service. No `Api`/`Core`/`Application` split, no repository, ser
 mediator layer, no `Result<T>` monad, no mapping framework. Handlers call the `DbContext`
 directly. `Domain/` must not reference EF Core or ASP.NET Core types.
 
-`Contracts/` depends on `Domain/` — for the length constants and for `ProductResponse.From` —
+`Contracts/` depends on `Domain/` — for the limit constants and the `From(...)` projections —
 which is the correct inward direction.
+
+A service that calls another service adds a `Clients/` folder holding an interface plus a typed
+`HttpClient` implementation per downstream service. **Stock has none**, because it makes no
+outbound calls; Ordering will be the first.
 
 ### 4.2 Entities
 
-`Domain/Product.cs` is the template.
-
 - `private set` on every property; a `private` parameterless constructor marked as EF-only.
-- `static Create(...)` assigns `Id = Guid.NewGuid()` and both timestamps from one
+- A `static Create(...)` factory assigns `Id = Guid.NewGuid()` and all timestamps from one
   `DateTimeOffset.UtcNow` read, so `CreatedAtUtc == UpdatedAtUtc` on a new entity.
-- Explicit mutation methods (`Update`, `Deactivate`) instead of public setters.
-- **Guards run before any mutation.** `Update_LeavesTheProductUntouchedWhenAGuardRejects`
-  asserts the entity is byte-identical after a rejected call — otherwise EF would persist a
-  half-applied change on the next save.
-- Length limits are `public const int` — `SkuMaxLength = 64`, `NameMaxLength = 200`,
-  `DescriptionMaxLength = 2000`, `CurrencyLength = 3`, `DefaultCurrency = "USD"` — so
-  `Contracts/` and `Data/` reference one number instead of three copies.
+- Explicit mutation methods instead of public setters.
+- **Guards run before any mutation**, so a rejected call leaves the entity byte-identical —
+  otherwise EF would persist a half-applied change on the next save. Each service has a test
+  asserting exactly this.
+- Limits are `public const` on the entity, so `Contracts/` and `Data/` reference one number
+  instead of three copies.
 - `DateTimeOffset` for all timestamps, never `DateTime`. Npgsql maps it to
   `timestamp with time zone`, which is unambiguous across services.
-- Money is `decimal` plus a separate `Currency` string. **No `Money` value object** — it would
-  be a DDD construct the project has deferred.
-- Money rounds to 2dp with `MidpointRounding.AwayFromZero`, matching `numeric(18,2)`.
-- Currency is normalised with **`ToUpperInvariant`**, not `ToUpper`. This machine's culture is
-  Turkish, where `ToUpper` maps `i` to a dotted capital İ that is not an ASCII letter — so
-  `"ils"` would fail validation under `ToUpper` and pass under `ToUpperInvariant`. A unit test
-  pins this.
-- Currency is validated as exactly three ASCII letters per ISO 4217. The registry of assigned
-  codes is deliberately not embedded: it changes as codes are added and withdrawn, and a stale
-  allow-list would reject legitimate values while giving false confidence.
-- `Sku` is immutable after creation, because it is the identity key other services hold;
-  changing it would silently orphan their references.
-- Whitespace is trimmed; a blank `Description` normalises to `null` rather than `""`.
+- **Derived values are computed properties, never stored**, and marked `builder.Ignore(...)`
+  so a second copy of the truth cannot drift. Stock's `Available = QuantityOnHand - Reserved`
+  is the template.
+- Identity fields that other services hold are immutable after creation.
+- **A domain rejection that must map to 409 gets its own exception type carrying typed
+  properties.** `ArgumentException` maps to 400, so it cannot express a conflict. The handler
+  builds client-facing text from those properties, never from `Message`, so rewording an
+  exception cannot silently change the public contract.
 
 ### 4.3 EF Core configuration
 
-`Data/ProductConfiguration.cs`, one `IEntityTypeConfiguration<T>` per entity, discovered by
-`ApplyConfigurationsFromAssembly` in the `DbContext`.
+One `IEntityTypeConfiguration<T>` per entity, discovered by `ApplyConfigurationsFromAssembly`
+in the `DbContext`, which is a primary-constructor one-liner over `DbContextOptions<T>`.
 
-- Explicit snake_case `ToTable("products")`.
+- Explicit snake_case `ToTable(...)`. `UseSnakeCaseNamingConvention()` is applied on the
+  `DbContextOptionsBuilder`, not the Npgsql sub-builder. It also renames EF's own
+  `__EFMigrationsHistory` columns to `migration_id` / `product_version`, which surprises anyone
+  writing raw SQL against it.
+- Unique indexes are named through a `public const` **because the exception handler branches on
+  the name**. Leaving it to EF's convention would let a rename silently break a 409 message.
 - `HasPrecision(18, 2)` on money → `numeric(18,2)`.
-- Unique indexes are named through a `public const`
-  (`UniqueSkuIndexName = "ix_products_sku"`) **because the exception handler branches on the
-  name**. Leaving it to EF's convention would let a rename silently break the 409 message.
 
-**Optimistic concurrency.** Every entity carries a PostgreSQL `xmin` token:
+**Optimistic concurrency is mandatory on every entity:**
 
 ```csharp
 builder.Property<uint>("xmin").IsConcurrencyToken().ValueGeneratedOnAddOrUpdate();
@@ -217,28 +229,30 @@ binary, not just the XML docs. Instead `NpgsqlPostgresModelFinalizingConvention`
 
 The migration file contains an `AddColumn<uint>("xmin", type: "xid")` operation, but
 **`NpgsqlMigrationsSqlGenerator.SystemColumnNames` suppresses it when generating SQL**.
-Confirmed two ways: `dotnet ef migrations script` contains no occurrence of `xmin`, and
-`information_schema.columns` on the live database returns 0 rows for it. Inserts carry
-`RETURNING xmin;` so EF can refresh the token.
+Confirmed two ways in both services: `dotnet ef migrations script` contains no occurrence of
+`xmin`, and `information_schema.columns` on the live database returns 0 rows for it. Inserts
+carry `RETURNING xmin;` so EF can refresh the token.
 
-Without a concurrency token two overlapping writes both succeed and the second silently
-discards the first. On `Product` that is a lost price update; on `StockItem` it is overselling.
+Without a concurrency token two overlapping writes both succeed and the second silently discards
+the first. The stakes differ per service — a lost price edit on `Product`, overselling on
+`StockItem` — which is why the testing burden differs too.
 
-**Never `HasDefaultValue` on a non-nullable `bool`.** EF's sentinel for `bool` is `false`, so
-an explicit `false` is indistinguishable from "unset": EF omits the column from the INSERT and
-the database default is applied instead. A product created inactive would silently come back
-active. `ProductConfiguration` carries a comment explaining this; the default was removed in
-migration `AddXminConcurrencyAndDropIsActiveDefault`.
+**Never `HasDefaultValue` on a non-nullable `bool`.** EF's sentinel for `bool` is `false`, so an
+explicit `false` is indistinguishable from "unset": EF omits the column from the INSERT and the
+database default is applied instead.
 
-**Query filter.** `HasQueryFilter(p => p.IsActive)` makes deactivated rows invisible by
-default. No supporting index is needed: with the large majority of rows active a sequential
-scan is optimal and an index would be ignored.
+**`CHECK` constraints** are legitimate defence-in-depth, but their SQL is passed through
+verbatim, so it must name columns *after* snake_case renaming. Reading them back in a test
+requires `db.GetService<IDesignTimeModel>().Model` — `GetCheckConstraints()` throws against the
+read-optimised runtime model.
 
-`UseSnakeCaseNamingConvention()` is applied on the `DbContextOptionsBuilder`, not on the
-Npgsql sub-builder. It also renames EF's own `__EFMigrationsHistory` columns to
-`migration_id` / `product_version`, which surprises anyone writing raw SQL against it.
+Enum properties map with `.HasConversion<string>()` plus a `CHECK` listing the names, so state
+is readable in `psql` rather than as integers.
 
-The `DbContext` is a primary-constructor one-liner over `DbContextOptions<T>`.
+**A foreign key within one service's own database is fine** — Stock's
+`stock_reservations → stock_items` uses one, with `DeleteBehavior.Restrict` and `WithMany()`
+(no navigation property, so the object graph stays flat). What is forbidden is a key crossing a
+service boundary.
 
 ### 4.4 Migrations
 
@@ -246,31 +260,26 @@ Per service, under `Data/Migrations/`, namespace `<Service>.Data.Migrations`.
 
 ```powershell
 $env:ASPNETCORE_ENVIRONMENT = "Development"
-dotnet ef migrations add <Name> -p src/AgenticShop.Catalog -s src/AgenticShop.Catalog
-dotnet ef database update       -p src/AgenticShop.Catalog -s src/AgenticShop.Catalog
+dotnet ef migrations add <Name> -p src/AgenticShop.<Service> -s src/AgenticShop.<Service>
+dotnet ef database update       -p src/AgenticShop.<Service> -s src/AgenticShop.<Service>
 dotnet ef migrations script     -p ... -s ...   # inspect before applying anything non-trivial
 ```
 
-`ASPNETCORE_ENVIRONMENT=Development` is required so `appsettings.Development.json` supplies
-the connection string. There is **no design-time factory**; EF resolves the context through
-the app host, intercepting `Build()`, so code after it does not run at design time.
-
-Current migrations: `20260923143431_InitialCatalog`,
-`20260923154230_AddXminConcurrencyAndDropIsActiveDefault`.
+`ASPNETCORE_ENVIRONMENT=Development` is required so `appsettings.Development.json` supplies the
+connection string. There is **no design-time factory**; EF resolves the context through the app
+host, intercepting `Build()`, so code after it does not run at design time.
 
 Applied automatically at startup **only in `Development`** via `MigrateAsync()`. That guard is
 what avoids the multi-replica migration race — EF Core documents concurrent `Migrate` as
 unsafe. Production applies migrations explicitly via CLI.
 
-Migrations run as the service role (`catalog_svc`), which works precisely because that role
-owns the database.
+Migrations run as the service's own role, which works precisely because that role owns the
+database.
 
-A failed `DbCommand` line reading `Failed executing DbCommand` during `database update` is
-EF's benign probe for the existence of the history table, not a failure.
+A `Failed executing DbCommand` line during `database update` is EF's benign probe for the
+existence of the history table, not a failure.
 
 ### 4.5 Endpoints
-
-`Endpoints/ProductEndpoints.cs`:
 
 - One `static class <Resource>Endpoints` exposing a
   `Map<Resource>Endpoints(this IEndpointRouteBuilder)` extension called from `Program.cs`.
@@ -285,26 +294,24 @@ EF's benign probe for the existence of the history table, not a failure.
 - `201` + `Location` on create, `200` + body on update, `204` on delete, `404` when missing,
   `409` on conflict.
 
-Catalog routes:
-
-```
-GET    /api/v1/products?page=&size=&includeInactive=
-GET    /api/v1/products/{id:guid}
-POST   /api/v1/products
-PUT    /api/v1/products/{id:guid}
-DELETE /api/v1/products/{id:guid}
-GET    /health
-```
-
-`/health`, `/openapi/v1.json` and `/scalar/v1` are mapped in `Program.cs`. **The latter two
-are Development-only** — a publicly reachable Scalar UI is an interactive attack surface.
+`/health`, `/openapi/v1.json` and `/scalar/v1` are mapped in `Program.cs`. **The latter two are
+Development-only** — a publicly reachable Scalar UI is an interactive attack surface.
 
 Pipeline order in `Program.cs` matters: `UseCorrelationId()` runs **before**
-`UseExceptionHandler()`, so a failure raised by later middleware still carries a correlation
-id and the handler can read it.
+`UseExceptionHandler()`, so a failure raised by later middleware still carries a correlation id
+and the handler can read it.
 
 `Program.cs` ends with `public partial class Program;` — the `WebApplicationFactory<Program>`
 anchor for integration tests.
+
+**Multi-entity writes commit in a single `SaveChangesAsync`**, so EF wraps them in one
+transaction and the parts cannot disagree. Stock's counter update and reservation insert rely on
+this — and it is the property Phase 2's outbox will depend on, since an outbox row added to the
+same context would commit atomically with both.
+
+**Let the database reject duplicates rather than pre-checking.** `SELECT`-then-`INSERT` has a
+race window under retry; a unique index does not. Catalog's unique `sku` and Stock's
+`UNIQUE(order_id, stock_item_id)` are what make their create paths naturally idempotent.
 
 ### 4.6 Validation
 
@@ -333,18 +340,18 @@ The filter's contract:
   `DateTimeOffset`, `DateOnly`, `TimeOnly`, `TimeSpan`, `Guid`, `Uri`. `string` is checked
   **before** the `IEnumerable` branch, because strings are enumerable.
 - Failures return `Results.ValidationProblem(...)`.
-- The marker's own gap — forgetting to implement it — is closed by
+- The marker's own gap — forgetting to implement it — is closed by each service's
   `RequestContractCoverageTests`, which reflects over `Contracts/` and fails the build.
 
-Catalog has **no nested request DTO**. The cascade is proven by synthetic contracts in
-`DataAnnotationValidationFilterTests`; that suite is the specification Stock and Ordering
-inherit, and Ordering's `CreateOrderRequest` will be the first real one.
+**Neither service has a nested request DTO yet.** The cascade is proven by synthetic contracts
+in Catalog's `DataAnnotationValidationFilterTests`; that suite is the specification, and it is
+deliberately not duplicated in Stock. Ordering's `CreateOrderRequest` will be the first real one.
 
 ### 4.7 Error handling
 
-`Errors/CatalogExceptionHandler.cs` implements `IExceptionHandler` and always answers with
-`Results.Problem(...)` → `application/problem+json`, RFC 9457, carrying a `correlationId`
-extension. That shared shape is why no `AgenticShop.Shared` project is needed.
+Each service has a `<Service>ExceptionHandler` implementing `IExceptionHandler`, always
+answering with `Results.Problem(...)` → `application/problem+json`, RFC 9457, carrying a
+`correlationId` extension. That shared shape is why no `AgenticShop.Shared` project is needed.
 
 Classification, in switch order:
 
@@ -352,6 +359,7 @@ Classification, in switch order:
 |---|---|---|
 | `OperationCanceledException` **and** `RequestAborted` | *not handled* | `LogDebug`, `return false` |
 | `BadHttpRequestException` | **`badRequest.StatusCode`** | `null` |
+| service-specific domain conflicts | 409 | built from typed properties |
 | `DbUpdateConcurrencyException` | 409 | reload hint |
 | `DbUpdateException` + `23505` | 409 | keyed on constraint name |
 | `DbUpdateException` + `22001` / `22003` | 400 | too long / out of range |
@@ -362,15 +370,18 @@ Classification, in switch order:
 `BadHttpRequestException` uses its own `StatusCode` rather than a hardcoded 400 because an
 oversized body is a 413.
 
-Three invariants, all test-guarded:
+Four invariants, all test-guarded:
 
 1. **A client error is never a 5xx.** 5xx rates and error logs are how operators decide
    whether to page someone, so misclassifying bad input creates false alarms any caller can
    generate at will.
-2. **No exception message reaches the client.** `detail` is `null` for domain 400s and all
+2. **A server fault is never a 4xx.** A violated `CHECK` constraint restates an invariant the
+   entity already guards, so it can only mean our code has a bug; reporting it as 409 would
+   hide our defect inside the caller's error budget.
+3. **No exception message reaches the client.** `detail` is `null` for domain 400s and all
    500s. Those messages carry internal parameter names and are formatted with the *server's*
    culture — on this host `-5.00` renders as `-5,00`.
-3. **The handler decides severity, not EF Core.** Handled rejections log one `Warning` line
+4. **The handler decides severity, not EF Core.** Handled rejections log one `Warning` line
    with no exception object; unhandled failures log `Error` *with* the exception object, so
    the full inner chain and stack traces survive.
 
@@ -382,10 +393,11 @@ says only "see the inner exception for details". `PostgresException` is formatte
 surface `SqlState`, `MessageText`, and `table=` / `column=` / `constraint=` when present;
 `MessageText` is used rather than `Message`, which re-prefixes the same SQLSTATE.
 
-`Microsoft.EntityFrameworkCore.Update` is set to `"None"` in `appsettings.json`. EF logs every
-`SaveChanges` failure at Error with a full stack trace before rethrowing and cannot know
-whether it was handled, so a routine duplicate-key 409 used to emit roughly 40 lines. Severity
-classification belongs to the handler because only it knows whether the error was handled.
+`Microsoft.EntityFrameworkCore.Update` is set to `"None"` in every service's `appsettings.json`.
+EF logs every `SaveChanges` failure at Error with a full stack trace before rethrowing and
+cannot know whether it was handled, so a routine duplicate-key 409 used to emit roughly 40
+lines. Severity classification belongs to the handler because only it knows whether the error
+was handled.
 
 Client cancellation returns `false`, handing the exception back to the framework: there is no
 client left to receive a response, and logging it as an error would make every aborted request
@@ -413,262 +425,9 @@ still counts as a fault.
 Propagation is currently **inbound only**. Nothing forwards the header on outbound calls
 because no service makes any yet. See `ROADMAP.md`.
 
-### 4.9 Soft delete
-
-`IsActive` on the entity, `Deactivate()` as the only way to clear it, `HasQueryFilter` making
-deactivated rows invisible. `DELETE` returns `204` and never removes a row, so history stays
-queryable for orders that already reference the product. `includeInactive=true` applies
-`IgnoreQueryFilters()`.
-
-Consequences: `GET`, `PUT` and `DELETE` on a deactivated entity all return `404`, and there is
-**no reactivation path**.
-
-### 4.10 Paging
-
-`page` is 1-based and clamped to `>= 1`; `size` to `1..MaxPageSize`. Catalog uses
-`DefaultPageSize = 20`, `MaxPageSize = 100`. The response is a `<Resource>Page` record with
-`Items`, `Page`, `Size`, `TotalCount`, echoing the clamped values.
-
-**Order by a unique column** — Catalog uses `Sku`. Ordering by a non-unique column such as
-`Name` makes the paging window unstable: rows can be skipped or repeated across pages.
-
-`CountAsync` and `ToListAsync` are two queries outside a transaction, so `TotalCount` can
-disagree with the page under concurrent writes. Standard for offset paging and accepted; see
-`KNOWN-ISSUES.md`.
-
 ---
 
-## 5. Stock service
-
-The second service, and the test of whether Catalog's conventions transfer rather than merely
-copy. Stock owns inventory: it holds quantity against an order, then settles that hold as either
-shipped or cancelled.
-
-### 5.1 Position in the topology — a leaf service
-
-**Stock makes no outbound calls.** It has no `Clients/` folder, registers no `HttpClient` or
-`IHttpClientFactory`, and never resolves a product against Catalog. Only Ordering orchestrates.
-
-This is enforced at three levels: `Directory.Build.targets` rejects a compile-time reference;
-`LeafServiceBoundaryTests` asserts at runtime that no `HttpClient`/`IHttpClientFactory` is
-registered and that the assembly references no other `AgenticShop.*` assembly; and PostgreSQL
-refuses `catalog_svc` a connection to `agenticshop_stock`.
-
-Consequences accepted deliberately: Stock cannot tell you whether a product exists, so you *can*
-provision stock for a nonexistent `ProductId`. That is tolerable because the only caller in the
-real flow is Ordering, which validates against Catalog first. Stock also never learns a product's
-name or price — snapshotting those is Ordering's job.
-
-### 5.2 Domain
-
-`StockItem` — the inventory counter, one row per product:
-
-| Member | Notes |
-|---|---|
-| `ProductId` | **unique**; a plain `Guid`, because the product lives in Catalog's database |
-| `QuantityOnHand` | physical count |
-| `Reserved` | currently held, not yet shipped |
-| `Available` | **computed** `QuantityOnHand - Reserved`; `builder.Ignore`d, never persisted |
-| `MaxQuantity` | `1_000_000`, shared with the contracts so the counters cannot overflow `int` |
-
-Methods `Create`, `SetQuantityOnHand`, `Reserve`, `ConfirmReservation`, `ReleaseReservation`, all
-with guards before mutation. `SetQuantityOnHand` refuses to go below `Reserved`, or in-flight holds
-would stop being coverable.
-
-`StockReservation` — one row per hold: `StockItemId`, `OrderId`, `Quantity`, `Status`, timestamps,
-plus a computed `IsPending`. No navigation property to `StockItem`; endpoints load both explicitly.
-
-Two domain exceptions carry **typed properties rather than relying on `Message`**:
-`InsufficientStockException(Available, Requested)` and
-`InvalidReservationStateException(CurrentStatus, AttemptedStatus)`. The handler builds client-facing
-text from those properties, so a reworded exception cannot silently change the public contract.
-
-### 5.3 Why `Reserved` is a stored column
-
-It could be derived as `SUM(quantity)` over pending reservations. It is stored instead because that
-keeps the availability check and the mutation a **single-row operation guarded by one `xmin`
-token**. Deriving it would require an aggregate read plus a write in one transaction, and
-`StockItem`'s token would no longer cover reservation changes.
-
-The reservation table is the *audit trail of intent*; `Reserved` is the *counter that makes the
-check atomic*. Both are written by the **same `SaveChangesAsync`**, so they cannot disagree — and
-that single-transaction property is precisely what Phase 2's outbox will rely on, since an outbox
-row added to this context would commit atomically with both.
-
-### 5.4 Reservation lifecycle
-
-```
-                 reserve(q)
-   (no row) ─────────────────► PENDING
-                                 │  │
-                    confirm(q)   │  │   release(q)
-                                 ▼  ▼
-                           CONFIRMED  RELEASED      ← both terminal
-```
-
-| Transition | Effect on `StockItem` | Rationale |
-|---|---|---|
-| `reserve(q)` | `Reserved += q` | Holds the goods. `Available` drops immediately; `QuantityOnHand` is untouched |
-| `confirm(q)` | `QuantityOnHand -= q`, `Reserved -= q` | Goods leave. `Available` is unchanged — it already fell at reserve time |
-| `release(q)` | `Reserved -= q` | Order cancelled; hold lifted, `QuantityOnHand` untouched |
-
-`Reserved <= QuantityOnHand` holds after all three, so `Available` can never go negative.
-
-**Transitions are strict, not idempotent.** Confirming an already-`Confirmed` or `Released`
-reservation throws rather than succeeding quietly, because a silent no-op would hide a
-double-settle from the caller. The known cost: a retry after a successful confirm gets a 409.
-Phase 2's at-least-once delivery will require idempotency — that is what Phase 1's idempotency
-keys and the Inbox exist for. Until then **Ordering must treat "409 because already confirmed" as
-success.**
-
-There is no reservation expiry: no `ExpiresAtUtc`, no background worker. Release is an explicit
-call only. The expiry worker is Phase 3.
-
-### 5.5 Schema
-
-```
-stock_items
-  id                uuid         PK
-  product_id        uuid         NOT NULL, UNIQUE  (ix_stock_items_product_id)
-  quantity_on_hand  integer      NOT NULL   CHECK >= 0
-  reserved          integer      NOT NULL   CHECK >= 0, CHECK <= quantity_on_hand
-  updated_at_utc    timestamptz  NOT NULL
-  xmin              (system column — emits no DDL)
-
-stock_reservations
-  id              uuid         PK
-  stock_item_id   uuid         NOT NULL  FK → stock_items(id) ON DELETE RESTRICT
-  order_id        uuid         NOT NULL
-  quantity        integer      NOT NULL   CHECK > 0
-  status          varchar(20)  NOT NULL   CHECK IN ('Pending','Confirmed','Released')
-  created_at_utc  timestamptz  NOT NULL
-  updated_at_utc  timestamptz  NOT NULL
-  xmin            (system column — emits no DDL)
-  UNIQUE (order_id, stock_item_id)   ix_stock_reservations_order_id_stock_item_id
-  INDEX  (order_id)                  ix_stock_reservations_order_id
-```
-
-Two indexes carry real weight:
-
-- **`UNIQUE(order_id, stock_item_id)`** gives reserve natural idempotency, exactly as Catalog's
-  unique SKU does. Because `stock_items.product_id` is itself unique, `stock_item_id` is 1:1 with
-  `product_id` — so this enforces *one reservation per product per order* **without denormalising
-  `ProductId` onto the reservation**. A side effect worth stating: Ordering must combine duplicate
-  product lines.
-- **`INDEX(order_id)`** supports listing and releasing every reservation for an order — the
-  compensation path.
-
-The foreign key is legitimate *because both tables are in Stock's own database*. The prohibition is
-on keys crossing a service boundary, not on relational integrity within one.
-
-Status is stored as a **string** with a `CHECK`, so `psql` shows `Pending` rather than `0`. Being
-able to read reservation state directly matters once Phase 2 adds sagas. Cost: a
-`HasConversion<string>()` and a `varchar(20)`.
-
-Migration `20260923190112_InitialStock`, applied as `stock_svc`. Verified against the live
-database: `information_schema.columns` returns **0 rows for `xmin`** on both tables, and all three
-`stock_items` CHECK constraints are present in `pg_constraint`.
-
-### 5.6 Endpoints
-
-```
-GET    /api/v1/stock/{productId}                       200 | 404
-POST   /api/v1/stock                                   201 | 409 record exists | 400
-PUT    /api/v1/stock/{productId}                       200 | 404 | 409 xmin | 400
-POST   /api/v1/stock/{productId}/reservations          201 | 404 | 409 insufficient|duplicate | 400
-POST   /api/v1/reservations/{id}/confirm               200 | 404 | 409 wrong state|xmin
-POST   /api/v1/reservations/{id}/release               200 | 404 | 409 wrong state|xmin
-GET    /api/v1/reservations?orderId=                   200 | 400 when orderId missing
-GET    /health                                         200
-```
-
-There is **no list or paging endpoint for stock**. Catalog's paging convention is deliberately
-unexercised here; adding it "for symmetry" would be exactly the speculative generality the project
-avoids. `GET /reservations?orderId=` exists because it is cheap, indexed, and is the reconciliation
-path for a half-failed order.
-
-`orderId` is a required parameter, so omitting it is a `BadHttpRequestException` binding failure
-→ 400 from the handler, not a 500 and not an unbounded scan.
-
-### 5.7 Concurrency design
-
-Both entities carry the token:
-
-```csharp
-builder.Property<uint>("xmin").IsConcurrencyToken().ValueGeneratedOnAddOrUpdate();
-```
-
-How it prevents overselling: two requests both read `xmin=5`, `Available=5`, and both try to
-reserve 5. The first commits (`xmin` → 6). The second's `UPDATE ... WHERE id=@id AND xmin=5`
-matches zero rows → `DbUpdateConcurrencyException` → **409**. Without the token both would succeed
-and stock would go negative.
-
-**There is no server-side retry on conflict.** Resilience libraries are Phase 1, and the 409 is the
-honest signal that Ordering must learn to handle. It is also largely dissolved by Phase 2 — a queue
-with a single consumer serialises reservations, so contention disappears rather than being retried
-away.
-
-The measured cost, from a live 40-way burst against 10 units:
-
-```
-201=4   409=36   5xx=0   other=0   total=40
-reserved=4   quantity_on_hand=10   available=6
-pending reservation rows=4   sum(quantity)=4
-```
-
-**Only 4 of 10 units were held.** Safety is perfect; liveness under burst is poor, because 36
-requests lost the `xmin` race and were told 409 despite stock being available. A 20-way parallel
-confirm of one reservation produced `200=1, 409=19, 5xx=0` and shipped exactly once.
-
-This is the single most important input to the Ordering design: a synchronous order placement that
-reserves line by line will fail often under load, and Ordering must decide whether to retry,
-partial-fill, or fail the order.
-
-### 5.8 Divergences from Catalog
-
-Each was the right call for this service, and each is the evidence that the conventions transfer:
-
-| Catalog | Stock | Why |
-|---|---|---|
-| soft delete + `HasQueryFilter` | **none** | a filtered stock row reads as "no stock", which is more dangerous than a deleted product |
-| offset paging + `ProductPage` | **no list endpoint** | nothing needed it |
-| `decimal` money + currency | **`int` counters only** | stock is not money |
-| light concurrency test | **parallel overselling tests** | on `Product` a missed token loses a price edit; on `StockItem` it oversells |
-| DTO-limit vs column-limit guard | **enum/CHECK and bound guards** | copying the original verbatim would have matched nothing and passed vacuously |
-
-Copied verbatim, namespace only: `DataAnnotationValidationFilter`, `CorrelationIdMiddleware`,
-`IRequestContract`, the test harness, and the error-handler skeleton.
-
-### 5.9 Error classification specific to Stock
-
-| Case | Status | Note |
-|---|---|---|
-| `InsufficientStockException` | 409 | detail built from `Available`/`Requested` |
-| `InvalidReservationStateException` | 409 | detail names both states |
-| `DbUpdateConcurrencyException` | 409 | Stock-specific wording, not Catalog's "product" |
-| `23505` on `ix_stock_items_product_id` | 409 | "A stock record for that product already exists." |
-| `23505` on `ix_stock_reservations_order_id_stock_item_id` | 409 | "That order already has a reservation for this product." |
-| **`23514` CHECK violation** | **500** | deliberate — see below |
-
-**The CHECK-violation mapping reverses the original Stock plan**, which called for a 4xx. Every
-CHECK on these tables restates an invariant `StockItem` already guards, and `xmin` closes the
-concurrent path, so a violation can only mean *our* code has a bug. Reporting it as 409 would hide
-our own defect inside the caller's error budget. The invariant runs in both directions: a client
-error is never a 5xx, **and a server fault is never a 4xx**. No handler arm was added; the default
-arm already yields 500 at Error level, and `ACheckConstraintViolation_IsAServerFaultNotACallerError`
-pins it so nobody "fixes" it later.
-
-### 5.10 What Stock still does not exercise
-
-Stock is a leaf service with no outbound calls, so it did **not** test: the typed `HttpClient`
-seam, outbound correlation-id propagation, real nested request DTOs (the validation cascade is
-still proven only by synthetic contracts), order-line snapshotting, compensation across services,
-or a sequence-generated business number. Ordering will be the first service to exercise any of
-them.
-
----
-
-## 6. Testing architecture
+## 5. Testing architecture
 
 Two projects per service — `<Service>.UnitTests` and `<Service>.IntegrationTests` — rather
 than one shared test project, so fixtures do not multiply inside a single assembly.
@@ -689,7 +448,7 @@ Current counts, all passing:
 
 **276 total.** Build is clean under `TreatWarningsAsErrors`.
 
-### 6.1 Why Testcontainers and never a mocked DbContext
+### 5.1 Why Testcontainers and never a mocked DbContext
 
 Mocks pass while the real query fails. Concretely, only a real PostgreSQL could have surfaced:
 
@@ -702,7 +461,7 @@ Stock adds four more that no in-memory provider could produce: the `UNIQUE(order
 stock_item_id)` duplicate-hold `409`, the `CHECK` constraints and their `23514` SQLSTATE, the
 `RESTRICT` foreign key, and the enum-to-string conversion inside the `status IN (...)` check.
 
-### 6.2 Harness design
+### 5.2 Harness design
 
 Identical in shape for both services, and deliberately duplicated rather than shared — the two
 integration assemblies must not reference each other.
@@ -725,7 +484,7 @@ integration assemblies must not reference each other.
 - Tests that assert on `ProblemDetails` deserialise the response body rather than depending on
   an internal result type.
 
-### 6.3 Concurrency testing
+### 5.3 Concurrency testing
 
 **Anything with a mutable counter needs a parallel test, and a sequential one is not a
 substitute.** This is the strongest testing lesson Stock produced.
@@ -759,7 +518,7 @@ counter-vs-rows agreement check.
 Catalog has no equivalent, and deliberately so: `Product` has no contended numeric resource. Its
 `ConcurrencyTests` cover the token at the `DbContext` level only.
 
-### 6.4 Gotchas that have already bitten
+### 5.4 Gotchas that have already bitten
 
 - **The connection string must be resolved lazily inside the `AddDbContext` callback.**
   `WebApplicationFactory.ConfigureAppConfiguration` applies its override *during* `Build()`.
@@ -787,7 +546,7 @@ Catalog has no equivalent, and deliberately so: `Product` has no contended numer
 - `TestPostgreSql.Image` is each project's single declaration of the PostgreSQL image tag;
   `docker-compose.yml` states its own and both `ComposeConfigurationTests` fail if they diverge.
 
-### 6.5 Structural guards
+### 5.5 Structural guards
 
 A convention enforced only by prose will be violated. These fail the build or the suite:
 

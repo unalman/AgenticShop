@@ -1,4 +1,7 @@
-# Known issues
+# Known issues — global
+
+Issues that affect the repository, the build, the shared infrastructure, or more than one service.
+Service-specific items live in `src/<Service>/docs/KNOWN-ISSUES.md`.
 
 Open items are accepted residuals with a named owner phase — not a backlog to clear
 opportunistically. Resolved items are kept because *what caught them* is the instructive part.
@@ -32,10 +35,9 @@ the 3 validation ones were silent. "Clients are sending invalid data" is therefo
 Logging every malformed request would be noise, so this wants metrics or sampled request logging
 rather than a log line.
 
-**`DbUpdateConcurrencyException` logs the least useful line in Stock.** *Low · Phase 1.* Under
-contention this is Stock's most common rejection, and each warning carries EF's full boilerplate
-including a documentation URL — roughly 230 characters. In one verified run, **55 of 144 log
-lines** were this message and the URL appeared 55 times.
+**`DbUpdateConcurrencyException` logs the least useful line under contention.** *Low · Phase 1.*
+Each warning carries EF's full boilerplate including a documentation URL — roughly 230 characters.
+In one verified Stock run, **55 of 144 log lines** were this message and the URL appeared 55 times.
 
 `DescribeForLog` is not at fault: it walked the chain correctly and found nothing to walk to,
 because a zero-rows-affected `UPDATE` is not a SQL error and there is no inner `PostgresException`.
@@ -45,32 +47,10 @@ diagnostic.
 
 A special case in `Describe` would reduce it to something like
 `DbUpdateConcurrencyException: 0 rows affected (concurrency token mismatch)`. Not done, because the
-fix belongs in **both** handlers and Catalog's is committed — raising it rather than folding it in.
-Good candidate to batch with the shared-library decision, which now stands at 2 of 3.
-
-### Concurrency
-
-**Contention throughput is poor by design.** *Medium · Phase 1 (retry) or Phase 2 (serialisation).*
-A live 40-way burst against 10 units held only **4** — 36 requests lost the `xmin` race and were
-told 409 despite stock being available. Nothing is oversold and nothing is a 5xx, so this is
-correct optimistic-concurrency behaviour with no server-side retry (decision D9), not a defect.
-
-It matters because Ordering's synchronous order placement will reserve line by line and will fail
-often under load. Either Phase 1 adds retry, or Phase 2's single-consumer queue dissolves the
-contention entirely. Ordering must decide in the meantime whether to retry, partial-fill, or fail
-the order.
+fix belongs in **both** handlers — raising it rather than folding it in. Good candidate to batch
+with the shared-library decision, which now stands at 2 of 3.
 
 ### Testing
-
-**Catalog has no HTTP-level optimistic-concurrency test.** *Low · deliberate.* The `xmin` token is
-proven at the `DbContext` level (`ConcurrencyTests`, two independent units of work) and the 409
-mapping is proven in `CatalogExceptionHandlerTests`. It cannot be provoked deterministically over
-HTTP: each request loads the row fresh, so it always carries the current `xmin`. Only two genuinely
-overlapping requests collide, and a racing test would be flaky.
-
-Stock is different and **does** have HTTP-level parallel tests (`OversellingConcurrencyTests`),
-because there the counter is contended and the consequence of a missed token is overselling rather
-than a lost price edit. See `ARCHITECTURE.md` §6.3.
 
 **Sequential state-machine tests do not prove concurrency safety.** *Info, but load-bearing.*
 Verified from Stock's logs: in a 20-way parallel confirm burst all 20 requests passed the
@@ -87,44 +67,28 @@ order-dependent. Applies to both fixtures.
 services now means **two** PostgreSQL containers concurrently; three will mean three. Worth knowing
 before CI.
 
-**`CatalogApiFixture.DisposeAsync` is not exception-safe.** *Low.* If `_factory.DisposeAsync()`
-throws, `_postgres.DisposeAsync()` never runs and the container leaks until Ryuk reaps it. Wants a
-`try/finally`. **`StockApiFixture` already has one** — fixed forward rather than copied, which makes
-this a live divergence between the two services. Per `AGENTS.md` §10 the Catalog fixture should be
-brought in line.
-
 **`coverlet.collector` is referenced but nothing consumes it.** *Low.* In all four test projects.
 No coverage report, threshold or CI step. Either wire up `--collect:"XPlat Code Coverage"` or drop
 the reference.
 
-**Structural guards are duplicated per service, by design.** *Info.* `TestPostgreSql.Image`,
-`ComposeConfigurationTests`, `TestHostIsolationTests` and `RequestContractCoverageTests` now exist
-in both integration/unit projects, and `ContractSchemaAlignmentTests` exists in both but with
-completely different content — Stock's had to be rewritten because Catalog's version would have
-matched nothing and passed vacuously. Sharing them would require the test assemblies to reference
-each other, which is the coupling the design avoids.
+**`CatalogApiFixture.DisposeAsync` is not exception-safe.** *Low.* If `_factory.DisposeAsync()`
+throws, `_postgres.DisposeAsync()` never runs and the container leaks until Ryuk reaps it. Wants a
+`try/finally`. **`StockApiFixture` already has one** — fixed forward rather than copied. Recorded
+here rather than in a service file because it is a divergence *between* the two services, and
+`AGENTS.md` §10 says a later service's improvement should be carried back to the earlier one.
 
-**Minor test-debt items.** *Info.* `Deactivate()` bumps `UpdatedAtUtc` but nothing asserts it.
-`Create_RejectsNegativePrice` casts `double`→`decimal` while the rounding theory two tests above
-deliberately uses invariant-culture strings — the inconsistency invites an imprecise case later.
+**Structural guards are duplicated per service, by design.** *Info.* `TestPostgreSql.Image`,
+`ComposeConfigurationTests`, `TestHostIsolationTests` and `RequestContractCoverageTests` exist in
+both test suites, and `ContractSchemaAlignmentTests` exists in both but with completely different
+content — Stock's had to be rewritten because Catalog's version would have matched nothing and
+passed vacuously. Sharing them would require the test assemblies to reference each other, which is
+the coupling the design avoids.
 
 ### Data and API
 
-**Paging is offset-based and not atomic.** *Low.* `CountAsync` and `ToListAsync` are two queries
-outside a transaction, so `TotalCount` can disagree with the page under concurrent writes.
-Standard, and acceptable at this scale. Keyset paging is the eventual answer.
-
-**Soft-deleted entities cannot be reactivated.** *Low.* `Update` does not accept `IsActive` and
-no endpoint exposes it, so an accidental `DELETE` is only reversible with SQL. Possibly
-intentional; never explicitly decided.
-
-**Unknown JSON fields are silently ignored.** *Info.* Verified: `{"bogus":1}` returns 201. Good
-for forward compatibility, but a client typo like `"prices": 5` is accepted and silently falls
-back to the default.
-
-**`Product.Create` assigns its own `Guid`.** *Info.* A caller cannot supply a deterministic id.
-Fine for idempotency keyed on a client token, but worth knowing before designing
-client-generated identities.
+**Unknown JSON fields are silently ignored.** *Info.* Verified in Catalog: `{"bogus":1}` returns
+201. Framework behaviour, so it applies to every service. Good for forward compatibility, but a
+client typo like `"prices": 5` is accepted and silently falls back to the default.
 
 ### Infrastructure
 
@@ -139,33 +103,27 @@ property in each service `.csproj`, or a guard test asserting the target still e
 machine — a second worktree, or a CI job alongside local development.
 
 **`global.json` pins `10.0.400` with `rollForward: latestFeature`.** *Low.* Rejects a machine
-that only has `10.0.1xx`. Deliberate for reproducibility, but it will surprise a new
-contributor.
+that only has `10.0.1xx`. Deliberate for reproducibility, but it will surprise a new contributor.
 
 **`CentralPackageTransitivePinningEnabled` is repo-wide.** *Info.* Any future `PackageVersion`
-entry also overrides transitive versions of that package everywhere, so adding a direct
-reference can silently shift a transitive dependency elsewhere. Contained today because only
-EF Core packages are declared.
+entry also overrides transitive versions of that package everywhere, so adding a direct reference
+can silently shift a transitive dependency elsewhere. Contained today because only EF Core packages
+are declared.
 
 **PostgreSQL image tag is declared in three places.** *Info.* `docker-compose.yml` plus one
 `TestPostgreSql.Image` per integration project. Both `ComposeConfigurationTests` fail if they
 diverge, so drift is caught rather than silent — but it is three places to edit, and it becomes
 four with Ordering.
 
-**Stock cannot validate that a product exists.** *Info · deliberate.* As a leaf service it makes
-no outbound call, so stock can be provisioned for a `ProductId` that Catalog has never heard of.
-Accepted because the only caller in the real flow is Ordering, which validates first. If a direct
-admin path to Stock is ever exposed, this becomes a real gap.
-
 **No CORS policy.** *Info.* Irrelevant for service-to-service; will block a browser admin UI.
 
 **`AllowedHosts: "*"`, no rate limiting, no HTTPS/HSTS.** *Info.* Correct for local Phase 0.
 Tighten before any non-local deployment.
 
-**`UserSecretsId` is declared but unused.** *Info.* `appsettings.Development.json` holds the
-local placeholder instead. It is documented in `README.md` as the mechanism for anyone wanting
-different local values, which makes it meaningful rather than decorative — but nothing enforces
-that.
+**`UserSecretsId` is declared but unused.** *Info.* Both services declare one;
+`appsettings.Development.json` holds the local placeholder instead. It is documented in
+`README.md` as the mechanism for anyone wanting different local values, which makes it meaningful
+rather than decorative — but nothing enforces that.
 
 **FluentAssertions 8.x licensing.** *Info.* Free for open-source, personal and educational use;
 licensed above a revenue threshold commercially. Relevant if this becomes a portfolio piece
@@ -178,27 +136,16 @@ handler and correlation middleware are copied into Stock (~517 lines). See the t
 `DECISIONS.md`: **building Ordering fires it**, not Phase 1, because the error handler's
 chain-describing logic is already entirely generic.
 
-**Reservation transitions are strict, not idempotent.** A retried confirm returns 409. Deliberate
-(decision D3); Ordering must treat that specific 409 as success until Phase 1/2 adds real
-idempotency.
-
-**No server-side retry on `xmin` conflict.** Deliberate (decision D9); see the contention-throughput
-item above.
-
-**`Currency` carries both `[StringLength(3,3)]` and `[RegularExpression]`.** Redundant on
-length, intentional: one guards the column, the other the charset, and Catalog's
-`ContractSchemaAlignmentTests` depends on `StringLength` being present.
-
-**Stock has no list endpoint.** Deliberate; nothing needed it and symmetry is not a reason.
-
 **Catalog-only conventions are not house style.** Soft delete, query filters and offset paging
 belong to Catalog. Stock has none of them, and an order must never vanish from a list either.
+Details in `src/AgenticShop.Catalog/docs/DECISIONS.md`.
 
 ---
 
 ## Resolved
 
-Kept for the lesson, not the fix.
+Kept for the lesson, not the fix. These concern shared infrastructure or the repository itself;
+service-specific findings are recorded with the service.
 
 ### Minimal APIs do not validate body DTOs → HTTP 500
 
@@ -229,8 +176,8 @@ nested DTO; it would have broken Ordering's `CreateOrderRequest.Lines`. Fixed by
 `WebApplicationFactory.ConfigureAppConfiguration` applies its override *during* `Build()`, so the
 Testcontainers connection string never reached the `DbContext`. **25 tests passed while
 truncating and writing the real local database**, and the container sat unused. Fixed by
-resolving lazily and validating after `Build()`; `TestHostIsolationTests` now guards it.
-**Caught by:** an E2E smoke check finding a stray row — not by the test suite.
+resolving lazily and validating after `Build()`; `TestHostIsolationTests` now guards it in both
+services. **Caught by:** an E2E smoke check finding a stray row — not by the test suite.
 
 ### The service boundary was asserted, not enforced
 
@@ -243,15 +190,8 @@ complaint. Fixed with per-service non-superuser roles, ownership, and
 ### PostgreSQL exposed on all interfaces
 
 `0.0.0.0:5432` with a superuser and a password published in a committed file — reachable from
-anything on the local network. Fixed by binding `127.0.0.1`, now guarded by
+anything on the local network. Fixed by binding `127.0.0.1`, now guarded by both
 `ComposeConfigurationTests`. **Caught by:** `docker port` during review.
-
-### `HasDefaultValue(true)` on a non-nullable `bool`
-
-EF's sentinel for `bool` is `false`, so an explicit `false` would be dropped from the INSERT and
-the database default applied instead — a product created inactive would come back active.
-Latent: unreachable while `Create` always set `true`, which is exactly why it was dangerous.
-Fixed by removing the default. **Caught by:** reading the model snapshot.
 
 ### Internal exception messages leaked to clients
 
@@ -271,9 +211,9 @@ chain and dropping the appended punctuation. **Caught by:** reading a real log l
 
 `Microsoft.EntityFrameworkCore.Update` logs every `SaveChanges` failure at Error before
 rethrowing and cannot know whether it was handled, which defeated the `warn`-vs-`fail`
-distinction the handler exists to make. Fixed by silencing the category; the handler still logs
-genuine failures at Error with the exception attached. **Caught by:** a task-notification log
-tail.
+distinction the handler exists to make. Fixed by silencing the category in both services; the
+handler still logs genuine failures at Error with the exception attached.
+**Caught by:** a task-notification log tail.
 
 ### `UseXminAsConcurrencyToken()` does not exist in Npgsql 10
 
@@ -296,31 +236,3 @@ from a test assembly. `PostgresException` fields are read-only. All caught by th
 command line. A smoke test intended to run without migrations ran them instead and crashed on an
 unreachable database. Documented rather than fixed; use `--no-launch-profile`.
 **Caught by:** a startup crash.
-
-### `GetCheckConstraints()` throws against EF's runtime model
-
-Writing Stock's schema-alignment guard failed with "The requested configuration is not stored in
-the read-optimized model". Check constraints are a design-time concept; reading them back needs
-`db.GetService<IDesignTimeModel>().Model`, and that type is in
-`Microsoft.EntityFrameworkCore.Metadata`, not `.Infrastructure`. **Caught by:** the compiler, then
-a test failure.
-
-### A copied structural guard would have passed vacuously
-
-Catalog's `ContractSchemaAlignmentTests` compares DTO string limits against column limits. Stock has
-almost no length-constrained strings, so a verbatim copy would have matched zero properties and
-passed while proving nothing — the exact failure its non-vacuity assertion exists to catch. Fixed by
-rewriting the guard around Stock's real drift risks. **Caught by:** reasoning about the copy before
-making it, which is why `AGENTS.md` §10 says to verify a convention still fits.
-
-### A test asserted a 404 the API was right to return
-
-`ListByOrder_ReturnsEveryReservationWithItsProduct` seeded a third reservation for a product with
-no stock record. Stock correctly answered 404 and the assertion failed. The test was wrong, not the
-code. **Caught by:** the test itself.
-
-### FluentAssertions API misuse in new test code
-
-`ThrowAsync<T>().Subject` does not yield the exception — it is `.And`. `NotContain(char)` has no
-overload, so a `string` is required. `BeExactly` does not exist on the relevant assertion type.
-Three separate compile breaks in one pass. **Caught by:** the compiler.

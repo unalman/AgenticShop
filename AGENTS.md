@@ -1,11 +1,26 @@
 # AGENTS.md
 
-Operational rules for AI agents working in this repository. Read before changing code.
+**Global** operational rules for AI agents working in this repository. Read before changing code.
 
-Rationale, history, deferred items and known issues live in `docs/`: `ARCHITECTURE.md` (design
-and the full Catalog reference) · `DECISIONS.md` (why each choice was made) ·
-`KNOWN-ISSUES.md` (open and resolved) · `ROADMAP.md` (phases). This file is the subset an agent
-needs to work safely; where it summarises, `docs/` explains.
+> **Working on one service? Also read its own `AGENTS.md`.**
+> `src/AgenticShop.Catalog/AGENTS.md` · `src/AgenticShop.Stock/AGENTS.md`
+>
+> Service-specific rules live there — soft delete, paging and money for Catalog; the leaf-service
+> rule, reservation state machine and counter invariant for Stock. This file holds only what
+> applies everywhere. Applying one service's convention to another is the most likely mistake
+> available here.
+
+Rationale, history, deferred items and known issues live in `docs/` and in each service's own
+`docs/`:
+
+| Scope | Architecture | Decisions | Known issues |
+|---|---|---|---|
+| **Global** | `docs/ARCHITECTURE.md` | `docs/DECISIONS.md` | `docs/KNOWN-ISSUES.md` |
+| **Catalog** | `src/AgenticShop.Catalog/docs/ARCHITECTURE.md` | `…/DECISIONS.md` | `…/KNOWN-ISSUES.md` |
+| **Stock** | `src/AgenticShop.Stock/docs/ARCHITECTURE.md` | `…/DECISIONS.md` | `…/KNOWN-ISSUES.md` |
+
+Phases are in `docs/ROADMAP.md`. This file is the subset an agent needs to work safely; where it
+summarises, `docs/` explains.
 
 ## 1. Project overview
 
@@ -89,7 +104,8 @@ docker compose exec db bash /usr/local/bin/verify-db-isolation   # 22 checks; no
 
 ## 5. Coding conventions
 
-Full detail and rationale: `docs/ARCHITECTURE.md` §4 (Catalog) and §5 (Stock).
+Shared conventions in full: `docs/ARCHITECTURE.md` §4. Service-specific design:
+`src/AgenticShop.Catalog/docs/ARCHITECTURE.md` and `src/AgenticShop.Stock/docs/ARCHITECTURE.md`.
 
 **Structure.** One project per service. **No** `Api`/`Core`/`Application` split, no repository,
 service or mediator layer — handlers call the `DbContext` directly.
@@ -202,15 +218,11 @@ untrusted:** accept only 1–128 characters of ASCII letters, digits and `-_.`; 
 **replace** with a minted id, never reject the request. Registered first, before
 `UseExceptionHandler`. Inbound-only for now.
 
-**Soft delete — Catalog-specific, not a house style.** `IsActive` + `Deactivate()` +
-`HasQueryFilter`; `DELETE` returns `204` and never removes a row; `includeInactive=true` applies
-`IgnoreQueryFilters()`. **Stock has none of this** — a filtered stock row reads as "no stock",
-which is more dangerous than a deleted product.
-
-**Paging — Catalog-specific so far.** `page` is 1-based, clamped `>= 1`; `size` clamped
-`1..MaxPageSize` (Catalog: 20 / 100). Response is a `<Resource>Page` record: `Items`, `Page`,
-`Size`, `TotalCount`. **Order by a unique column** or the window is unstable. Stock has no list
-endpoint; add one only when something needs it.
+**Service-specific conventions are not listed here.** Soft delete, query filters, offset paging,
+money and currency live in `src/AgenticShop.Catalog/AGENTS.md`; the leaf-service rule, the
+reservation state machine, the counter invariant and the strict-transition rule live in
+`src/AgenticShop.Stock/AGENTS.md`. **Read the service file before editing that service** — the
+most dangerous mistake available is applying one service's convention to another.
 
 **Multi-entity writes commit in one `SaveChangesAsync`** so EF wraps them in one transaction —
 Stock's counter update and reservation insert can never disagree. This is what Phase 2's outbox
@@ -267,7 +279,7 @@ Two projects per service: `<Service>.UnitTests` and `<Service>.IntegrationTests`
   harness is isolated — a suite that quietly uses the developer's database still passes.
 - Clean up any rows a smoke or E2E check creates.
 
-Further harness gotchas: `docs/ARCHITECTURE.md` §6.4. Concurrency-testing rules: §6.3.
+Further harness gotchas: `docs/ARCHITECTURE.md` §5.4. Concurrency-testing rules: §5.3.
 
 ## 7. Configuration and security
 
@@ -324,24 +336,18 @@ a broker is dead weight; CQRS without read pressure is ceremony.
 ## 10. Reference implementation rules
 
 **Catalog is the structural reference; Stock is the worked example of adapting it.** Before
-copying a convention into Ordering, verify it still fits — Stock diverged from Catalog in five
-deliberate ways, each of which was the right call for that service:
-
-| Catalog | Stock | Why |
-|---|---|---|
-| soft delete + `HasQueryFilter` | **none** | a filtered stock row looks like "no stock"; far more dangerous than a deleted product |
-| offset paging + `ProductPage` | **no list endpoint** | nothing needed it; symmetry is not a reason |
-| `decimal` money + currency | **`int` counters only** | stock is not money |
-| light concurrency test | **parallel overselling tests** | on `Product` a missed token loses a price edit; on `StockItem` it oversells |
-| DTO-limit vs column-limit guard | **enum/CHECK and bound guards** | copying the original verbatim would have matched nothing and passed vacuously |
+copying a convention into another service, verify it still fits. Stock diverged from Catalog in
+five deliberate ways — no soft delete, no paging, no money, parallel rather than sequential
+concurrency tests, and rewritten structural guards. The table and the reasoning are in
+`src/AgenticShop.Stock/docs/ARCHITECTURE.md` §8.
 
 **Must change per service:** the connection-string key, all `<Service>*` type names, the
 constraint names in `UniqueViolationDetail`, conflict-message wording, the entities under test in
 `ContractSchemaAlignmentTests`, and the port / database / role.
 
-**Needs judgement, not copying:** soft delete, paging, money, domain guards (Stock enforces
-`Reserved <= QuantityOnHand` and `Available >= 0`), and which structural guards are meaningful for
-the entities at hand.
+**Needs judgement, not copying:** soft delete, paging, money, domain guards, and which structural
+guards are meaningful for the entities at hand. A copied guard that matches nothing passes
+vacuously — that already happened once.
 
 **Copy verbatim, namespace only:** `DataAnnotationValidationFilter`, `CorrelationIdMiddleware`,
 `IRequestContract`, the test harness (`<Service>ApiFactory` / `Fixture` / `Collection`,
@@ -354,16 +360,11 @@ endpoint groups; its recursion behaviour is specified once, in Catalog's
 `DataAnnotationValidationFilterTests`. Re-testing identical code creates a second place to update
 and proves nothing.
 
-**Ordering will need what neither service has:** a typed `HttpClient` plus interface seam per
-downstream service, outbound correlation-id propagation via a `DelegatingHandler`, real nested
-request DTOs (the first genuine exercise of the validation cascade), order-line snapshotting of
-`ProductName` and `UnitPrice`, compensation that releases reservations when a later step fails,
-and a sequence for `OrderNumber`. Detail in `docs/ROADMAP.md`.
-
 **Duplication counter: 2 of 3.** The filter, middleware and error handler are now copied twice
 (~517 lines in Stock alone). Per `docs/DECISIONS.md`, **building Ordering is where the
 shared-library trigger fires** — raise it before the third copy, not after.
 
 **When a convention proves wrong for a later service, fix it in the earlier ones too.** One
-divergence is currently open: `StockApiFixture.DisposeAsync` guards disposal with `try/finally`
-while Catalog's does not.
+divergence is currently open; see `docs/KNOWN-ISSUES.md`.
+
+What Ordering will need that neither service has is listed in `docs/ROADMAP.md`.

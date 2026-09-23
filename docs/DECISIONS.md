@@ -1,7 +1,16 @@
 # Decisions
 
-Every significant choice, why it was made, and what would reopen it. Rules live in
-`AGENTS.md`; design detail in `ARCHITECTURE.md`; open problems in `KNOWN-ISSUES.md`.
+**Global** choices: platform, topology, boundaries, the shared error contract, validation,
+testing strategy, security, and what is deliberately not built yet. Why each was made and what
+would reopen it.
+
+Service-specific decisions live with the service and are not repeated here:
+
+- `src/AgenticShop.Catalog/docs/DECISIONS.md` — soft delete, paging, money and currency
+- `src/AgenticShop.Stock/docs/DECISIONS.md` — D1–D14 plus three taken during implementation
+
+Rules live in `AGENTS.md`; design detail in `ARCHITECTURE.md`; open problems in
+`KNOWN-ISSUES.md`.
 
 Entries are grouped by theme, not ordered by time. "Revisit" names the trigger, so a decision
 is changed deliberately rather than drifted away from.
@@ -187,49 +196,16 @@ rows for it.
 second silently discards the first. On `Product` that is a lost price update; on `StockItem` it
 is overselling.
 
-### No `HasDefaultValue` on a non-nullable `bool`
-
-**Context.** `IsActive` originally had `HasDefaultValue(true)`.
-
-**Decision.** Removed. The domain always assigns `IsActive`.
-
-**Why.** EF's sentinel for `bool` is `false`. With a store default present, an explicit `false`
-is indistinguishable from "unset": EF omits the column from the INSERT and the default is
-applied, so a product created inactive would silently come back active. Latent — unreachable
-while `Create` always sets `true` — which is exactly why it was dangerous. If a database
-default is ever needed for raw SQL inserts, add `.HasSentinel(null)` instead.
-
 ### Unique indexes named through a `public const`
 
-`ProductConfiguration.UniqueSkuIndexName`. The exception handler branches on the constraint
-name to produce an accurate 409 message, so leaving the name to EF's convention would let a
-rename silently make every unique violation report "duplicate SKU".
+`ProductConfiguration.UniqueSkuIndexName`, `StockItemConfiguration.UniqueProductIndexName`,
+`StockReservationConfiguration.UniqueOrderStockItemIndexName`. Each service's exception handler
+branches on the constraint name to produce an accurate 409 message, so leaving the name to EF's
+convention would let a rename silently make every unique violation report the wrong cause.
 
-### `decimal` plus a `Currency` column, no `Money` value object
-
-A `Money` type is a DDD tactical construct, and DDD is deferred. `numeric(18,2)` with
-`HasPrecision(18, 2)` and a `varchar(3)` currency is sufficient and keeps the schema legible.
-
-### Currency validated by format, not by registry
-
-Three ASCII letters per ISO 4217. Embedding the list of assigned codes was rejected: it changes
-as codes are added and withdrawn, and a stale allow-list rejects legitimate values while giving
-false confidence. `ToUpperInvariant` rather than `ToUpper` because this host's culture is
-Turkish, where `ToUpper` maps `i` to a dotted capital that is not ASCII.
-
-### Offset paging ordered by a unique column
-
-`OrderBy(Sku)`, not `Name`. Paging over a non-unique column is unstable — rows can be skipped
-or repeated across pages. `CountAsync` plus `ToListAsync` are two queries outside a
-transaction, so `TotalCount` can disagree with the page under concurrent writes; standard for
-offset paging and accepted. **Revisit:** keyset paging when a table is large enough to care.
-
-### Soft delete
-
-`IsActive` + `Deactivate()` + `HasQueryFilter`, with `includeInactive=true` as the escape
-hatch. Chosen so history stays queryable for orders that already reference a product.
-Consequences accepted: deactivated entities 404 on every route, and there is no reactivation
-path. **Revisit:** whether soft delete suits Stock and Ordering at all — it probably does not.
+The fallback arm matters as much as the named ones: a third unique index added without a matching
+case reports "The value conflicts with an existing record" rather than misattributing the
+conflict. Both handlers are tested for that.
 
 ---
 
@@ -386,7 +362,7 @@ when OpenTelemetry arrives, or there will be two parallel correlation concepts.
 
 ### Testcontainers, never a mocked `DbContext`
 
-See `ARCHITECTURE.md` §6.1 for the concrete cases only a real PostgreSQL could surface — four
+See `ARCHITECTURE.md` §5.1 for the concrete cases only a real PostgreSQL could surface — four
 from Catalog and four more from Stock. This decision has paid for itself repeatedly.
 
 ### Per-service test projects, not one shared suite
@@ -475,135 +451,6 @@ only add friction. Fixed port 5081 is worth more than local TLS at Phase 0. **Kn
 documented rather than fixed:** `dotnet run` always applies `launchSettings.json`, whose profile
 pins `ASPNETCORE_ENVIRONMENT=Development` and overrides the command line. Use
 `--no-launch-profile`.
-
----
-
-## Stock service
-
-Fourteen decisions were approved before implementation. Each is recorded with what was chosen
-and why; the numbering matches the approval request. Design detail lives in
-`ARCHITECTURE.md` §5.
-
-### D1 · `Reserved` is a stored column, not derived from reservations
-
-**Alternative rejected:** `SUM(quantity)` over pending reservations.
-
-**Why stored.** It keeps the availability check and the mutation a single-row operation guarded by
-one `xmin` token. Deriving it would need an aggregate read plus a write in one transaction, and
-`StockItem`'s token would no longer cover reservation changes. The reservation table is the audit
-trail; `Reserved` is the counter that makes the check atomic. Both are written by the same
-`SaveChangesAsync`, which preserves the outbox-readiness Phase 2 depends on.
-
-### D2 · `UNIQUE(order_id, stock_item_id)`
-
-Gives reserve natural idempotency, exactly as Catalog's unique SKU does — a retry conflicts
-instead of double-holding. Because `stock_items.product_id` is itself unique, `stock_item_id` is
-1:1 with `product_id`, so this enforces one reservation per product per order **without
-denormalising `ProductId` onto the reservation**.
-
-**Consequence accepted:** Ordering must combine duplicate product lines in an order.
-
-### D3 · Transitions are strict, not idempotent
-
-Confirming an already-settled reservation throws rather than returning success.
-
-**Why.** A silent no-op would hide a double-settle from the caller.
-
-**Known cost.** A retry after a successful confirm gets a 409. Phase 2's at-least-once delivery
-requires idempotency, which is what Phase 1's idempotency keys and the Inbox exist for. Until then
-**Ordering must treat "409 because already confirmed" as success.**
-
-**Revisit:** Phase 1/2, alongside idempotency keys.
-
-### D4 · Stock does not call Catalog — it is a leaf service
-
-Only Ordering orchestrates. If Stock also called Catalog it would add a hop, a Stock→Catalog
-coupling and a trace path that nothing in Phase 0 needs.
-
-**Consequence accepted:** Stock cannot tell you whether a product exists, so stock can be
-provisioned for a nonexistent `ProductId`. Tolerable because the only caller in the real flow is
-Ordering, which validates first. Enforced by `LeafServiceBoundaryTests`.
-
-### D5 · `CHECK` constraints on `stock_items` — **with a reversal**
-
-The constraints were approved as defence-in-depth, and the plan said to map SQLSTATE `23514` to a
-client error so a violation would not surface as a 500.
-
-**The mapping was reversed during implementation.** Every CHECK restates an invariant `StockItem`
-already guards, and `xmin` closes the concurrent path, so a violation can only mean *our* code has
-a bug. Reporting it as 4xx would hide our defect inside the caller's error budget. The invariant
-runs in both directions: a client error is never a 5xx, **and a server fault is never a 4xx**.
-
-No handler arm was added — the default arm already yields 500 at Error level.
-`ACheckConstraintViolation_IsAServerFaultNotACallerError` pins it so nobody "fixes" it later.
-
-### D6 · Real foreign key `stock_reservations.stock_item_id → stock_items.id`
-
-Both tables are in Stock's own database, so the key is legitimate; the prohibition is on keys
-*crossing* a service boundary. `DeleteBehavior.Restrict` with `WithMany()` — no navigation
-property, so the object graph stays flat and there is no cascade behaviour to reason about.
-
-**Consequence for tests:** `ResetDatabaseAsync` must delete reservations before stock items.
-
-### D7 · `POST /stock` plus `PUT /stock/{productId}`, not a single upsert
-
-Explicit create-versus-update mirrors Catalog, and a silent upsert would hide a
-duplicate-provisioning bug. The unique index on `product_id` makes the race safe.
-
-### D8 · `/stock/{productId}/reservations`, not `/stock/{productId}/reserve`
-
-Resource-oriented, matching `POST /api/v1/products`.
-
-### D9 · No server-side retry on `xmin` conflict — deferred to Phase 1
-
-**Why.** Resilience libraries are Phase 1, and the 409 is the honest signal Ordering must learn to
-handle. Phase 2 largely dissolves the problem: a queue with a single consumer serialises
-reservations, so contention disappears rather than being retried away.
-
-**Measured cost.** A live 40-way burst against 10 units held only **4** — 36 requests lost the
-`xmin` race and were told 409 despite stock being available. Safety is perfect; liveness under
-burst is poor. This is the most important input to the Ordering design, which must decide whether
-to retry, partial-fill, or fail the order.
-
-### D10 · `GET /api/v1/reservations?orderId=` is included
-
-Cheap, supported by the `order_id` index, and needed for Phase 2 reconciliation and for debugging a
-half-failed order. `orderId` is required, so omitting it is a binding failure → 400, not an
-unbounded scan.
-
-### D11 · A test asserts Stock registers no `HttpClient`
-
-`LeafServiceBoundaryTests` locks in the leaf-service boundary at runtime, covering what
-`Directory.Build.targets` cannot — a dependency introduced through DI rather than a project
-reference.
-
-### D12 · Do not duplicate the validation filter's recursion tests
-
-The filter is byte-identical to Catalog's. Stock asserts only that it is *wired* to its endpoint
-groups; the recursion behaviour is specified once, in Catalog's suite. Re-testing identical code
-creates a second place to update and proves nothing.
-
-### D13 · Stock gets its own `TestPostgreSql.Image` and compose guard
-
-Otherwise the image-drift guard has a hole. The two integration assemblies must not reference each
-other, so the constant and `ComposeConfigurationTests` are duplicated deliberately.
-
-### D14 · Status stored as a string with a `CHECK`, not an integer
-
-So reservation state is readable in `psql`, which matters once Phase 2 adds sagas and
-reconciliation. Cost: `HasConversion<string>()` plus a `varchar(20)`. A new enum member without a
-matching CHECK update fails loudly at insert time — the intended behaviour, since the schema and
-the enum are one vocabulary. `ContractSchemaAlignmentTests` asserts the two lists agree.
-
-### Not in the approval list, decided during implementation
-
-- **Domain exceptions carry typed properties**, and the handler builds client text from them rather
-  than from `Message`. Prevents a reworded exception from silently changing the public contract.
-- **A diverged-counter fault is a 500.** `StockItem.RequireCoveredByReserved` throws
-  `InvalidOperationException` when `Reserved` has drifted from the reservation rows. No caller
-  input can produce it, so blaming the caller would be wrong.
-- **`StockApiFixture.DisposeAsync` uses `try/finally`**, unlike Catalog's. Fixed forward rather
-  than copied; the Catalog divergence is recorded in `KNOWN-ISSUES.md`.
 
 ---
 

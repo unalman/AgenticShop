@@ -34,7 +34,7 @@ stopped.
 
 Stock's five deliberate divergences from Catalog — no soft delete, no paging, no money, parallel
 rather than sequential concurrency tests, rewritten structural guards — are tabulated in
-`ARCHITECTURE.md` §5.8.
+`src/AgenticShop.Stock/docs/ARCHITECTURE.md` §8.
 
 **Not done:** Ordering. Its database and role are provisioned; there is no project, no code and no
 client seam.

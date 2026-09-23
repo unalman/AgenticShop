@@ -51,7 +51,8 @@ EF Core migrations need) — and exits non-zero if any fails.
 **Catalog is the reference implementation; Stock is the worked example of adapting it.**
 Stock deliberately diverges where Catalog's conventions do not fit — no soft delete, no
 paging, no money, and parallel rather than sequential concurrency tests. Ordering is not
-started. See `docs/ARCHITECTURE.md` §5.8 for the divergences and why each was right.
+started. See `src/AgenticShop.Stock/docs/ARCHITECTURE.md` §8 for the divergences and why each was
+right.
 
 ## Layout
 
@@ -84,13 +85,20 @@ purpose; that duplication has a trigger, recorded in `docs/DECISIONS.md`.
 
 ## Documentation
 
-| File | For |
-|---|---|
-| `AGENTS.md` | Operational rules — read this before changing code |
-| `docs/ARCHITECTURE.md` | Design in depth; the Catalog (§4) and Stock (§5) references; testing architecture (§6) |
-| `docs/DECISIONS.md` | Every significant choice, why it was made, and what would reopen it |
-| `docs/KNOWN-ISSUES.md` | Accepted residuals, and defects found and fixed |
-| `docs/ROADMAP.md` | Phase sequence and what Ordering will need |
+Global rules and design live at the root; service-specific material lives with the service.
+
+| | Global | Catalog | Stock |
+|---|---|---|---|
+| **Operational rules** | `AGENTS.md` | `src/AgenticShop.Catalog/AGENTS.md` | `src/AgenticShop.Stock/AGENTS.md` |
+| **Architecture** | `docs/ARCHITECTURE.md` | `src/AgenticShop.Catalog/docs/ARCHITECTURE.md` | `src/AgenticShop.Stock/docs/ARCHITECTURE.md` |
+| **Decisions** | `docs/DECISIONS.md` | `src/AgenticShop.Catalog/docs/DECISIONS.md` | `src/AgenticShop.Stock/docs/DECISIONS.md` |
+| **Known issues** | `docs/KNOWN-ISSUES.md` | `src/AgenticShop.Catalog/docs/KNOWN-ISSUES.md` | `src/AgenticShop.Stock/docs/KNOWN-ISSUES.md` |
+
+`docs/ROADMAP.md` holds the phase sequence and what Ordering will need.
+
+**Start with `AGENTS.md`** before changing code, then read the `AGENTS.md` of whichever service
+you are touching. Global `docs/ARCHITECTURE.md` §4 documents the conventions every service
+shares; the service files document only what differs.
 
 ## Prerequisites
 
@@ -158,7 +166,7 @@ query filters, CHECK constraints and SQL translation bugs.
 
 Stock also has parallel concurrency tests: a 40-way burst against 10 units must never
 oversell, and a 20-way race to confirm one reservation must ship it exactly once.
-Sequential state-machine tests cannot prove this — see `docs/ARCHITECTURE.md` §6.3.
+Sequential state-machine tests cannot prove this — see `docs/ARCHITECTURE.md` §5.3.
 
 `TreatWarningsAsErrors` is on, so a warning fails the build.
 
