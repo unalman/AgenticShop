@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell *)",
+      "Bash(cd *)",
+      "Bash(dir *)",
+      "Bash(git *)",
+      "Bash(dotnet *)",
+      "Bash(findstr *)",
+      "Bash(echo *)",
+      "Bash(del *)"
+    ]
+  },
+  "$version": 4
+}
