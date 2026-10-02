@@ -3,10 +3,12 @@
 **Global** operational rules for AI agents working in this repository. Read before changing code.
 
 > **Working on one service? Also read its own `AGENTS.md`.**
-> `src/AgenticShop.Catalog/AGENTS.md` · `src/AgenticShop.Stock/AGENTS.md`
+> `src/AgenticShop.Catalog/AGENTS.md` · `src/AgenticShop.Stock/AGENTS.md` ·
+> `src/AgenticShop.Ordering/AGENTS.md`
 >
 > Service-specific rules live there — soft delete, paging and money for Catalog; the leaf-service
-> rule, reservation state machine and counter invariant for Stock. This file holds only what
+> rule, reservation state machine and counter invariant for Stock; the write-once order, the
+> confirm-phase policy and the downstream client seam for Ordering. This file holds only what
 > applies everywhere. Applying one service's convention to another is the most likely mistake
 > available here.
 
@@ -18,6 +20,7 @@ Rationale, history, deferred items and known issues live in `docs/` and in each 
 | **Global** | `docs/ARCHITECTURE.md` | `docs/DECISIONS.md` | `docs/KNOWN-ISSUES.md` |
 | **Catalog** | `src/AgenticShop.Catalog/docs/ARCHITECTURE.md` | `…/DECISIONS.md` | `…/KNOWN-ISSUES.md` |
 | **Stock** | `src/AgenticShop.Stock/docs/ARCHITECTURE.md` | `…/DECISIONS.md` | `…/KNOWN-ISSUES.md` |
+| **Ordering** | `src/AgenticShop.Ordering/docs/ARCHITECTURE.md` | `…/DECISIONS.md` | `…/KNOWN-ISSUES.md` |
 
 Phases are in `docs/ROADMAP.md`. This file is the subset an agent needs to work safely; where it
 summarises, `docs/` explains.
@@ -28,18 +31,20 @@ AgenticShop is an educational .NET backend for learning agentic software develop
 evolved gradually into a distributed e-commerce backend. The deferrals in §8 are deliberate —
 do not "improve" the project by adding infrastructure it has declined.
 
-**Phase 0 — two of three services exist:**
+**Phase 0 — all three services exist:**
 
 | Service | Status |
 |---|---|
 | **Catalog** | **Implemented.** The reference implementation; every convention originates here. |
 | **Stock** | **Implemented.** Follows Catalog's conventions, with the deliberate divergences recorded in §10. |
-| Ordering | **Does not exist.** Database and role provisioned; no project, no code. |
+| **Ordering** | **Implemented.** The orchestrator: the only service with outbound calls, and the one that forced the conventions to be re-derived rather than copied. |
 
-Do not assume Ordering exists, and do not create it unless asked.
+Phase 0 is feature-complete. Everything still deferred is deferred on purpose — see §8 and
+`docs/ROADMAP.md`.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **276 pass**
-(Catalog 99 unit + 39 integration, Stock 77 unit + 61 integration).
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **426 pass**
+(Catalog 99 unit + 39 integration, Stock 77 unit + 61 integration, Ordering 93 unit + 57
+integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
 
@@ -104,13 +109,15 @@ docker compose exec db bash /usr/local/bin/verify-db-isolation   # 22 checks; no
 
 ## 5. Coding conventions
 
-Shared conventions in full: `docs/ARCHITECTURE.md` §4. Service-specific design:
-`src/AgenticShop.Catalog/docs/ARCHITECTURE.md` and `src/AgenticShop.Stock/docs/ARCHITECTURE.md`.
+**These are the rules. `docs/ARCHITECTURE.md` §4 is the canonical explanation of each, with the
+evidence and the reasoning — read it before changing a convention, not before following one.**
+Service-specific design: `src/<Service>/docs/ARCHITECTURE.md`.
 
 **Structure.** One project per service. **No** `Api`/`Core`/`Application` split, no repository,
 service or mediator layer — handlers call the `DbContext` directly.
 
 ```
+Clients/     downstream contracts: an interface + typed HttpClient per service (orchestrators only)
 Contracts/   request+response records, IRequestContract marker
 Data/        DbContext, IEntityTypeConfiguration<T>, Migrations/
 Domain/      entities and invariants — must not reference EF Core or ASP.NET Core
@@ -120,40 +127,39 @@ Middleware/  correlation id
 Validation/  DataAnnotationValidationFilter
 ```
 
+`Clients/` exists only in Ordering, and `Domain/` must never reference it. The single sanctioned
+exception to "handlers call the `DbContext` directly" is Ordering's `OrderPlacer`, in `Endpoints/`
+beside its one caller — pre-authorised by `docs/DECISIONS.md`, no interface, no second consumer,
+and not the start of a layer.
+
 **Entities.** `private set` everywhere; `private` parameterless constructor for EF; `static
 Create(...)` factory; explicit mutation methods, not public setters. **Guards run before any
-mutation**, so a rejected call leaves the entity untouched. Length limits are `public const int`,
-shared by `Contracts/` and `Data/`. `DateTimeOffset` for all timestamps. Identity fields other
-services hold are immutable.
+mutation.** Length limits are `public const int`, shared by `Contracts/` and `Data/`.
+`DateTimeOffset` for all timestamps. Identity fields other services hold are immutable.
 
-- **Derived values are computed properties, never stored** — Stock's
-  `Available = QuantityOnHand - Reserved` is the template. Mark them `builder.Ignore(...)` so a
-  second copy of the truth cannot drift.
+- **Derived values are computed properties, never stored** — mark them `builder.Ignore(...)`.
+  Stock's `Available = QuantityOnHand - Reserved` is the template.
 - Money is `decimal` plus a separate `Currency` string — no `Money` value object — rounded 2dp
   `AwayFromZero`. **Stock has no money at all**; do not add fields a service does not need.
 - **Domain rejections get their own exception type carrying typed properties**, e.g.
   `InsufficientStockException(Available, Requested)`. The handler builds the client message from
-  those properties, never from `Message` (logs only). `ArgumentException` is not enough when the
-  correct status is 409 rather than 400.
+  those properties, never from `Message` (logs only). `ArgumentException` cannot express a 409.
 
 **EF Core.** One `IEntityTypeConfiguration<T>` per entity via `ApplyConfigurationsFromAssembly`.
-Explicit snake_case `ToTable`. `HasPrecision(18, 2)` on money. `UseSnakeCaseNamingConvention()`
-on the context. Name unique indexes through a `public const` — the exception handler branches
-on it.
+Explicit snake_case `ToTable`. `HasPrecision(18, 2)` on money. `UseSnakeCaseNamingConvention()` on
+the context. Name unique indexes through a `public const` — the exception handler branches on it.
 
 - **Optimistic concurrency is mandatory on every entity:**
   `builder.Property<uint>("xmin").IsConcurrencyToken().ValueGeneratedOnAddOrUpdate();`
   `UseXminAsConcurrencyToken()` **does not exist in Npgsql 10**. This emits no DDL.
 - **Never `HasDefaultValue` on a non-nullable `bool`** — EF's sentinel is `false`, so an explicit
   `false` is dropped from the INSERT and silently comes back as the default.
-- **A foreign key is fine within one service's database** — Stock's `stock_reservations →
-  stock_items` uses one, with `DeleteBehavior.Restrict` and `WithMany()` (no navigation property).
-  Only a key crossing a service boundary is forbidden.
-- **`CHECK` constraints** are legitimate defence-in-depth, but their SQL is verbatim, so it must
-  name columns *after* snake_case renaming. Reading them back needs
-  `db.GetService<IDesignTimeModel>().Model`; `GetCheckConstraints()` throws against the runtime model.
-- Enums map with `.HasConversion<string>()` plus a `CHECK` listing the names, so state is readable
-  in `psql`.
+- **A foreign key is fine within one service's database.** Only a key crossing a service boundary
+  is forbidden.
+- **`CHECK` constraints:** their SQL is verbatim, so it must name columns *after* snake_case
+  renaming. Reading them back needs `db.GetService<IDesignTimeModel>().Model`;
+  `GetCheckConstraints()` throws against the runtime model.
+- Enums map with `.HasConversion<string>()` plus a `CHECK` listing the names.
 
 **Migrations.** Per service under `Data/Migrations/`. Set `ASPNETCORE_ENVIRONMENT=Development`
 first so `appsettings.Development.json` supplies the connection string:
@@ -191,46 +197,44 @@ positional parameters); domain guards protect invariants. Both, deliberately.
 |---|---|
 | `OperationCanceledException` **and** `RequestAborted` | not handled — `LogDebug`, `return false` |
 | `BadHttpRequestException` | **`badRequest.StatusCode`** — never hardcode 400; an oversized body is 413 |
-| domain conflict exceptions | 409 — Stock: `InsufficientStockException`, `InvalidReservationStateException`. Place before the EF arms |
+| domain conflict exceptions | 409 — built from typed properties. Place before the EF arms |
+| a dependency failed | **502** — Ordering only |
 | `DbUpdateConcurrencyException` | 409 (must precede `DbUpdateException`, which it derives from) |
 | `DbUpdateException` + SQLSTATE `23505` | 409, message keyed on the **constraint name** |
 | `DbUpdateException` + SQLSTATE `22001` / `22003` | 400 |
 | `ArgumentException` | 400 |
 | anything else | 500 |
 
-**Do not add an arm for a CHECK-constraint violation (`23514`).** Every CHECK restates an
-invariant the entity already guards, and `xmin` closes the concurrent path, so a violation means
-*our* code has a bug. It belongs in the 5xx bucket at Error level; mapping it to 409 would hide
-our defect inside the caller's error budget. The invariant runs both ways: a client error is never
-a 5xx, **and a server fault is never a 4xx**.
+**Do not add an arm for a CHECK-constraint violation (`23514`).** Every CHECK restates an invariant
+the entity already guards, so a violation means *our* code has a bug and belongs in the 5xx bucket.
 
-Four invariants: **(1)** a client error is never a 5xx — 5xx rates decide whether someone gets
-paged; **(2)** a server fault is never a 4xx; **(3)** no exception message reaches the client, so
-`detail` is `null` for domain 400s and all 500s, and built from typed properties for domain 409s;
-**(4)** the handler decides severity, not EF Core — handled rejections log one `Warning` line with
-no exception object, unhandled failures log `Error` *with* it. Non-5xx lines log the whole
-exception chain (`DescribeForLog`, depth cap 5).
+Four invariants, all test-guarded — the reasoning for each is in `docs/ARCHITECTURE.md` §4.7:
+**(1)** a client error is never a 5xx; **(2)** a server fault is never a 4xx; **(3)** no exception
+message reaches the client, so `detail` is `null` for domain 400s and all 500s and built from typed
+properties for domain 409s; **(4)** the handler decides severity, not EF Core — handled rejections
+log one `Warning` line with no exception object, unhandled failures log `Error` *with* it. Non-5xx
+lines log the whole exception chain (`DescribeForLog`, depth cap 5).
 `Microsoft.EntityFrameworkCore.Update` is `"None"` in `appsettings.json`.
 
 **Correlation ID.** Use the constant `CorrelationIdMiddleware.HeaderName`; never hardcode the
 string. Adopt an inbound value or mint `Guid.NewGuid().ToString("N")`. **Inbound values are
 untrusted:** accept only 1–128 characters of ASCII letters, digits and `-_.`; otherwise
 **replace** with a minted id, never reject the request. Registered first, before
-`UseExceptionHandler`. Inbound-only for now.
+`UseExceptionHandler`.
 
 **Service-specific conventions are not listed here.** Soft delete, query filters, offset paging,
 money and currency live in `src/AgenticShop.Catalog/AGENTS.md`; the leaf-service rule, the
 reservation state machine, the counter invariant and the strict-transition rule live in
-`src/AgenticShop.Stock/AGENTS.md`. **Read the service file before editing that service** — the
+`src/AgenticShop.Stock/AGENTS.md`; the write-once order and the confirm-phase policy live in
+`src/AgenticShop.Ordering/AGENTS.md`. **Read the service file before editing that service** — the
 most dangerous mistake available is applying one service's convention to another.
 
-**Multi-entity writes commit in one `SaveChangesAsync`** so EF wraps them in one transaction —
-Stock's counter update and reservation insert can never disagree. This is what Phase 2's outbox
-will depend on. Needing a transaction across several saves is a design smell; raise it first.
+**Multi-entity writes commit in one `SaveChangesAsync`** so EF wraps them in one transaction. This
+is what Phase 2's outbox will depend on. Needing a transaction across several saves is a design
+smell; raise it first.
 
 **Let the database reject duplicates; do not pre-check.** `SELECT`-then-`INSERT` has a race window
-under retry; a unique index does not. Stock's `UNIQUE(order_id, stock_item_id)` is what makes a
-retried reserve idempotent instead of a double-hold.
+under retry; a unique index does not.
 
 ## 6. Testing rules
 
@@ -257,23 +261,18 @@ Two projects per service: `<Service>.UnitTests` and `<Service>.IntegrationTests`
 - **Assert failure paths as rigorously as success paths.** The missing 400/404/409 assertions are
   exactly what shipped as 500s.
 - **Anything with a mutable counter needs a parallel test.** Sequential state-machine tests prove
-  almost nothing about concurrency: in a verified 20-way parallel confirm burst **all 20 passed the
-  state-machine check** and only `xmin` stopped 19. Across a full Stock run, 55 rejections came
-  from the concurrency token and 2 from the state machine — a sequential "confirm twice → 409"
-  test still passes with the token deleted.
+  almost nothing about concurrency — the measurements are in `docs/ARCHITECTURE.md` §5.3, and a
+  sequential "confirm twice → 409" test still passes with the concurrency token deleted.
 - **Parallel assertions are inequalities, never exact counts.** Winners depend on interleaving and
   Phase 0 does not retry server-side. Assert what must always hold — never oversold, no 5xx,
   counters agree with committed rows, every request answered — and cover the exact boundary in a
   separate *sequential* test.
 - **Structural conventions get automated guards** — a convention enforced only by prose will be
-  violated: `RequestContractCoverageTests`, `ContractSchemaAlignmentTests`,
-  `ComposeConfigurationTests`, `TestHostIsolationTests`, `LeafServiceBoundaryTests` (a service
-  that makes no outbound calls must register no `HttpClient`), `Directory.Build.targets`,
-  `scripts/verify-db-isolation.sh`.
-- **These guards are duplicated per service on purpose.** `TestPostgreSql.Image`,
-  `ComposeConfigurationTests` and `TestHostIsolationTests` exist in both integration projects —
-  the assemblies must not reference each other, and each needs its own drift check. Copy them;
-  do not try to share them.
+  violated. The inventory is `docs/ARCHITECTURE.md` §5.5; it includes `Directory.Build.targets`,
+  `scripts/verify-db-isolation.sh`, and a boundary guard per service that asserts whether it may
+  register an `HttpClient`.
+- **These guards are duplicated per service on purpose** — the assemblies must not reference each
+  other, and each needs its own drift check. Copy them; do not try to share them.
 - **Build and run the tests before declaring a task complete.** Report actual numbers, not
   "tests pass". Also run the integration tests once with `docker compose stop db` to prove the
   harness is isolated — a suite that quietly uses the developer's database still passes.
@@ -335,11 +334,9 @@ a broker is dead weight; CQRS without read pressure is ceremony.
 
 ## 10. Reference implementation rules
 
-**Catalog is the structural reference; Stock is the worked example of adapting it.** Before
-copying a convention into another service, verify it still fits. Stock diverged from Catalog in
-five deliberate ways — no soft delete, no paging, no money, parallel rather than sequential
-concurrency tests, and rewritten structural guards. The table and the reasoning are in
-`src/AgenticShop.Stock/docs/ARCHITECTURE.md` §8.
+**Catalog is the structural reference; Stock is the worked example of adapting it; Ordering is the
+test of whether the conventions survive a service that orchestrates.** Before copying a convention
+into another service, verify it still fits.
 
 **Must change per service:** the connection-string key, all `<Service>*` type names, the
 constraint names in `UniqueViolationDetail`, conflict-message wording, the entities under test in
@@ -360,11 +357,15 @@ endpoint groups; its recursion behaviour is specified once, in Catalog's
 `DataAnnotationValidationFilterTests`. Re-testing identical code creates a second place to update
 and proves nothing.
 
-**Duplication counter: 2 of 3.** The filter, middleware and error handler are now copied twice
-(~517 lines in Stock alone). Per `docs/DECISIONS.md`, **building Ordering is where the
-shared-library trigger fires** — raise it before the third copy, not after.
+**Duplication counter: 3 of 3.** All three services now carry their own copy of the filter, the
+middleware and the error-handler skeleton. **Extraction is deferred to Phase 1 by decision — do not
+propose it during Phase 0.** Reasoning and accepted cost: `docs/DECISIONS.md` → "No shared library".
+The per-service structural guards are never shared, in any phase.
 
-**When a convention proves wrong for a later service, fix it in the earlier ones too.** One
-divergence is currently open; see `docs/KNOWN-ISSUES.md`.
+**When a convention proves wrong for a later service, fix it in the earlier ones too.** The open
+divergences are listed in `docs/KNOWN-ISSUES.md`.
 
-What Ordering will need that neither service has is listed in `docs/ROADMAP.md`.
+Each service's divergences are tabulated with reasons in its own `docs/ARCHITECTURE.md` — Stock §8,
+Ordering §10. Those tables are the count and the authority; **do not restate a divergence list or a
+number here.** None of them is a convention the other services should adopt, and none is one they
+should have been following.

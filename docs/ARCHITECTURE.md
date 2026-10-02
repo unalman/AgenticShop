@@ -7,6 +7,7 @@ Service-specific design lives with the service:
 
 - `src/AgenticShop.Catalog/docs/ARCHITECTURE.md`
 - `src/AgenticShop.Stock/docs/ARCHITECTURE.md`
+- `src/AgenticShop.Ordering/docs/ARCHITECTURE.md`
 
 Rationale for individual choices is in `DECISIONS.md` (and each service's own); open and
 resolved defects in `KNOWN-ISSUES.md` (likewise); the phase sequence in `ROADMAP.md`.
@@ -29,12 +30,14 @@ Three independently deployed ASP.NET Core hosts communicating over HTTP only:
 |---|---|---|---|---|
 | Catalog | 5081 | `agenticshop_catalog` | `catalog_svc` | **implemented** |
 | Stock | 5082 | `agenticshop_stock` | `stock_svc` | **implemented** |
-| Ordering | 5083 | `agenticshop_ordering` | `ordering_svc` | not created |
+| Ordering | 5083 | `agenticshop_ordering` | `ordering_svc` | **implemented** |
 
-Catalog is the reference implementation and Stock is the worked example of adapting it; Stock's
-five deliberate divergences are the evidence that the conventions transfer rather than merely
-copy. Both are documented in their own `docs/ARCHITECTURE.md`. §4 below holds only what the two
-genuinely share.
+Catalog is the reference implementation, Stock is the worked example of adapting it, and Ordering is
+the test of whether the conventions survive a service that orchestrates rather than owns a single
+resource. Each service's deliberate divergences are the evidence that the conventions transfer
+rather than merely copy, and are tabulated in that service's own `docs/ARCHITECTURE.md` — Stock §8,
+Ordering §10. The tables are the count; do not restate a number here. §4 below holds only what all
+three genuinely share.
 
 Ports are fixed in each service's `Properties/launchSettings.json` so cross-service
 configuration never drifts. In Phase 0 only PostgreSQL is containerised; the APIs run on the
@@ -47,7 +50,9 @@ eventual distribution real rather than cosmetic:
 - **One database per service**, owned by that service alone, with its own EF migrations.
   Cross-service references are `Guid` ids resolved over HTTP — never foreign keys or joins.
 - **Orders snapshot `ProductName` and `UnitPrice`** so a later catalog edit cannot rewrite
-  order history. (Not yet implemented; Ordering does not exist.)
+  order history. Implemented, and pinned by
+  `ALineSnapshotsTheCatalogSoALaterEditCannotRewriteOrderHistory`, which changes the product after
+  the order exists and asserts the order did not move.
 
 ---
 
@@ -64,11 +69,8 @@ runs `BeforeTargets="BeforeBuild"`, applies to every current and future service
 automatically, and exempts `tests/`.
 
 The error message names both projects and states the remedy — define the contract in the
-consuming service as an interface plus a typed `HttpClient`.
-
-Verified by creating throwaway `src/AgenticShop.ProbeA` → `ProbeB` projects: the build failed
-with the actionable message, and `ProbeB` alone built clean, confirming no false positive.
-Both were deleted afterwards.
+consuming service as an interface plus a typed `HttpClient`. The guard was verified to fire, and
+verified not to false-positive, using throwaway probe projects; see `DECISIONS.md`.
 
 **Limitation:** the guard identifies services by the `/src/` path segment. Restructuring the
 repository layout silently disables it.
@@ -168,6 +170,7 @@ src/AgenticShop.<Service>/
 ├── Errors/                 <Service>ExceptionHandler
 ├── Middleware/             CorrelationIdMiddleware
 ├── Validation/             DataAnnotationValidationFilter
+├── Clients/                orchestrators only: an interface + typed HttpClient per downstream
 └── Properties/launchSettings.json
 ```
 
@@ -179,14 +182,20 @@ directly. `Domain/` must not reference EF Core or ASP.NET Core types.
 which is the correct inward direction.
 
 A service that calls another service adds a `Clients/` folder holding an interface plus a typed
-`HttpClient` implementation per downstream service. **Stock has none**, because it makes no
-outbound calls; Ordering will be the first.
+`HttpClient` implementation per downstream service. **Catalog and Stock have none**, because neither
+makes an outbound call and Stock's absence is asserted by `LeafServiceBoundaryTests`. Ordering has
+two, plus the consumer-owned response records they deserialise into, a `DelegatingHandler` that
+propagates the correlation id, and the shared send-and-classify plumbing — see
+`src/AgenticShop.Ordering/docs/ARCHITECTURE.md` §6.
 
 ### 4.2 Entities
 
 - `private set` on every property; a `private` parameterless constructor marked as EF-only.
 - A `static Create(...)` factory assigns `Id = Guid.NewGuid()` and all timestamps from one
-  `DateTimeOffset.UtcNow` read, so `CreatedAtUtc == UpdatedAtUtc` on a new entity.
+  `DateTimeOffset.UtcNow` read, so `CreatedAtUtc == UpdatedAtUtc` on a new entity. Ordering's `Order`
+  diverges on both counts and for one reason: its id is supplied by the caller because Stock's
+  reservations carry it and are created before the order row exists, and it has no `UpdatedAtUtc`
+  because it is write-once.
 - Explicit mutation methods instead of public setters.
 - **Guards run before any mutation**, so a rejected call leaves the entity byte-identical —
   otherwise EF would persist a half-applied change on the next save. Each service has a test
@@ -229,9 +238,14 @@ binary, not just the XML docs. Instead `NpgsqlPostgresModelFinalizingConvention`
 
 The migration file contains an `AddColumn<uint>("xmin", type: "xid")` operation, but
 **`NpgsqlMigrationsSqlGenerator.SystemColumnNames` suppresses it when generating SQL**.
-Confirmed two ways in both services: `dotnet ef migrations script` contains no occurrence of
+Confirmed two ways in all three services: `dotnet ef migrations script` contains no occurrence of
 `xmin`, and `information_schema.columns` on the live database returns 0 rows for it. Inserts
 carry `RETURNING xmin;` so EF can refresh the token.
+
+Note that the token being *declared* is not the same as it being *exercised*. Catalog's guards a
+price edit, Stock's prevents overselling and is proven by parallel tests, and Ordering's is
+currently inert — a Phase 0 order is written once and never updated, so no conflict can arise.
+It is declared anyway because it is mandatory on every entity and Phase 2's saga will need it.
 
 Without a concurrency token two overlapping writes both succeed and the second silently discards
 the first. The stakes differ per service — a lost price edit on `Product`, overselling on
@@ -343,9 +357,9 @@ The filter's contract:
 - The marker's own gap — forgetting to implement it — is closed by each service's
   `RequestContractCoverageTests`, which reflects over `Contracts/` and fails the build.
 
-**Neither service has a nested request DTO yet.** The cascade is proven by synthetic contracts
-in Catalog's `DataAnnotationValidationFilterTests`; that suite is the specification, and it is
-deliberately not duplicated in Stock. Ordering's `CreateOrderRequest` will be the first real one.
+**Ordering's `CreateOrderRequest` is the only real nested DTO**, and is what proved the cascade
+against a real contract rather than a synthetic one. Catalog's `DataAnnotationValidationFilterTests`
+remains the specification for the filter and is deliberately not duplicated in Stock or Ordering.
 
 ### 4.7 Error handling
 
@@ -360,6 +374,7 @@ Classification, in switch order:
 | `OperationCanceledException` **and** `RequestAborted` | *not handled* | `LogDebug`, `return false` |
 | `BadHttpRequestException` | **`badRequest.StatusCode`** | `null` |
 | service-specific domain conflicts | 409 | built from typed properties |
+| a dependency failed — **Ordering only** | 502 | `DownstreamServiceException`, `OrderPlacementIncompleteException` |
 | `DbUpdateConcurrencyException` | 409 | reload hint |
 | `DbUpdateException` + `23505` | 409 | keyed on constraint name |
 | `DbUpdateException` + `22001` / `22003` | 400 | too long / out of range |
@@ -368,7 +383,8 @@ Classification, in switch order:
 
 `DbUpdateConcurrencyException` must precede `DbUpdateException` because it derives from it.
 `BadHttpRequestException` uses its own `StatusCode` rather than a hardcoded 400 because an
-oversized body is a 413.
+oversized body is a 413. The 502 arm exists only where a dependency can fail — a 500 there would
+say "we have a bug" when the truth is "we were let down", and operators page differently on those.
 
 Four invariants, all test-guarded:
 
@@ -422,8 +438,21 @@ still counts as a fault.
   extension, which falls back to `TraceIdentifier`.
 - Registered first in the pipeline so later middleware failures still carry it.
 
-Propagation is currently **inbound only**. Nothing forwards the header on outbound calls
-because no service makes any yet. See `ROADMAP.md`.
+Catalog and Stock are **inbound only**: neither makes an outbound call, and Stock's absence is
+asserted by `LeafServiceBoundaryTests`. Ordering closes the loop with
+`CorrelationIdPropagatingHandler`, a `DelegatingHandler` registered on both typed clients that
+copies the ambient request's id onto every outbound call. It reads the id through
+`IHttpContextAccessor` rather than taking it as a parameter, so no client method has to carry a
+tracing concern in its signature, and it omits the header when there is no ambient request rather
+than minting one — a trace that starts nowhere is worse than no trace.
+
+Because every Ordering integration test replaces both clients at the seam, no automated test can
+observe the header on the wire; it was verified live instead, and the evidence is recorded in
+`src/AgenticShop.Ordering/docs/ARCHITECTURE.md` §6.
+
+Phase 1 derives the id from `Activity.Current?.TraceId` instead, which is what makes the two
+directions one concept rather than two — note that `Results.Problem` already adds a `traceId`
+extension of its own, so a ProblemDetails body carries both today.
 
 ---
 
@@ -444,9 +473,10 @@ Current counts, all passing:
 |---|---|---|
 | Catalog | 99 | 39 |
 | Stock | 77 | 61 |
-| **Total** | **176** | **100** |
+| Ordering | 93 | 57 |
+| **Total** | **269** | **157** |
 
-**276 total.** Build is clean under `TreatWarningsAsErrors`.
+**426 total.** Build is clean under `TreatWarningsAsErrors`.
 
 ### 5.1 Why Testcontainers and never a mocked DbContext
 
@@ -461,26 +491,42 @@ Stock adds four more that no in-memory provider could produce: the `UNIQUE(order
 stock_item_id)` duplicate-hold `409`, the `CHECK` constraints and their `23514` SQLSTATE, the
 `RESTRICT` foreign key, and the enum-to-string conversion inside the `status IN (...)` check.
 
+Ordering adds three that a mock could not even represent: materialising `Order.Lines` through a
+readonly backing field (`PropertyAccessMode.Field`) on an `Include`, the `numeric(18,2)` precision
+that `Order.MaxTotalAmount` is derived from, and a `varchar(30)` status column whose `CHECK` list
+has to agree with a four-member enum.
+
+Ordering's integration tests are also the only place the confirm-phase policy can be tested at all.
+Both clients are faked there, which is normally a compromise and here is a requirement: "Stock
+timed out after applying the confirm" cannot be produced deterministically against a live host
+without putting a proxy in front of it. The database underneath is still real, so every assertion
+about a persisted order status is a fact about PostgreSQL.
+
 ### 5.2 Harness design
 
-Identical in shape for both services, and deliberately duplicated rather than shared — the two
-integration assemblies must not reference each other.
+Identical in shape for all three services, and deliberately duplicated rather than shared — the
+three integration assemblies must not reference each other.
 
 - `<Service>ApiFactory : WebApplicationFactory<Program>` calls `builder.UseEnvironment("Development")`
   **explicitly** rather than inheriting the framework default, because the suite depends on it:
   `Program.cs` runs `MigrateAsync()` only when `IsDevelopment()`. It also overrides
-  `ConnectionStrings:<Service>` through `ConfigureAppConfiguration`.
+  `ConnectionStrings:<Service>` through `ConfigureAppConfiguration`, and in Ordering's case the two
+  downstream base URLs as well — pointed at `.invalid`, a TLD RFC 2606 reserves so it cannot
+  resolve, so a replacement that silently stops applying fails loudly instead of calling a service
+  running on this machine.
 - `<Service>ApiFixture : IAsyncLifetime` owns one `PostgreSqlContainer` built from that project's
   own `TestPostgreSql.Image`, exposed as `ICollectionFixture` via `<Service>ApiCollection` with
   `[Collection("<Service> API")]`. xunit runs a collection sequentially, which is what makes
   per-test `ResetDatabaseAsync()` safe.
-- `ResetDatabaseAsync()` deletes every table. Catalog uses `IgnoreQueryFilters()` so soft-deleted
-  rows go too; Stock deletes `stock_reservations` **before** `stock_items`, because the foreign
-  key is `RESTRICT`. Neither resets sequences.
+- The per-test reset deletes every table, child before parent where a foreign key demands it:
+  Catalog uses `IgnoreQueryFilters()` so soft-deleted rows go too, Stock deletes
+  `stock_reservations` **before** `stock_items` (`RESTRICT`), and Ordering deletes `order_lines`
+  before `orders` (`CASCADE`) and also resets its two client fakes. No fixture resets sequences —
+  see `KNOWN-ISSUES.md`.
 - `CreateScope()` exposes the host's services so a test can open independent units of work
   against the same database — which is what an optimistic-concurrency conflict needs.
-- Disposal order is `Client` → factory → container. **Stock guards this with `try/finally`;
-  Catalog does not** — a known divergence recorded in `KNOWN-ISSUES.md`.
+- Disposal order is `Client` → factory → container. **Stock and Ordering guard this with
+  `try/finally`; Catalog does not** — a known divergence recorded in `KNOWN-ISSUES.md`.
 - Tests that assert on `ProblemDetails` deserialise the response body rather than depending on
   an internal result type.
 
@@ -525,8 +571,8 @@ Catalog has no equivalent, and deliberately so: `Product` has no contended numer
   Reading the value into a local beforehand freezes it, and the tests then run silently against
   the developer's own compose database while the Testcontainers container sits unused. This
   happened. `TestHostIsolationTests` now fails the suite if it recurs; it can also be proven by
-  running the integration tests with `docker compose stop db`. Both services were verified this
-  way — Stock's 61 integration tests pass with port 5432 closed.
+  running the integration tests with `docker compose stop db`. All three services were verified
+  this way — Stock's 61 and Ordering's 57 integration tests pass with port 5432 closed.
 - `ProblemHttpResult.ExecuteAsync` resolves `ILoggerFactory` and `JsonOptions` from
   `HttpContext.RequestServices`, so a bare `DefaultHttpContext` throws. Build one with
   `.AddOptions().AddLogging()`.
@@ -544,7 +590,7 @@ Catalog has no equivalent, and deliberately so: `Product` has no contended numer
 - FluentAssertions: `ThrowAsync<T>().And` (not `.Subject`) yields the exception;
   `NotContain(char)` has no overload, so use a string.
 - `TestPostgreSql.Image` is each project's single declaration of the PostgreSQL image tag;
-  `docker-compose.yml` states its own and both `ComposeConfigurationTests` fail if they diverge.
+  `docker-compose.yml` states its own and all three `ComposeConfigurationTests` fail if they diverge.
 
 ### 5.5 Structural guards
 
@@ -553,20 +599,23 @@ A convention enforced only by prose will be violated. These fail the build or th
 | Guard | Protects | Present in |
 |---|---|---|
 | `Directory.Build.targets` | no cross-service `ProjectReference` (build time) | repo root |
-| `RequestContractCoverageTests` | every `*Request` implements `IRequestContract`, and the check does not pass vacuously | both |
-| `ContractSchemaAlignmentTests` | schema and contracts agree — see below | both, differently |
-| `ComposeConfigurationTests` | compose image matches `TestPostgreSql.Image`; port is loopback-only; no literal credentials; isolation script mounted | both |
-| `TestHostIsolationTests` | the app under test really uses the Testcontainers database | both |
+| `RequestContractCoverageTests` | every `*Request` implements `IRequestContract`, and the check does not pass vacuously | all three |
+| `ContractSchemaAlignmentTests` | schema and contracts agree — see below | all three, differently |
+| `ComposeConfigurationTests` | compose image matches `TestPostgreSql.Image`; port is loopback-only; no literal credentials; isolation script mounted | all three |
+| `TestHostIsolationTests` | the app under test really uses the Testcontainers database | all three |
 | `LeafServiceBoundaryTests` | a service that makes no outbound calls registers no `HttpClient` | Stock |
+| `ServiceBoundaryTests` | the orchestrator references no other service assembly, and *does* register its clients | Ordering |
 | `scripts/verify-db-isolation.sh` | PostgreSQL role isolation, 22 checks | repo root |
 
 `ContractSchemaAlignmentTests` reads limits from the EF model rather than restating them, so it
-tracks the configuration instead of a second copy that could itself drift. Catalog's version
-compares DTO string limits against column limits — the guard that would have prevented the
-original over-length-SKU 500. **Stock's version had to be rewritten**, because Stock has almost
-no length-constrained strings: copied verbatim it would have matched nothing and passed without
-proving anything. It instead asserts the enum vocabulary equals its `CHECK` list, the status
-column is wide enough, every quantity bound matches `StockItem.MaxQuantity`, the bound fits an
-`integer` column, derived values are not persisted, and every entity carries an `xmin` token.
+tracks the configuration instead of a second copy that could itself drift. Each service's version
+covers the drift *that service* can suffer, and none is a copy of another:
 
-That is the concrete reason a structural guard must be re-derived per service rather than copied.
+| Service | What it compares |
+|---|---|
+| Catalog | DTO string limits against column limits — the guard that would have prevented the original over-length-SKU 500 |
+| Stock | enum vocabulary against its `CHECK` list, status column width, quantity bounds against `StockItem.MaxQuantity` and an `integer` column, derived values not persisted, `xmin` on every entity |
+| Ordering | the generated `OrderNumber` against its column, the summed `TotalAmount` against `numeric(18,2)`, and snapshot limits that mirror constants declared in two assemblies it must not reference |
+
+Copying Catalog's version into Stock would have matched nothing and passed vacuously — the concrete
+reason a structural guard must be re-derived per service rather than copied.

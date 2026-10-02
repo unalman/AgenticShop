@@ -57,6 +57,5 @@ Manual requests: `../../http/catalog.http`. Scalar UI: <http://localhost:5081/sc
 ## Before changing a convention here
 
 Catalog is the reference implementation, so a change to its shared conventions — the validation
-filter, exception handler, correlation middleware or test harness — must be mirrored into Stock.
-Check `../../docs/ARCHITECTURE.md` §4 for which conventions are shared, and fix both services
-rather than letting them diverge.
+filter, exception handler, correlation middleware or test harness — must be mirrored into Stock
+**and Ordering**. Which conventions are shared: `../../docs/ARCHITECTURE.md` §4.

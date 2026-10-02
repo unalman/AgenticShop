@@ -85,6 +85,12 @@ Phase 2's at-least-once delivery will require idempotency — that is what Phase
 keys and the Inbox exist for. Until then **Ordering must treat "409 because already confirmed" as
 success.**
 
+**`Confirmed` is also non-compensable, and that shapes Ordering.** Confirm decrements
+`QuantityOnHand`; release does not. So no transition undoes a confirm, and an order whose confirms
+fail part-way through cannot be rolled back — only its still-`Pending` reservations can be released.
+How Ordering handles that is its decision, not Stock's: see
+`../../AgenticShop.Ordering/docs/DECISIONS.md` → **O14**.
+
 There is no reservation expiry: no `ExpiresAtUtc`, no background worker. Release is an explicit
 call only. The expiry worker is Phase 3.
 
@@ -184,9 +190,9 @@ pending reservation rows=4   sum(quantity)=4
 requests lost the `xmin` race and were told 409 despite stock being available. A 20-way parallel
 confirm of one reservation produced `200=1, 409=19, 5xx=0` and shipped exactly once.
 
-This is the single most important input to the Ordering design: a synchronous order placement that
-reserves line by line will fail often under load, and Ordering must decide whether to retry,
-partial-fill, or fail the order.
+**This is the canonical record of both measurements.** Everything else in the repository cites it
+rather than restating it. It was the single most important input to the Ordering design, which
+decided to **fail fast** — see `../../AgenticShop.Ordering/docs/DECISIONS.md` → **O16**.
 
 ## 8. Divergences from Catalog
 
@@ -214,19 +220,16 @@ Copied verbatim, namespace only: `DataAnnotationValidationFilter`, `CorrelationI
 | `23505` on `ix_stock_reservations_order_id_stock_item_id` | 409 | "That order already has a reservation for this product." |
 | **`23514` CHECK violation** | **500** | deliberate — see below |
 
-**The CHECK-violation mapping reverses the original Stock plan**, which called for a 4xx. Every
-CHECK on these tables restates an invariant `StockItem` already guards, and `xmin` closes the
-concurrent path, so a violation can only mean *our* code has a bug. Reporting it as 409 would hide
-our own defect inside the caller's error budget. The invariant runs in both directions: a client
-error is never a 5xx, **and a server fault is never a 4xx**. No handler arm was added; the default
-arm already yields 500 at Error level, and `ACheckConstraintViolation_IsAServerFaultNotACallerError`
-pins it so nobody "fixes" it later.
+**The CHECK-violation mapping reverses the original Stock plan**, which called for a 4xx. It follows
+global invariant two — a server fault is never a 4xx — and the reasoning is in `DECISIONS.md` → D5.
+No handler arm was added; the default arm already yields 500 at Error level, and
+`ACheckConstraintViolation_IsAServerFaultNotACallerError` pins it so nobody "fixes" it later.
 
 ## 10. What Stock still does not exercise
 
 Stock is a leaf service with no outbound calls, so it did **not** test: the typed `HttpClient`
-seam, outbound correlation-id propagation, real nested request DTOs (the validation cascade is
-still proven only by synthetic contracts), order-line snapshotting, compensation across services,
-or a sequence-generated business number. Ordering will be the first service to exercise any of
-them.
+seam, outbound correlation-id propagation, real nested request DTOs, order-line snapshotting,
+compensation across services, or a business number. Ordering has since exercised all of them
+except the last — see `../../AgenticShop.Ordering/docs/ARCHITECTURE.md` §11, which is the
+canonical list of what remains unexercised anywhere in Phase 0.
 

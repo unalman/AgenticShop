@@ -37,6 +37,13 @@ Confirming an already-settled reservation throws rather than returning success.
 requires idempotency, which is what Phase 1's idempotency keys and the Inbox exist for. Until then
 **Ordering must treat "409 because already confirmed" as success.**
 
+**Second consequence, found while planning Ordering.** Strictness plus a terminal `Confirmed` means
+there is no compensating action for a confirm that already succeeded. `release` on a `Confirmed`
+reservation throws — and even if it did not, it would return `Reserved` without returning
+`QuantityOnHand`, leaving the counters describing stock that has already left. An order whose
+confirms fail part-way therefore cannot be rolled back, only recorded. What Ordering records is its
+decision: `../../AgenticShop.Ordering/docs/DECISIONS.md` → **O14**.
+
 **Revisit:** Phase 1/2, alongside idempotency keys.
 
 ## D4 · Stock does not call Catalog — it is a leaf service
@@ -84,10 +91,9 @@ Resource-oriented, matching `POST /api/v1/products`.
 handle. Phase 2 largely dissolves the problem: a queue with a single consumer serialises
 reservations, so contention disappears rather than being retried away.
 
-**Measured cost.** A live 40-way burst against 10 units held only **4** — 36 requests lost the
-`xmin` race and were told 409 despite stock being available. Safety is perfect; liveness under
-burst is poor. This is the most important input to the Ordering design, which must decide whether
-to retry, partial-fill, or fail the order.
+**Measured cost.** Poor liveness under burst, quantified in `ARCHITECTURE.md` §7 — the canonical
+record. This was the most important input to the Ordering design, which decided to **fail fast**
+with no server-side retry in Phase 0: `../../AgenticShop.Ordering/docs/DECISIONS.md` → **O16**.
 
 ## D10 · `GET /api/v1/reservations?orderId=` is included
 
@@ -127,6 +133,5 @@ the enum are one vocabulary. `ContractSchemaAlignmentTests` asserts the two list
   `InvalidOperationException` when `Reserved` has drifted from the reservation rows. No caller
   input can produce it, so blaming the caller would be wrong.
 - **`StockApiFixture.DisposeAsync` uses `try/finally`**, unlike Catalog's. Fixed forward rather
-  than copied; the divergence is tracked in `../../../docs/KNOWN-ISSUES.md` because it spans both
-  services.
+  than copied; the divergence is tracked in `../../../docs/KNOWN-ISSUES.md`.
 

@@ -8,6 +8,8 @@ Service-specific decisions live with the service and are not repeated here:
 
 - `src/AgenticShop.Catalog/docs/DECISIONS.md` — soft delete, paging, money and currency
 - `src/AgenticShop.Stock/docs/DECISIONS.md` — D1–D14 plus three taken during implementation
+- `src/AgenticShop.Ordering/docs/DECISIONS.md` — O1–O16: the orchestrator's placement flow, the
+  derived order number, the confirm-phase policy and the downstream client seam
 
 Rules live in `AGENTS.md`; design detail in `ARCHITECTURE.md`; open problems in
 `KNOWN-ISSUES.md`.
@@ -106,34 +108,35 @@ accepted deliberately.
 
 **Revisit:** never for this project; the point is the distribution.
 
-### No shared library
+### No shared library — extraction deferred to Phase 1
 
-**Context.** With three services, a shared kernel is the obvious move.
+**Context.** With three services, a shared kernel is the obvious move. Built-in `ProblemDetails`
+is contract enough for the error shape, so no shared assembly is *needed*.
 
-**Decision.** None. Built-in `ProblemDetails` is contract enough for the error shape, so no
-shared assembly is needed.
+**Decision (2026-09-24).** None in Phase 0. The filter, the exception-handler skeleton and the
+correlation middleware are copied per service — Ordering carries the third copy — and extraction
+is a committed Phase 1 item, to be done once alongside Serilog, OpenTelemetry, resilience
+registration and health-check wiring.
 
-**Why.** A shared assembly created on day one becomes a coupling magnet and a version-lock
-across independently deployable services.
+**Why.** A shared assembly created on day one becomes a coupling magnet and a version-lock across
+independently deployable services. Extracting now would also freeze the handler's shape before
+Phase 1 changes it: Serilog and OpenTelemetry both touch the logging arms, and resilience policies
+touch how a downstream 409 is classified. Designing the shared type twice costs more than copying
+it a third time — and Ordering proved the point by needing two things the other services do not, a
+502 bucket and an `orderId` extension on failures. Phase 1 therefore designs against four real
+consumers rather than three near-identical ones.
 
-**Revisit — this one is live, and the counter is now 2 of 3.** The filter, handler and
-middleware have been copied into Stock: `DataAnnotationValidationFilter` (192 lines),
-`StockExceptionHandler` (253) and `CorrelationIdMiddleware` (72) — roughly 517 lines of
-near-identical infrastructure. That was the agreed plan, and Stock proves the copies are cheap
-to make correctly because the structural guards travel with them.
+**Cost accepted.** Three near-identical copies of roughly 500 lines each, so a fix to the skeleton
+must be applied three times; the risk is silent divergence rather than breakage. Two mitigations:
+the four invariants in `ARCHITECTURE.md` §4.7 are test-guarded in every service, and `AGENTS.md` §10
+requires a convention proven wrong in a later service to be fixed in the earlier ones too.
 
-The trigger is **Phase 1**, when Serilog configuration, OpenTelemetry setup, resilience
-registration and health-check wiring join these three and duplication reaches roughly 400
-lines × 3. But note that the error handler's chain-describing logic is already entirely generic
-— only `UniqueViolationDetail`, the conflict wording and the two domain arms are
-service-specific — so **building Ordering is the point at which the trigger fires, not Phase 1.**
-Raise the decision before the third copy, not after.
+**Must never be shared, in any phase:** the per-service structural guards (`TestPostgreSql.Image`,
+`ComposeConfigurationTests`, `TestHostIsolationTests`, `ContractSchemaAlignmentTests`). Sharing
+them would require the integration assemblies to reference each other, which is the coupling the
+whole design avoids — see "Structural guards are re-derived per service" below.
 
-**What must not be shared regardless:** the per-service structural guards
-(`TestPostgreSql.Image`, `ComposeConfigurationTests`, `TestHostIsolationTests`,
-`ContractSchemaAlignmentTests`). Sharing them would require the integration assemblies to
-reference each other, which is the coupling the whole design avoids, and Stock's
-`ContractSchemaAlignmentTests` had to be rewritten anyway — see that entry below.
+**Do not re-raise extraction during Phase 0.** It is planned work with an owner phase.
 
 ### One PostgreSQL container hosting three databases
 
@@ -177,35 +180,31 @@ password published in a committed file, to every host on the local network. Foun
 
 ### `xmin` as the concurrency token, declared as a `uint` shadow property
 
-**Context.** `UseXminAsConcurrencyToken()` is the documented Npgsql approach and **does not
-exist in Npgsql 10** — verified against the assembly binary.
+**Context.** `UseXminAsConcurrencyToken()` is the documented Npgsql approach and **does not exist
+in Npgsql 10** — verified against the assembly binary, not just the XML docs.
 
-**Decision.**
+**Decision.** Declare it manually instead:
 
 ```csharp
 builder.Property<uint>("xmin").IsConcurrencyToken().ValueGeneratedOnAddOrUpdate();
 ```
 
-**Why.** `NpgsqlPostgresModelFinalizingConvention` detects any `uint` concurrency token
-generated `OnAddOrUpdate` and maps it to the system column. `NpgsqlMigrationsSqlGenerator.SystemColumnNames`
-then suppresses the `AddColumn` when generating SQL, so it costs no storage and no DDL.
-Verified: the migration script contains no `xmin`, and `information_schema.columns` returns 0
-rows for it.
+The mechanism that makes this work — and the proof that it emits no DDL — is in `ARCHITECTURE.md`
+§4.3.
 
-**Why concurrency tokens at all.** Without one, two overlapping writes both succeed and the
-second silently discards the first. On `Product` that is a lost price update; on `StockItem` it
-is overselling.
+**Why concurrency tokens at all.** Without one, two overlapping writes both succeed and the second
+silently discards the first. On `Product` that is a lost price update; on `StockItem` it is
+overselling. The stakes differ per service, which is why the testing burden does too.
 
 ### Unique indexes named through a `public const`
 
-`ProductConfiguration.UniqueSkuIndexName`, `StockItemConfiguration.UniqueProductIndexName`,
-`StockReservationConfiguration.UniqueOrderStockItemIndexName`. Each service's exception handler
-branches on the constraint name to produce an accurate 409 message, so leaving the name to EF's
-convention would let a rename silently make every unique violation report the wrong cause.
+Each service's exception handler branches on the constraint name to produce an accurate 409
+message, so leaving the name to EF's convention would let a rename silently make every unique
+violation report the wrong cause.
 
-The fallback arm matters as much as the named ones: a third unique index added without a matching
-case reports "The value conflicts with an existing record" rather than misattributing the
-conflict. Both handlers are tested for that.
+The fallback arm matters as much as the named ones: a unique index added without a matching case
+reports "The value conflicts with an existing record" rather than misattributing the conflict.
+Every handler is tested for that.
 
 ---
 
@@ -221,7 +220,13 @@ that is MVC `[ApiController]` behaviour — hence `DataAnnotationValidationFilte
 
 Handlers call the `DbContext` directly. At this size an extra layer is indirection without
 benefit. **Revisit:** if a use case needs to coordinate two aggregates or an external call
-inside one transaction, which Ordering's `POST /orders` will.
+inside one transaction.
+
+**The revisit fired once.** Ordering's `OrderPlacer` is the collaborator this entry reserved room
+for — no interface, one caller, one public method, in `Endpoints/` beside its caller. That is the
+whole of the concession: `Application/` is still not a folder that exists, and a second
+collaborator must be argued for on its own merits rather than inherited from this one. Detail in
+`src/AgenticShop.Ordering/docs/DECISIONS.md` → O1.
 
 ### `BadHttpRequestException` answered with its own `StatusCode`
 
@@ -351,10 +356,15 @@ Phase 1.
 
 ### Correlation id, not OpenTelemetry
 
-A correlation id is 60 lines and immediately useful. Distributed tracing has nothing to trace
-until a second service exists. **Consequence to handle in Phase 1:** `Guid.NewGuid().ToString("N")`
-is not W3C `traceparent`-compatible, so the id should be derived from `Activity.Current?.TraceId`
-when OpenTelemetry arrives, or there will be two parallel correlation concepts.
+A correlation id is 60 lines and immediately useful. Distributed tracing had nothing to trace until
+a second service existed; one now makes an outbound call and the id does cross the hop. What it
+still cannot answer is *which call was slow*, because there is no span tree — the gap Phase 1 closes.
+
+**Consequence to handle in Phase 1:** `Guid.NewGuid().ToString("N")` is not W3C
+`traceparent`-compatible, so the id should be derived from `Activity.Current?.TraceId` when
+OpenTelemetry arrives, or there will be two parallel correlation concepts. A hint of that already
+shows up in responses: `Results.Problem` adds a `traceId` extension from the ambient activity, so a
+ProblemDetails body carries both ids today and only one of them is ours.
 
 ---
 
@@ -362,8 +372,9 @@ when OpenTelemetry arrives, or there will be two parallel correlation concepts.
 
 ### Testcontainers, never a mocked `DbContext`
 
-See `ARCHITECTURE.md` §5.1 for the concrete cases only a real PostgreSQL could surface — four
-from Catalog and four more from Stock. This decision has paid for itself repeatedly.
+See `ARCHITECTURE.md` §5.1 for the concrete cases only a real PostgreSQL could surface — four from
+Catalog, four more from Stock, three more from Ordering. This decision has paid for itself
+repeatedly.
 
 ### Per-service test projects, not one shared suite
 
@@ -387,37 +398,32 @@ are components of a web service, and the tests still perform no I/O.
 
 ### Parallel concurrency tests are mandatory for any mutable counter
 
-**Context.** Stock's sequential state-machine tests looked thorough and proved almost nothing
-about concurrency. Log evidence from a live run: in a 20-way parallel confirm burst **all 20
-requests passed the state-machine check**, and only the `xmin` token stopped 19. Across the whole
-run, 55 rejections came from the concurrency token and 2 from the state machine — and those 2 were
-from sequential smoke checks.
+**Context.** Stock's sequential state-machine tests looked thorough and proved almost nothing about
+concurrency — the measurements are in `ARCHITECTURE.md` §5.3, and they are unflattering.
 
-**Decision.** Any entity with a mutable counter gets a parallel test. Parallel assertions are
+**Decision.** Any entity with a mutable counter gets a parallel test. Assertions are
 **inequalities** (never oversold, no 5xx, counters agree with committed rows, every request
-answered), never exact success counts, because winners depend on interleaving. The exact boundary
-gets its own *sequential* test. Results are asserted against the database, not only the API.
+answered), the exact boundary gets its own *sequential* test, and results are asserted against the
+database rather than only the API.
 
-**Why.** `Confirm_Twice_Returns409AndDoesNotShipTwice` passes with the `xmin` declaration
-deleted. A test that cannot fail when the safety mechanism is removed is not testing the
-mechanism.
+**Why.** `Confirm_Twice_Returns409AndDoesNotShipTwice` passes with the `xmin` declaration deleted.
+A test that cannot fail when the safety mechanism is removed is not testing the mechanism.
 
 **Rejected.** Exact-count assertions — flaky, and they test the scheduler rather than the design.
+One such assertion did ship, and did hide a server fault behind a tally mismatch; see
+`KNOWN-ISSUES.md` → Resolved.
 
 ### Structural guards are re-derived per service, not copied
 
-**Context.** Catalog's `ContractSchemaAlignmentTests` compares DTO string limits against column
-limits. Stock has almost no length-constrained strings, so a verbatim copy would have matched
-nothing and passed vacuously — the exact failure mode its own non-vacuity assertion exists to
-catch.
+**Decision.** Each service writes guards for the drift *it* can suffer. The three
+`ContractSchemaAlignmentTests` share nothing but a name — what each covers is tabulated in
+`ARCHITECTURE.md` §5.5.
 
-**Decision.** Each service writes guards for the drift *it* can suffer. Stock's asserts the enum
-vocabulary equals its `CHECK` list, the status column is wide enough, quantity bounds match
-`StockItem.MaxQuantity` and fit an `integer` column, derived values are not persisted, and every
-entity carries an `xmin` token.
+**Why.** A verbatim copy of Catalog's into Stock would have matched zero properties and passed
+vacuously — the exact failure mode its own non-vacuity assertion exists to catch.
 
 **Consequence accepted.** More duplicated guard scaffolding. It is the price of the guards being
-worth anything.
+worth anything, and it is why the guards are excluded from the Phase 1 shared-library extraction.
 
 ---
 
@@ -464,14 +470,16 @@ Each was considered and declined, with the phase that would justify it:
 | Outbox / Inbox | An outbox makes "write a row and publish an event" atomic; there are no events. Note the design is already outbox-ready: every write path is a single `SaveChangesAsync`, so an entity and an outbox row would already be atomic. Stock's reserve commits the counter and the reservation row together, which is the same property |
 | Redis | No cache pressure, no distributed idempotency store to hold |
 | Polly / resilience | Retrying without idempotency keys double-reserves stock. Also see D9: Stock deliberately returns 409 on `xmin` conflict rather than retrying |
-| OpenTelemetry | No service makes an outbound call yet, so there is nothing distributed to trace |
+| OpenTelemetry | A correlation id crosses the hop and appears in both logs, which is enough for three services and one synchronous path. A span tree answers "which call was slow", and nothing is slow yet |
 | Serilog | Built-in logging suffices and the configuration is about to change |
-| Shared infrastructure library | See the trigger above — the counter is now 2 of 3 |
+| Shared infrastructure library | Deferred to Phase 1 by decision (2026-09-24), after the trigger fired — see "No shared library" above |
 | Authentication / authorization | Deferred by the project owner. Adding it later needs a customer identity column on `Order` plus a cross-cutting policy — a migration and a concern, which is why no placeholder seam was pre-built |
 | Kubernetes / Helm, YARP gateway | Phase 4 |
 | CQRS, DDD tactical patterns, event sourcing | No read pressure, no aggregate boundaries to enforce |
-| Idempotency keys | Phase 1. Two operations are already naturally idempotent through unique constraints: `POST /products` (unique SKU) and `POST /stock/{id}/reservations` (unique order + stock item) |
-| Reservation expiry / `ExpiresAtUtc` | Phase 3. Release is an explicit call only; no background worker |
+| Idempotency keys | Phase 1. Two operations are already naturally idempotent through unique constraints: `POST /products` (unique SKU) and `POST /stock/{id}/reservations` (unique order + stock item). **`POST /orders` is not** — a retried placement creates a second order and a second set of holds, which for an order that actually confirmed means shipping twice. That is now the largest open residual in the repository, and it is why keys precede retry policies rather than following them |
+| Reservation expiry / `ExpiresAtUtc` | Phase 3. Release is an explicit call only; no background worker. The cost became concrete with Ordering: a release that fails during compensation strands the hold, and nothing lifts it |
+| Payment / any money movement | Not in scope at any phase. It is also what keeps the confirm-phase residual survivable — a `PartiallyConfirmed` order strands *inventory*, not money. Adding a payment step would turn it into a financial inconsistency and would need the outbox and the saga first |
+| Compensating return-to-stock for a confirmed reservation | Stock's `Confirmed` is terminal by decision D3 and confirm decrements `quantity_on_hand`, so undoing one needs a new inventory-adjustment transition with its own audit trail. Ordering records a terminal `PartiallyConfirmed` order instead — see `src/AgenticShop.Ordering/docs/DECISIONS.md` → O14 |
 | Service Dockerfiles | Phase 0 runs APIs on the host for a fast inner loop |
 | CI pipeline | Phase 1 |
 | CORS policy | No browser client |

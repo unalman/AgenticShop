@@ -14,17 +14,14 @@ worth knowing.
 ### Concurrency
 
 **Contention throughput is poor by design.** *Medium · Phase 1 (retry) or Phase 2 (serialisation).*
-A live 40-way burst against 10 units held only **4** — 36 requests lost the `xmin` race and were
-told 409 despite stock being available. Nothing is oversold and nothing is a 5xx, so this is
-correct optimistic-concurrency behaviour with no server-side retry (decision D9), not a defect.
+A live burst held only 4 of 10 units — the numbers and the log are in `ARCHITECTURE.md` §7.
+Nothing is oversold and nothing is a 5xx, so this is correct optimistic-concurrency behaviour with
+no server-side retry (decision D9), not a defect.
 
-It matters because Ordering's synchronous order placement will reserve line by line and will fail
-often under load. Either Phase 1 adds retry, or Phase 2's single-consumer queue dissolves the
-contention entirely. Ordering must decide in the meantime whether to retry, partial-fill, or fail
-the order.
-
-A 20-way race to confirm one reservation behaved correctly: exactly one 200, nineteen 409s, no
-5xx, and the goods shipped once.
+It matters because Ordering's synchronous placement reserves line by line and will fail often under
+load. Either Phase 1 adds retry, or Phase 2's single-consumer queue dissolves the contention
+entirely. **Ordering's policy is decided: fail fast** — see
+`../../AgenticShop.Ordering/docs/DECISIONS.md` → **O16**.
 
 ### API
 
@@ -39,6 +36,13 @@ admin path to Stock is ever exposed, this becomes a real gap.
 succeeding quietly. Deliberate (decision D3): a silent no-op would hide a double-settle from the
 caller. **Ordering must treat that specific 409 as success** until Phase 1/2 adds real
 idempotency.
+
+**`Confirmed` is non-compensable.** Deliberate, and a consequence of the item above plus confirm
+decrementing `quantity_on_hand`. There is no transition that undoes a confirm, so an order whose
+confirms fail part-way through cannot be rolled back — only its still-`Pending` reservations can be
+released. Stock is not where this is handled; how Ordering records such an order is decision
+**O14** in `../../AgenticShop.Ordering/docs/DECISIONS.md`, and the stranded-hold residual is tracked
+in `../../../docs/KNOWN-ISSUES.md` → "Cross-service consistency".
 
 **No server-side retry on `xmin` conflict.** Deliberate (decision D9); see the contention item
 above.

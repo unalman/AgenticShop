@@ -143,8 +143,8 @@ makes the paging window unstable: rows can be skipped or repeated across pages.
 disagree with the page under concurrent writes. Standard for offset paging and accepted; see
 `KNOWN-ISSUES.md`.
 
-Stock has no paging and no list endpoint. Paging is therefore not yet a proven cross-service
-convention — Ordering should treat it as a pattern to evaluate, not inherit.
+Stock has no paging and no list endpoint, and neither does Ordering — paging is still a
+Catalog-only convention, not house style.
 
 ---
 
@@ -167,9 +167,10 @@ concurrency conflict on `PUT`.
 ## 7. What Catalog does not exercise
 
 Catalog is single-entity CRUD. It does **not** cover: outbound HTTP calls, typed `HttpClient`
-seams, correlation-id propagation, nested request DTOs (the validation cascade is proven only by
-synthetic contracts in `DataAnnotationValidationFilterTests`), multi-entity transactions,
-compensation, sequences, or any contended numeric resource.
+seams, correlation-id propagation, nested request DTOs, multi-entity transactions, compensation,
+sequences, or any contended numeric resource. Ordering has since exercised all of those except a
+sequence — `../../AgenticShop.Ordering/docs/ARCHITECTURE.md` §11 is the canonical list of what
+remains untested anywhere in Phase 0.
 
 Its `xmin` token is proven at the `DbContext` level only (`ConcurrencyTests`, two independent
 units of work) — there is no HTTP-level parallel test, because `Product` has nothing worth

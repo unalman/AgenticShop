@@ -5,14 +5,14 @@ justifies it. The ordering is the point: **retrying without idempotency keys dou
 stock; an outbox without a broker to publish to is dead weight; CQRS without read pressure is
 ceremony.**
 
-`README.md` carries a short version of this list. This file is authoritative for detail.
-
+`README.md` carries a short version of this list. This file is authoritative for the phases.
 Constraints on what may *not* be added early are in `AGENTS.md` §8; the reasoning behind each
-deferral is in `DECISIONS.md`.
+deferral is in `DECISIONS.md`. Decisions taken while building a service live in that service's
+`docs/DECISIONS.md`, not here — this file records only which phase owns each open problem.
 
 ---
 
-## Phase 0 — Foundation *(current: Catalog and Stock complete, Ordering outstanding)*
+## Phase 0 — Foundation *(complete)*
 
 Three independently deployed hosts, synchronous HTTP between them, one database per service with
 its own migrations and its own least-privilege PostgreSQL role, Testcontainers-backed integration
@@ -28,67 +28,38 @@ reservation lifecycle (`Pending → Confirmed | Released`, both terminal), `xmin
 `CHECK` constraints, a `RESTRICT` foreign key, natural reserve idempotency via
 `UNIQUE(order_id, stock_item_id)`, and parallel overselling tests. 138 tests.
 
-Together **276 tests passing**, build clean under `TreatWarningsAsErrors`, database isolation
-verified 22/22, and both integration suites proven isolated by running with the compose database
+**Ordering — done.** The orchestrator, and the first service to make an outbound call: two typed
+`HttpClient`s behind consumer-owned interfaces, outbound correlation-id propagation, the first real
+nested request DTO, order-line snapshotting, and compensation across services. One migration, two
+endpoints plus `/health`, four order statuses, `xmin` on both entities, `CHECK` constraints, a
+`CASCADE` foreign key and a unique index enforcing one line per product. 150 tests.
+
+Together **426 tests passing**, build clean under `TreatWarningsAsErrors`, database isolation
+verified 22/22, and all three integration suites proven isolated by running with the compose database
 stopped.
 
-Stock's five deliberate divergences from Catalog — no soft delete, no paging, no money, parallel
-rather than sequential concurrency tests, rewritten structural guards — are tabulated in
-`src/AgenticShop.Stock/docs/ARCHITECTURE.md` §8.
+Each service's deliberate divergences from Catalog are tabulated in its own
+`docs/ARCHITECTURE.md` — Stock §8, Ordering §10. Those tables are the record of what transferred
+and what did not; do not restate them here.
 
-**Not done:** Ordering. Its database and role are provisioned; there is no project, no code and no
-client seam.
+### What Phase 0 settled, and who owns it now
 
----
+| Settled | Decision | Owner of the detail | Next phase to touch it |
+|---|---|---|---|
+| A reserve that fails after earlier lines were held → release everything, fail the order, **no server-side retry** | fail fast | `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O16** | Phase 1, once idempotency keys make a retry safe |
+| A confirm that fails part-way → terminal `PartiallyConfirmed`, 502, classified by a reconciliation read | reconcile, never undo a confirm | `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O14**, design in that service's `ARCHITECTURE.md` §5 | Phase 2's saga, which can drive it to a resolved state |
+| Filter, exception handler and correlation middleware are copied per service | third copy now, extract later | `DECISIONS.md` → "No shared library" | **Phase 1**, committed |
+| Order lines snapshot `ProductName` and `UnitPrice` | standing project invariant | `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O5** | never — it is what keeps order history immutable |
+| `OrderNumber` is derived, not sequenced | no allocation, no sequence to reset | `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O4** | never, unless a sequence is genuinely needed |
 
-## Next: build Ordering
-
-Still Phase 0. The point is to create the first real network hops and to prove the conventions
-survive a service that orchestrates rather than owns a single resource.
-
-Ordering introduces everything Catalog and Stock lack:
-
-- **A typed `HttpClient` plus an interface seam per downstream service.** The one abstraction
-  justified in advance, because it is a real network boundary: the seam the integration tests
-  fake, and the seam a broker-based implementation later swaps into.
-- **Outbound correlation-id propagation** via a `DelegatingHandler`. Without it a trace breaks
-  at the first hop. Neither existing service makes an outbound call, so this is untested
-  territory.
-- **Real nested request DTOs.** `CreateOrderRequest` with a `Lines` collection is the first
-  genuine exercise of the validation cascade, which until now is proven only by synthetic
-  contracts.
-- **Order-line snapshotting.** `OrderLine` must copy `ProductName` and `UnitPrice` at the time of
-  ordering, so a later catalog edit cannot rewrite order history. This is a standing project
-  invariant, not a Catalog convention.
-- **Compensation.** Placing an order reserves stock line by line; a failure part-way through must
-  release whatever was already reserved.
-- **A sequence or equivalent for `OrderNumber`** — which also means the test fixture must reset
-  sequences, not just truncate rows (see `KNOWN-ISSUES.md`).
-
-Two things Stock established that Ordering must honour rather than rediscover:
-
-- **Reserve is naturally idempotent** via `UNIQUE(order_id, stock_item_id)`, so a retried reserve
-  returns 409 rather than double-holding. Ordering must combine duplicate product lines in an
-  order, or the second will be rejected.
-- **Settling is strict, not idempotent.** A retried confirm returns 409 "already confirmed", and
-  Ordering must treat that as success. This is decision D3 and it changes in Phase 1/2.
-
-Ordering must also decide how to handle contention: a live 40-way burst against 10 units held only
-**4**, because there is no server-side retry on `xmin` conflict (decision D9). Whether Ordering
-retries, partial-fills, or fails the order is an open design question, not an implementation
-detail.
-
-Expect the conventions to need revision here. **When a convention proves wrong for a later
-service, fix it in the earlier ones too** — divergent conventions across three services are worse
-than one imperfect convention applied consistently.
-
-This is also where the shared-library trigger fires: the filter, exception handler and correlation
-middleware are already copied twice (~517 lines in Stock), and the error handler's
-chain-describing logic is entirely generic. Raise the decision **before** the third copy.
+The three-host path was also driven by hand, because no automated test can: `http/ordering.http`
+provisions a product in Catalog, stock in Stock, then places an order through Ordering and reads both
+databases back. That run is what proved outbound correlation-id propagation end to end — the evidence
+is recorded in `src/AgenticShop.Ordering/docs/ARCHITECTURE.md` §6.
 
 ---
 
-## Phase 1 — Reliability and observability
+## Phase 1 — Reliability and observability *(next)*
 
 Now that a network hop exists, make its failure modes survivable and visible.
 
@@ -100,20 +71,25 @@ Now that a network hop exists, make its failure modes survivable and visible.
   being theoretical. Derive the correlation id from `Activity.Current?.TraceId` here, or there
   will be two parallel correlation concepts
 - Dependency-aware health checks
+- **Extract the shared infrastructure library.** Committed by the 2026-09-24 decision that gave
+  Ordering the third copy: `DataAnnotationValidationFilter`, the exception-handler skeleton and
+  `CorrelationIdMiddleware`, designed against four consumers (the three plus Serilog/telemetry
+  wiring) rather than three near-identical ones. The per-service structural guards stay per
+  service. See `DECISIONS.md` → "No shared library". Reconcile Ordering's two divergences — the
+  502 bucket and the `orderId` extension — into the shared surface at that point.
 - Dockerfiles for all three services plus a `full` compose profile
 - CI: build, test, and `dotnet ef migrations has-pending-model-changes` as a drift gate
 
 Also resolves, or forces a decision on, the three open observability items in `KNOWN-ISSUES.md`:
 the `Database.Command` Error entry for handled 409s, the fact that validation rejections are
 invisible, and the verbose `DbUpdateConcurrencyException` log line that dominates Stock's output
-under contention. The last is the cheapest and is a candidate to fix earlier — but it belongs in
-**both** handlers, so it is naturally batched with the shared-library decision that Ordering
-triggers.
+under contention. The last is the cheapest, but it belongs in **all three** handlers, so it is
+naturally batched with the extraction above.
 
-**Contention is the phase's real driver.** Stock measured a 40-way burst holding only 4 of 10
-units because there is no server-side retry on `xmin` conflict (decision D9). Retry policies plus
-idempotency keys are what turn that 409 into a transparent retry, which is exactly why idempotency
-comes first: retrying a reserve without a key double-holds stock.
+**Contention is the phase's real driver.** Stock measured a 40-way burst holding only 4 of 10 units
+because there is no server-side retry on `xmin` conflict (decision D9) — the measurement and the log
+are in `src/AgenticShop.Stock/docs/ARCHITECTURE.md` §7. Retry policies plus idempotency keys are what
+turn that 409 into a transparent retry, which is exactly why idempotency comes first.
 
 Note that Phase 2 largely dissolves this problem rather than solving it — a single-consumer queue
 serialises reservations, so the contention disappears. If Phase 2 arrives quickly, the retry work
@@ -131,17 +107,25 @@ here may be worth less than it looks.
   `SaveChangesAsync`, so an entity and an outbox row would already be atomic
 - **Inbox** for consumer-side deduplication. Prerequisite: the Phase 2 event contracts must carry
   a stable message id from the start — cheap to decide then, expensive to retrofit
-- Saga / process manager in Ordering owning the order lifecycle and compensation
+- Saga / process manager in Ordering owning the order lifecycle and compensation — including
+  driving Phase 0's terminal `PartiallyConfirmed` orders to a resolved state, which a synchronous
+  orchestrator with no worker can only record. It also makes a persisted `Pending` order the normal
+  case, which needs the migration Phase 0 deliberately did not write
 - Dead-letter queues, retry policies, at-least-once semantics
+- Closes the dual-write orphan residual: a process death mid-confirm currently leaves Stock holding
+  reservations for an order row that was never written — `KNOWN-ISSUES.md` → "Cross-service
+  consistency"
 
 ---
 
 ## Phase 3 — Data and scale
 
 - Redis: catalog read caching plus a distributed idempotency store
-- Reservation-expiry background worker (the `ExpiresAtUtc` concept deliberately skipped in Phase 0)
+- Reservation-expiry background worker (the `ExpiresAtUtc` concept deliberately skipped in Phase 0).
+  This is what finally lifts a hold stranded by a failed compensation release
 - Read models / projections — CQRS on the read side only, introduced when a real query needs it
-- Consumer-driven contract tests (Pact), so services can evolve independently
+- Consumer-driven contract tests (Pact), so services can evolve independently — the answer to
+  Ordering's consumer-owned contracts drifting silently
 - Keyset paging, if any table has grown enough to care
 
 ---

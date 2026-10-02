@@ -23,9 +23,9 @@ contended and the consequence of a missed token is overselling rather than a los
 not copy Catalog's lighter approach into a service with a contended counter.
 
 **`CatalogApiFixture.DisposeAsync` is not exception-safe.** *Low.* If `_factory.DisposeAsync()`
-throws, `_postgres.DisposeAsync()` never runs and the container leaks until Ryuk reaps it. Wants a
-`try/finally`. `StockApiFixture` already has one — the divergence is tracked in
-`../../../docs/KNOWN-ISSUES.md` because it spans both services.
+throws, the container leaks until Ryuk reaps it; wants a `try/finally`. Stock and Ordering both have
+one, so Catalog is the only service without it. Tracked in `../../../docs/KNOWN-ISSUES.md`, because
+a divergence *between* services belongs there.
 
 **Minor test-debt items.** *Info.* `Deactivate()` bumps `UpdatedAtUtc` but nothing asserts it.
 `Create_RejectsNegativePrice` casts `double`→`decimal` while the rounding theory two tests above
@@ -57,7 +57,7 @@ depends on `StringLength` being present.
 
 Kept for the lesson, not the fix. Findings about shared infrastructure — the validation filter,
 the exception handler, the test harness, `xmin`, `launchSettings` — are recorded in
-`../../../docs/KNOWN-ISSUES.md`, because that is where the code now lives in both services.
+`../../../docs/KNOWN-ISSUES.md`, because that is where the code now lives in all three services.
 
 ### `HasDefaultValue(true)` on a non-nullable `bool`
 

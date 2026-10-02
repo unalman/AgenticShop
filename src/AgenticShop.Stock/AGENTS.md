@@ -52,9 +52,9 @@ open and resolved issues: `docs/KNOWN-ISSUES.md`.
 - **A `CHECK` violation is a 500, not a 4xx.** Every CHECK restates an invariant the entity
   already guards, so a violation means our code has a bug. Do not add a handler arm for `23514`.
 - **Any change to a counter needs a parallel test.** Sequential state-machine tests prove almost
-  nothing here — in a verified 20-way confirm race all 20 passed the state machine and only `xmin`
-  stopped 19. Parallel assertions are inequalities (never oversold, no 5xx, counters agree with
-  committed rows), never exact success counts.
+  nothing here — see `docs/ARCHITECTURE.md` §7 and `../../../docs/ARCHITECTURE.md` §5.3. Parallel
+  assertions are inequalities (never oversold, no 5xx, counters agree with committed rows), never
+  exact success counts.
 - `ResetDatabaseAsync` must delete `stock_reservations` **before** `stock_items`; the foreign key
   is `RESTRICT`.
 
@@ -77,9 +77,5 @@ Stock runs independently — it needs no other service up.
 ## Before changing a convention here
 
 The validation filter, exception-handler skeleton, correlation middleware and test harness are
-copies of Catalog's. A change to any of them must be mirrored into Catalog. Check
-`../../docs/ARCHITECTURE.md` §4 for which conventions are shared, and fix both services rather
-than letting them diverge.
-
-One divergence is already open: `StockApiFixture.DisposeAsync` uses `try/finally` and Catalog's
-does not. See `docs/KNOWN-ISSUES.md`.
+copies of Catalog's, and Ordering holds the third. A change to any of them must be mirrored into
+both other services. Which conventions are shared: `../../docs/ARCHITECTURE.md` §4.

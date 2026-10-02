@@ -56,16 +56,18 @@ public sealed class OversellingConcurrencyTests(StockApiFixture fixture) : IAsyn
         var successes = statuses.Count(s => s == HttpStatusCode.Created);
         var conflicts = statuses.Count(s => s == HttpStatusCode.Conflict);
 
+        // A contention burst must not surface as a server fault. This is the assertion that
+        // would catch a misclassified DbUpdateConcurrencyException or an unmapped SQLSTATE, so it
+        // runs first: the counts below would also fail on a 5xx, and would report it as a
+        // mismatched tally rather than as the server fault it actually was.
+        responses.Should().NotContain(r => (int)r.StatusCode >= 500,
+            "contention is a client-visible conflict, never a 5xx");
+
         // The headline invariant.
         successes.Should().BeLessThanOrEqualTo(10, "ten units cannot satisfy more than ten holds");
 
         successes.Should().BeGreaterThan(0, "at least one request should win the race");
         (successes + conflicts).Should().Be(25, "every request must be answered");
-
-        // A contention burst must not surface as a server fault. This is the assertion that
-        // would catch a misclassified DbUpdateConcurrencyException or an unmapped SQLSTATE.
-        responses.Should().NotContain(r => (int)r.StatusCode >= 500,
-            "contention is a client-visible conflict, never a 5xx");
 
         var stock = await GetStockAsync(productId);
 
@@ -122,10 +124,23 @@ public sealed class OversellingConcurrencyTests(StockApiFixture fixture) : IAsyn
 
         var statuses = responses.Select(r => r.StatusCode).ToList();
 
+        // The no-5xx assertion comes first because it is the diagnostic one. An exact 409 count
+        // placed ahead of it once turned a genuine server fault into a report of "8 instead of 9",
+        // which named the symptom and hid the cause.
+        responses.Should().NotContain(r => (int)r.StatusCode >= 500,
+            "contention is a client-visible conflict, never a server fault");
+
+        // Only two outcomes are reachable: the state machine settles one and refuses the rest, or the
+        // xmin token refuses them. Anything else — a 400, a 404, a 422 — is a misclassification, and
+        // this catches it without depending on how the requests interleaved.
+        //
+        // Written as equality rather than an `is` pattern: FluentAssertions builds an expression
+        // tree here, and pattern matching is not allowed inside one.
+        statuses.Should().OnlyContain(s => s == HttpStatusCode.OK || s == HttpStatusCode.Conflict,
+            "a parallel confirm either settles or conflicts");
+
         statuses.Count(s => s == HttpStatusCode.OK).Should().Be(1,
             "exactly one confirm may settle the reservation");
-        statuses.Count(s => s == HttpStatusCode.Conflict).Should().Be(9);
-        responses.Should().NotContain(r => (int)r.StatusCode >= 500);
 
         var stock = await GetStockAsync(productId);
 

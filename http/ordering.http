@@ -1,0 +1,142 @@
+### Ordering — manual requests
+#
+# Ordering is the orchestrator, so a smoke check needs all three services up:
+#
+#   docker compose up -d db
+#   dotnet run --project src/AgenticShop.Catalog     # http://localhost:5081
+#   dotnet run --project src/AgenticShop.Stock       # http://localhost:5082
+#   dotnet run --project src/AgenticShop.Ordering    # http://localhost:5083
+#
+# Run the requests top to bottom: the order at the bottom consumes the product and the stock
+# provisioned above it. Every response carries the X-Correlation-Id it was sent, and Ordering
+# forwards it to Catalog and Stock, so one id appears in all three logs — that is the thing to look
+# at first, because it is the only end-to-end check of outbound propagation the suite cannot make
+# with the clients faked.
+
+@ordering = http://localhost:5083
+@catalog = http://localhost:5081
+@stock = http://localhost:5082
+
+### Health
+GET {{ordering}}/health
+
+### 1. Create a product in Catalog
+# @name createProduct
+POST {{catalog}}/api/v1/products
+Content-Type: application/json
+X-Correlation-Id: ordering-smoke
+
+{
+  "sku": "ORD-SMOKE-1",
+  "name": "Blue Widget",
+  "description": "Used by http/ordering.http",
+  "price": 12.50,
+  "currency": "USD"
+}
+
+### 2. Provision stock for it (10 units)
+# Stock does not resolve productId against Catalog; Ordering does, and it is the only service that
+# calls both.
+POST {{stock}}/api/v1/stock
+Content-Type: application/json
+X-Correlation-Id: ordering-smoke
+
+{
+  "productId": "{{productId}}",
+  "quantityOnHand": 10
+}
+
+### 3. Place an order -> 201 Confirmed
+# Reserves 2 units, confirms them, and writes the order once, already terminal.
+# @name placeOrder
+POST {{ordering}}/api/v1/orders
+Content-Type: application/json
+X-Correlation-Id: ordering-smoke
+
+{
+  "lines": [
+    { "productId": "{{productId}}", "quantity": 2 }
+  ]
+}
+
+### 4. Read it back
+GET {{ordering}}/api/v1/orders/{{orderId}}
+
+### 5. Stock after the order: on-hand 8, reserved 0, and one Confirmed reservation
+GET {{stock}}/api/v1/stock/{{productId}}
+
+### 6. The reconciliation view Ordering used to decide the outcome
+GET {{stock}}/api/v1/reservations?orderId={{orderId}}
+
+### Duplicate lines for one product are combined into a single hold
+# Stock's UNIQUE(order_id, stock_item_id) allows one hold per product per order, so this places one
+# reservation for 5 units, not two.
+POST {{ordering}}/api/v1/orders
+Content-Type: application/json
+
+{
+  "lines": [
+    { "productId": "{{productId}}", "quantity": 2 },
+    { "productId": "{{productId}}", "quantity": 3 }
+  ]
+}
+
+### Ordering more than is available -> 409, the earlier holds released, the order written as Failed
+# The response body carries an orderId extension: a failed placement still writes a row.
+POST {{ordering}}/api/v1/orders
+Content-Type: application/json
+
+{
+  "lines": [
+    { "productId": "{{productId}}", "quantity": 100000 }
+  ]
+}
+
+### A product Catalog does not have -> 409, and nothing is reserved
+POST {{ordering}}/api/v1/orders
+Content-Type: application/json
+
+{
+  "lines": [
+    { "productId": "99999999-9999-9999-9999-999999999999", "quantity": 1 }
+  ]
+}
+
+### A soft-deleted product -> 409 too
+# Catalog's query filter answers 404 for an inactive product, which Ordering reports as
+# "cannot be ordered" rather than passing the 404 through.
+DELETE {{catalog}}/api/v1/products/{{productId}}
+
+### No lines -> 400 ValidationProblemDetails with an error against "Lines"
+POST {{ordering}}/api/v1/orders
+Content-Type: application/json
+
+{
+  "lines": []
+}
+
+### A bad quantity -> 400 with the error against "Lines[0].Quantity"
+# The first genuinely nested request DTO in the repository, so this is the request that exercises the
+# validation filter's collection recursion for real.
+POST {{ordering}}/api/v1/orders
+Content-Type: application/json
+
+{
+  "lines": [
+    { "productId": "{{productId}}", "quantity": 0 }
+  ]
+}
+
+### Malformed JSON -> 400 ProblemDetails (never a 500)
+POST {{ordering}}/api/v1/orders
+Content-Type: application/json
+
+{
+
+### Unknown order -> 404
+GET {{ordering}}/api/v1/orders/88888888-8888-8888-8888-888888888888
+
+### A 502 cannot be provoked from here
+# It needs Catalog or Stock to fail mid-placement, which no request can arrange. The confirm-phase
+# policy is covered by ConfirmPhaseFailureTests, where the client seam can be scripted; the residual
+# it accepts is in docs/KNOWN-ISSUES.md under "Cross-service consistency".
