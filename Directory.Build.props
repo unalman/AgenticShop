@@ -10,4 +10,13 @@
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <!--
+      Shared infrastructure is not a service, and the boundary guard in
+      Directory.Build.targets exempts exactly this one project name and nothing else.
+      Declared here so renaming it is a one-line change rather than an edit to the guard.
+    -->
+    <AgenticShopSharedProject>AgenticShop.Shared</AgenticShopSharedProject>
+  </PropertyGroup>
+
 </Project>

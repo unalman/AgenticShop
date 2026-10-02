@@ -1,9 +1,9 @@
 using System.Collections;
 using System.ComponentModel.DataAnnotations;
 using System.Reflection;
-using AgenticShop.Catalog.Contracts;
+using AgenticShop.Shared.Contracts;
 
-namespace AgenticShop.Catalog.Validation;
+namespace AgenticShop.Shared.Validation;
 
 /// <summary>
 /// Runs DataAnnotations validation over request DTOs and returns RFC 9457
@@ -13,7 +13,7 @@ namespace AgenticShop.Catalog.Validation;
 /// <para>
 /// Minimal APIs do not validate body DTOs on their own — automatic model validation is an
 /// MVC/<c>[ApiController]</c> behaviour. Without this filter the attributes declared in
-/// <c>Contracts/</c> are decorative: an over-length SKU sails through to PostgreSQL, which
+/// <c>Contracts/</c> are decorative: an over-length value sails through to PostgreSQL, which
 /// rejects the insert, and the caller gets a 500 instead of a 400.
 /// </para>
 /// <para>
@@ -26,6 +26,11 @@ namespace AgenticShop.Catalog.Validation;
 /// Candidates are identified by the <see cref="IRequestContract"/> marker rather than by
 /// namespace, so injected services are skipped and a DTO cannot be missed by living in the
 /// wrong folder.
+/// </para>
+/// <para>
+/// Behaviour is specified once, by <c>AgenticShop.Shared.UnitTests</c>. Each service asserts only
+/// that the filter is wired to its own endpoint groups — re-testing identical code proves nothing
+/// and creates a second place to update.
 /// </para>
 /// </remarks>
 public sealed class DataAnnotationValidationFilter : IEndpointFilter

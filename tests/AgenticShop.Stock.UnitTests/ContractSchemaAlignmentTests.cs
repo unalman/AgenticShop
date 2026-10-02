@@ -1,6 +1,7 @@
 using System.ComponentModel.DataAnnotations;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using AgenticShop.Shared.Contracts;
 using AgenticShop.Stock.Contracts;
 using AgenticShop.Stock.Data;
 using AgenticShop.Stock.Domain;
@@ -186,7 +187,10 @@ public class ContractSchemaAlignmentTests
             .Should().Equal(nameof(StockReservation.OrderId), nameof(StockReservation.StockItemId));
     }
 
-    private static IEnumerable<Type> RequestContracts() => typeof(IRequestContract).Assembly
+    // Anchored on a Stock contract type, not on IRequestContract: the marker now lives in
+    // AgenticShop.Shared, which has no DTOs, so deriving the assembly from it would scan nothing
+    // and every assertion below would pass vacuously.
+    private static IEnumerable<Type> RequestContracts() => typeof(SetStockRequest).Assembly
         .GetTypes()
         .Where(t => t.IsClass && !t.IsInterface && typeof(IRequestContract).IsAssignableFrom(t));
 }

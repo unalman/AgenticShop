@@ -178,13 +178,6 @@ attached to commercial work. `Shouldly` (Apache-2.0) is the drop-in alternative.
 
 ### Deliberate, not defects
 
-**Cross-cutting code is duplicated across services — 3 of 3, extraction deferred to Phase 1 by
-decision.** The filter, exception handler and correlation middleware exist in all three services,
-roughly 500 lines each, so a fix to the skeleton must be applied three times. This is a tracked
-decision with an owner phase, not an oversight — **do not re-raise it before Phase 1.** Reasoning,
-accepted cost and the two divergences a Phase 1 extraction must reconcile are all in
-`DECISIONS.md` → "No shared library".
-
 **Catalog-only conventions are not house style.** Soft delete, query filters and offset paging
 belong to Catalog. Stock has none of them, and Ordering has none of them either — an order must never
 vanish from a list, and there is no list to page. Details in
@@ -236,9 +229,15 @@ them shipped past a green test suite.
 | `UseXminAsConcurrencyToken()` does not exist in Npgsql 10 | the compiler | `ARCHITECTURE.md` §4.3 |
 | `UseSnakeCaseNamingConvention()` placement · no `JsonContentAs<T>()` · `HttpValidationProblemDetails` namespace · obsolete parameterless `PostgreSqlBuilder()` · inaccessible `ValidationProblemHttpResult` · read-only `PostgresException` fields | the compiler | `ARCHITECTURE.md` §5.4 |
 | `dotnet run` silently overrides the environment; a smoke test ran migrations and crashed | a startup crash | `DECISIONS.md` → `launchSettings.json` |
+| Cross-cutting code was copied into all three services (~500 lines each), so a fix to the skeleton had to be applied three times — and the copies had already drifted in their doc comments | the 2026-09-24 decision's own trigger, fired before the third copy was written | `DECISIONS.md` → shared infrastructure library |
+| Moving `IRequestContract` into `AgenticShop.Shared` silently detached two structural guards from the DTOs they were meant to scan — `typeof(IRequestContract).Assembly` no longer named a service assembly, so `RequestContractCoverageTests` and `ContractSchemaAlignmentTests` would have matched nothing and passed | `TheCoverageCheckIsNotPassingVacuously`, during the extraction | `AGENTS.md` §10 |
 
-Two patterns are worth more than any single row. **Not one of these was caught by the test suite** —
-the suite was green for all of them. And only the last three surfaced mechanically at all (two
+Two patterns are worth more than any single row. **Not one of the original twelve was caught by the
+test suite** — the suite was green for all of them, and only three surfaced mechanically at all (two
 compiler errors and a startup crash); the other nine needed a human to read an actual response body,
-log line, `docker port` output or stray database row, or to probe a path nobody had thought to
-assert on.
+log line, `docker port` output or stray database row, or to probe a path nobody had thought to assert
+on.
+
+The last row is the counter-example, and the more useful lesson: a guard that asserts its own
+non-vacuity turned a *silent* hole into a red build at the exact moment it opened. That is why every
+reflection-based guard here carries one.

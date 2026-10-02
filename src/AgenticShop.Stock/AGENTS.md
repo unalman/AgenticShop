@@ -76,6 +76,8 @@ Stock runs independently — it needs no other service up.
 
 ## Before changing a convention here
 
-The validation filter, exception-handler skeleton, correlation middleware and test harness are
-copies of Catalog's, and Ordering holds the third. A change to any of them must be mirrored into
-both other services. Which conventions are shared: `../../docs/ARCHITECTURE.md` §4.
+The validation filter, the correlation middleware, `IRequestContract` and the exception-handler base
+class are no longer copied — they live in `src/AgenticShop.Shared/`, so a change there reaches all
+three services at once. Only the test harness is still per service. Stock's handler supplies just its
+two domain arms and its two message strings; everything else is inherited. Which conventions are
+shared: `../../docs/ARCHITECTURE.md` §4.

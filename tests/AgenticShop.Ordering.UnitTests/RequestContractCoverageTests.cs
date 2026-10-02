@@ -1,4 +1,5 @@
 using AgenticShop.Ordering.Contracts;
+using AgenticShop.Shared.Contracts;
 using FluentAssertions;
 
 namespace AgenticShop.Ordering.UnitTests;
@@ -9,15 +10,23 @@ namespace AgenticShop.Ordering.UnitTests;
 /// came about. Reflecting over the contracts assembly turns that omission into a build-time failure.
 /// </summary>
 /// <remarks>
+/// <para>
 /// A copy of Stock's guard rather than a shared test, and worth more here than there: Ordering owns
 /// the first genuinely nested request DTO, so an unmarked type would skip validation for a whole
 /// collection of lines rather than one field.
+/// </para>
+/// <para>
+/// The assembly is anchored on an Ordering contract type, **not** on <see cref="IRequestContract"/> —
+/// the marker now lives in <c>AgenticShop.Shared</c>, which contains no DTOs, so deriving the
+/// assembly from it would scan nothing and this guard would pass vacuously.
+/// <see cref="TheCoverageCheckIsNotPassingVacuously"/> is what proves the anchor is right.
+/// </para>
 /// </remarks>
 public class RequestContractCoverageTests
 {
-    private static readonly Type[] ContractTypes = typeof(IRequestContract).Assembly
+    private static readonly Type[] ContractTypes = typeof(CreateOrderRequest).Assembly
         .GetTypes()
-        .Where(t => t.Namespace == typeof(IRequestContract).Namespace)
+        .Where(t => t.Namespace == typeof(CreateOrderRequest).Namespace)
         .ToArray();
 
     [Fact]

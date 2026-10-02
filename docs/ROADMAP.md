@@ -48,7 +48,7 @@ and what did not; do not restate them here.
 |---|---|---|---|
 | A reserve that fails after earlier lines were held → release everything, fail the order, **no server-side retry** | fail fast | `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O16** | Phase 1, once idempotency keys make a retry safe |
 | A confirm that fails part-way → terminal `PartiallyConfirmed`, 502, classified by a reconciliation read | reconcile, never undo a confirm | `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O14**, design in that service's `ARCHITECTURE.md` §5 | Phase 2's saga, which can drive it to a resolved state |
-| Filter, exception handler and correlation middleware are copied per service | third copy now, extract later | `DECISIONS.md` → "No shared library" | **Phase 1**, committed |
+| Filter, exception handler and correlation middleware are copied per service | ~~third copy now, extract later~~ **extracted** | `DECISIONS.md` → "Shared infrastructure library" | **done**, first Phase 1 item |
 | Order lines snapshot `ProductName` and `UnitPrice` | standing project invariant | `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O5** | never — it is what keeps order history immutable |
 | `OrderNumber` is derived, not sequenced | no allocation, no sequence to reset | `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O4** | never, unless a sequence is genuinely needed |
 
@@ -59,10 +59,19 @@ is recorded in `src/AgenticShop.Ordering/docs/ARCHITECTURE.md` §6.
 
 ---
 
-## Phase 1 — Reliability and observability *(next)*
+## Phase 1 — Reliability and observability *(in progress)*
 
 Now that a network hop exists, make its failure modes survivable and visible.
 
+- ~~**Extract the shared infrastructure library.**~~ **Done.** `src/AgenticShop.Shared/` holds
+  `DataAnnotationValidationFilter`, `CorrelationIdMiddleware`, `IRequestContract` and the
+  `ProblemDetailsExceptionHandler` base class; the three services now derive from it rather than
+  copy it. Ordering's two divergences were reconciled into the shared surface rather than forked:
+  the `orderId` extension became data on `ExceptionClassification`, and the 502 arm stayed in
+  Ordering because "a dependency failed" is only expressible where a dependency exists. The
+  per-service structural guards and the test harness were **not** shared, and two of those guards
+  had to be re-anchored because they had been discovering DTOs through the now-shared marker
+  interface. `DECISIONS.md` → "Shared infrastructure library".
 - Retry, circuit-breaker and timeout policies on the typed clients
 - **Idempotency keys** on `POST /orders` and on reserve/confirm — a prerequisite for safe retries,
   which is why it precedes resilience rather than following it
@@ -71,14 +80,11 @@ Now that a network hop exists, make its failure modes survivable and visible.
   being theoretical. Derive the correlation id from `Activity.Current?.TraceId` here, or there
   will be two parallel correlation concepts
 - Dependency-aware health checks
-- **Extract the shared infrastructure library.** Committed by the 2026-09-24 decision that gave
-  Ordering the third copy: `DataAnnotationValidationFilter`, the exception-handler skeleton and
-  `CorrelationIdMiddleware`, designed against four consumers (the three plus Serilog/telemetry
-  wiring) rather than three near-identical ones. The per-service structural guards stay per
-  service. See `DECISIONS.md` → "No shared library". Reconcile Ordering's two divergences — the
-  502 bucket and the `orderId` extension — into the shared surface at that point.
 - Dockerfiles for all three services plus a `full` compose profile
 - CI: build, test, and `dotnet ef migrations has-pending-model-changes` as a drift gate
+
+The extraction came first on purpose: Serilog and OpenTelemetry both touch the logging arms, so
+wiring them before consolidating would have meant writing the same change three times.
 
 Also resolves, or forces a decision on, the three open observability items in `KNOWN-ISSUES.md`:
 the `Database.Command` Error entry for handled 409s, the fact that validation rejections are

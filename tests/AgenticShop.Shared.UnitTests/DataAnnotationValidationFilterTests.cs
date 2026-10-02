@@ -1,20 +1,26 @@
 using System.ComponentModel.DataAnnotations;
 using System.Text.Json;
-using AgenticShop.Catalog.Contracts;
-using AgenticShop.Catalog.Validation;
+using AgenticShop.Shared.Contracts;
+using AgenticShop.Shared.Validation;
 using FluentAssertions;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 
-namespace AgenticShop.Catalog.UnitTests;
+namespace AgenticShop.Shared.UnitTests;
 
 /// <summary>
-/// The Catalog API has no nested request DTO yet, so these use synthetic contracts.
-/// They exist because the filter is the reference implementation for Stock and Ordering,
-/// and Ordering's create-order request will carry a collection of lines.
-/// <see cref="Validator.TryValidateObject"/> does not cascade on its own — if that
-/// regresses, nested DTOs stop validating silently and the failure surfaces as a 500.
+/// The single specification of the shared filter's behaviour. The recursion cases use synthetic
+/// contracts so the shapes that matter — nested objects, collections, collections of collections,
+/// jagged arrays, class-level attributes, reference cycles — are each covered directly rather than
+/// only where a service happens to use them. <see cref="Validator.TryValidateObject"/> does not
+/// cascade on its own; if that regresses, nested DTOs stop validating silently and the failure
+/// surfaces as a 500.
 /// </summary>
+/// <remarks>
+/// No service re-tests this. Each asserts only that the filter is *wired* to its own endpoint
+/// groups, plus — for Ordering, the one service with a real nested DTO — that the cascade works
+/// over HTTP against <c>CreateOrderRequest.Lines</c>.
+/// </remarks>
 public class DataAnnotationValidationFilterTests
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);

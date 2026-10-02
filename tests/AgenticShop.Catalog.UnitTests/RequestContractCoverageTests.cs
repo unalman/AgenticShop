@@ -1,4 +1,5 @@
 using AgenticShop.Catalog.Contracts;
+using AgenticShop.Shared.Contracts;
 using FluentAssertions;
 
 namespace AgenticShop.Catalog.UnitTests;
@@ -9,11 +10,17 @@ namespace AgenticShop.Catalog.UnitTests;
 /// over-length-SKU 500 came about. Reflecting over the contracts assembly turns that
 /// omission into a build-time test failure instead of a production incident.
 /// </summary>
+/// <remarks>
+/// The assembly is anchored on a Catalog contract type, **not** on <see cref="IRequestContract"/>.
+/// The marker now lives in <c>AgenticShop.Shared</c>, so deriving the assembly from it would scan
+/// the shared project — which contains no DTOs — and this guard would pass without covering
+/// anything. <see cref="TheCoverageCheckIsNotPassingVacuously"/> is what proves the anchor is right.
+/// </remarks>
 public class RequestContractCoverageTests
 {
-    private static readonly Type[] ContractTypes = typeof(IRequestContract).Assembly
+    private static readonly Type[] ContractTypes = typeof(CreateProductRequest).Assembly
         .GetTypes()
-        .Where(t => t.Namespace == typeof(IRequestContract).Namespace)
+        .Where(t => t.Namespace == typeof(CreateProductRequest).Namespace)
         .ToArray();
 
     [Fact]

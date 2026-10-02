@@ -5,7 +5,7 @@ using AgenticShop.Ordering.Contracts;
 using AgenticShop.Ordering.Data;
 using AgenticShop.Ordering.Domain;
 using AgenticShop.Ordering.IntegrationTests.Fakes;
-using AgenticShop.Ordering.Middleware;
+using AgenticShop.Shared.Middleware;
 using FluentAssertions;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;

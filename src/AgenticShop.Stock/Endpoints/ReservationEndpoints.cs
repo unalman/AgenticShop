@@ -1,7 +1,7 @@
+using AgenticShop.Shared.Validation;
 using AgenticShop.Stock.Contracts;
 using AgenticShop.Stock.Data;
 using AgenticShop.Stock.Domain;
-using AgenticShop.Stock.Validation;
 using Microsoft.EntityFrameworkCore;
 
 namespace AgenticShop.Stock.Endpoints;

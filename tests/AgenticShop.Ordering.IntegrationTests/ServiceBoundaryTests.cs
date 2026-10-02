@@ -22,6 +22,12 @@ namespace AgenticShop.Ordering.IntegrationTests;
 [Collection("Ordering API")]
 public sealed class ServiceBoundaryTests(OrderingApiFixture fixture)
 {
+    /// <summary>
+    /// Shared infrastructure is not a service. It is the one <c>AgenticShop.*</c> assembly a service
+    /// may reference, and <c>Directory.Build.targets</c> exempts exactly this name and no other.
+    /// </summary>
+    private const string SharedInfrastructureAssembly = "AgenticShop.Shared";
+
     [Fact]
     public void TheAssemblyDoesNotReferenceAnyOtherAgenticShopService()
     {
@@ -31,9 +37,14 @@ public sealed class ServiceBoundaryTests(OrderingApiFixture fixture)
             .Where(name => name is not null && name.StartsWith("AgenticShop.", StringComparison.Ordinal))
             .ToList();
 
-        referenced.Should().BeEmpty(
-            "a service assembly must not reference another service; the build guard in " +
-            "Directory.Build.targets enforces this at compile time and this catches the runtime equivalent");
+        // An exact set match, not merely "contains no service": asserting the shared library *is*
+        // referenced proves the exemption is about that one assembly rather than a blanket hole, so
+        // a second reference would fail here even though it is not a service name.
+        referenced.Should().BeEquivalentTo(
+            new[] { SharedInfrastructureAssembly },
+            "a service may reference only the shared infrastructure library, never another service; " +
+            "the build guard in Directory.Build.targets enforces this at compile time and this " +
+            "catches the runtime equivalent");
     }
 
     [Fact]

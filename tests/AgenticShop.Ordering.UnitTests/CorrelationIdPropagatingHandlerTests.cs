@@ -1,6 +1,6 @@
 using System.Net;
 using AgenticShop.Ordering.Clients;
-using AgenticShop.Ordering.Middleware;
+using AgenticShop.Shared.Middleware;
 using FluentAssertions;
 using Microsoft.AspNetCore.Http;
 

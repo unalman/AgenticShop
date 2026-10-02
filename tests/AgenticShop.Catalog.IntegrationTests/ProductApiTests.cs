@@ -3,7 +3,7 @@ using System.Net.Http.Json;
 using System.Text;
 using AgenticShop.Catalog.Contracts;
 using AgenticShop.Catalog.Domain;
-using AgenticShop.Catalog.Middleware;
+using AgenticShop.Shared.Middleware;
 using FluentAssertions;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;

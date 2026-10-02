@@ -108,35 +108,62 @@ accepted deliberately.
 
 **Revisit:** never for this project; the point is the distribution.
 
-### No shared library — extraction deferred to Phase 1
+### Shared infrastructure library — deferred through Phase 0, extracted at the start of Phase 1
 
-**Context.** With three services, a shared kernel is the obvious move. Built-in `ProblemDetails`
-is contract enough for the error shape, so no shared assembly is *needed*.
+**Context.** With three services, a shared kernel is the obvious move, and built-in
+`ProblemDetails` alone is not enough to avoid one: the validation filter, the correlation
+middleware, `IRequestContract` and the exception-handler skeleton were copied three times, roughly
+500 lines each.
 
-**Decision (2026-09-24).** None in Phase 0. The filter, the exception-handler skeleton and the
-correlation middleware are copied per service — Ordering carries the third copy — and extraction
-is a committed Phase 1 item, to be done once alongside Serilog, OpenTelemetry, resilience
-registration and health-check wiring.
+**Decision (2026-09-24): do not extract during Phase 0.** The trigger this entry's earlier form
+named fired before the third copy was written and was put to the project owner, who chose to defer.
+The reasoning held: a shared assembly created on day one becomes a coupling magnet and a
+version-lock across independently deployable services, and extracting early freezes the handler's
+shape before Serilog, OpenTelemetry and resilience policies change it. Ordering proved the point by
+needing two things the other services do not — a 502 bucket and an `orderId` extension on failures —
+which would have been retrofitted into a shared surface had the library existed first.
 
-**Why.** A shared assembly created on day one becomes a coupling magnet and a version-lock across
-independently deployable services. Extracting now would also freeze the handler's shape before
-Phase 1 changes it: Serilog and OpenTelemetry both touch the logging arms, and resilience policies
-touch how a downstream 409 is classified. Designing the shared type twice costs more than copying
-it a third time — and Ordering proved the point by needing two things the other services do not, a
-502 bucket and an `orderId` extension on failures. Phase 1 therefore designs against four real
-consumers rather than three near-identical ones.
+**Decision (Phase 1): extract, now.** `src/AgenticShop.Shared/` holds the filter, the middleware,
+`IRequestContract` and `ProblemDetailsExceptionHandler`. It is designed against four consumers —
+the three services plus the Serilog/telemetry wiring still to come — which is what the deferral
+bought.
 
-**Cost accepted.** Three near-identical copies of roughly 500 lines each, so a fix to the skeleton
-must be applied three times; the risk is silent divergence rather than breakage. Two mitigations:
-the four invariants in `ARCHITECTURE.md` §4.7 are test-guarded in every service, and `AGENTS.md` §10
-requires a convention proven wrong in a later service to be fixed in the earlier ones too.
+**Three problems the extraction had to solve, and how.**
 
-**Must never be shared, in any phase:** the per-service structural guards (`TestPostgreSql.Image`,
-`ComposeConfigurationTests`, `TestHostIsolationTests`, `ContractSchemaAlignmentTests`). Sharing
-them would require the integration assemblies to reference each other, which is the coupling the
-whole design avoids — see "Structural guards are re-derived per service" below.
+- **The boundary guard forbade it.** `Directory.Build.targets` rejects any `ProjectReference` from a
+  project under `src/` to another under `src/`, which is exactly what a shared library needs.
+  Rather than move the library outside `src/` or blanket-disable the guard, `Directory.Build.props`
+  declares `AgenticShopSharedProject` once and the target exempts that single filename. A reference
+  between two services is still a build error, and this was re-verified by probing it after the
+  change. The shared project is itself under `src/`, so it remains forbidden from referencing any
+  service — the dependency only points one way.
+- **Ordering's two divergences had to become shared surface, not forks.** `ExceptionClassification`
+  carries an optional `Extensions` dictionary, so `orderId` is data rather than a subclass override;
+  the 502 arm stays in Ordering's `ClassifyDomain`, because "a dependency failed" is only
+  expressible where a dependency exists. The base class therefore holds the arms that mean the same
+  thing everywhere and delegates the rest — `ClassifyDomain` (virtual, defaults to null),
+  `UniqueViolationDetail` and `ConcurrencyDetail`.
+- **Two structural guards silently stopped working.** `RequestContractCoverageTests` and
+  `ContractSchemaAlignmentTests` discovered a service's DTOs via `typeof(IRequestContract).Assembly`.
+  With the marker in the shared project that scans an assembly containing no DTOs, so each guard
+  would have passed having matched nothing — the vacuous-guard failure mode arriving through a new
+  door. Each now anchors on one of its own contract types. `TheCoverageCheckIsNotPassingVacuously`
+  is what turned this from a silent hole into a red build.
 
-**Do not re-raise extraction during Phase 0.** It is planned work with an owner phase.
+**Rejected:** a marker property on each service `.csproj` to exempt the reference. It would let any
+project opt itself out of the boundary guard; exempting one filename cannot.
+
+**Still never shared, in any phase:** the per-service structural guards (`TestPostgreSql.Image`,
+`ComposeConfigurationTests`, `TestHostIsolationTests`, `ContractSchemaAlignmentTests`,
+`RequestContractCoverageTests`) and the test harness. Sharing them would require the integration
+assemblies to reference each other, which is the coupling the whole design avoids — see "Structural
+guards are re-derived per service" below.
+
+**Cost of having waited, paid:** the filter's three copies had already drifted in their XML doc
+comments, and the handler's had drifted in structure — Catalog's was a 3-tuple, Ordering's a
+4-field record. Executable code was identical in the first two and nearly so in the third, so the
+drift was cosmetic rather than behavioural, but it is the predicted failure mode and it is why the
+extraction is not optional maintenance.
 
 ### One PostgreSQL container hosting three databases
 
@@ -472,7 +499,6 @@ Each was considered and declined, with the phase that would justify it:
 | Polly / resilience | Retrying without idempotency keys double-reserves stock. Also see D9: Stock deliberately returns 409 on `xmin` conflict rather than retrying |
 | OpenTelemetry | A correlation id crosses the hop and appears in both logs, which is enough for three services and one synchronous path. A span tree answers "which call was slow", and nothing is slow yet |
 | Serilog | Built-in logging suffices and the configuration is about to change |
-| Shared infrastructure library | Deferred to Phase 1 by decision (2026-09-24), after the trigger fired — see "No shared library" above |
 | Authentication / authorization | Deferred by the project owner. Adding it later needs a customer identity column on `Order` plus a cross-cutting policy — a migration and a concern, which is why no placeholder seam was pre-built |
 | Kubernetes / Helm, YARP gateway | Phase 4 |
 | CQRS, DDD tactical patterns, event sourcing | No read pressure, no aggregate boundaries to enforce |

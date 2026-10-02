@@ -4,6 +4,7 @@ using System.Reflection;
 using AgenticShop.Catalog.Contracts;
 using AgenticShop.Catalog.Data;
 using AgenticShop.Catalog.Domain;
+using AgenticShop.Shared.Contracts;
 using FluentAssertions;
 using Microsoft.EntityFrameworkCore;
 
@@ -27,7 +28,10 @@ public class ContractSchemaAlignmentTests
 
         limits.Should().NotBeEmpty();
 
-        var contracts = typeof(IRequestContract).Assembly
+        // Anchored on a Catalog contract type, not on IRequestContract: the marker now lives in
+        // AgenticShop.Shared, which has no DTOs, so deriving the assembly from it would find none.
+        // The NotBeEmpty assertion below is what proves the anchor is right.
+        var contracts = typeof(CreateProductRequest).Assembly
             .GetTypes()
             .Where(t => !t.IsInterface && typeof(IRequestContract).IsAssignableFrom(t))
             .ToList();

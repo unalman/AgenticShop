@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using AgenticShop.Shared.Contracts;
 using AgenticShop.Stock.Domain;
 
 namespace AgenticShop.Stock.Contracts;

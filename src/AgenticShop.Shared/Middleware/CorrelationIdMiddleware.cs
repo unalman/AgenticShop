@@ -1,15 +1,15 @@
-namespace AgenticShop.Ordering.Middleware;
+namespace AgenticShop.Shared.Middleware;
 
 /// <summary>
 /// Accepts an inbound X-Correlation-Id or mints one, then echoes it on the response.
-/// Adopting an inbound value is what lets a single request be traced across
-/// Ordering, Catalog and Stock once the orchestration lands.
+/// Adopting an inbound value is what lets a single request be traced across Ordering, Catalog
+/// and Stock.
 /// </summary>
 /// <remarks>
-/// The third and last deliberate copy of Catalog's middleware, not a shared type — extraction is
-/// deferred to Phase 1 by decision, see <c>docs/DECISIONS.md</c>. Unlike Catalog's and Stock's,
-/// this copy is paired with an outbound direction: <see cref="Clients.CorrelationIdPropagatingHandler"/>
-/// forwards the value resolved here onto every downstream call.
+/// Registered first in the pipeline, before <c>UseExceptionHandler</c>, so a failure in any later
+/// component still carries the id. Inbound-only for Catalog and Stock; Ordering pairs this with
+/// its own <c>CorrelationIdPropagatingHandler</c>, which forwards the value resolved here onto
+/// every downstream call. That outbound direction is a service concern and stays in the service.
 /// </remarks>
 public sealed class CorrelationIdMiddleware(RequestDelegate next)
 {

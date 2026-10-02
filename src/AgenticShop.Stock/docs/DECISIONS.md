@@ -109,9 +109,9 @@ reference.
 
 ## D12 · Do not duplicate the validation filter's recursion tests
 
-The filter is byte-identical to Catalog's. Stock asserts only that it is *wired* to its endpoint
-groups; the recursion behaviour is specified once, in Catalog's suite. Re-testing identical code
-creates a second place to update and proves nothing.
+The filter is shared code — it lives in `AgenticShop.Shared` and is specified once, in
+`AgenticShop.Shared.UnitTests`. Stock asserts only that it is *wired* to its own endpoint groups.
+Re-testing shared code creates a second place to update and proves nothing.
 
 ## D13 · Stock gets its own `TestPostgreSql.Image` and compose guard
 

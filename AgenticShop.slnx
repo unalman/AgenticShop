@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/AgenticShop.Catalog/AgenticShop.Catalog.csproj" />
     <Project Path="src/AgenticShop.Ordering/AgenticShop.Ordering.csproj" />
+    <Project Path="src/AgenticShop.Shared/AgenticShop.Shared.csproj" />
     <Project Path="src/AgenticShop.Stock/AgenticShop.Stock.csproj" />
   </Folder>
   <Folder Name="/tests/">
@@ -9,6 +10,7 @@
     <Project Path="tests/AgenticShop.Catalog.UnitTests/AgenticShop.Catalog.UnitTests.csproj" />
     <Project Path="tests/AgenticShop.Ordering.IntegrationTests/AgenticShop.Ordering.IntegrationTests.csproj" />
     <Project Path="tests/AgenticShop.Ordering.UnitTests/AgenticShop.Ordering.UnitTests.csproj" />
+    <Project Path="tests/AgenticShop.Shared.UnitTests/AgenticShop.Shared.UnitTests.csproj" />
     <Project Path="tests/AgenticShop.Stock.IntegrationTests/AgenticShop.Stock.IntegrationTests.csproj" />
     <Project Path="tests/AgenticShop.Stock.UnitTests/AgenticShop.Stock.UnitTests.csproj" />
   </Folder>

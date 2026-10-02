@@ -1,5 +1,6 @@
 using System.ComponentModel.DataAnnotations;
 using AgenticShop.Catalog.Domain;
+using AgenticShop.Shared.Contracts;
 
 namespace AgenticShop.Catalog.Contracts;
 

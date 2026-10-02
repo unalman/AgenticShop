@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>AgenticShop.Shared</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      This is a library, not a host, but it implements IEndpointFilter, IExceptionHandler and
+      an ASP.NET Core middleware — so it needs the shared framework rather than a package
+      reference to it. The same reason each service's unit test project carries it.
+    -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      A FrameworkReference supplies the assemblies but not the using directives; Microsoft.NET.Sdk.Web
+      adds those implicitly, which is why the service copies of these files carry no ASP.NET usings
+      at all. Declaring the same set here keeps the moved files identical to the originals rather
+      than scattering framework usings through them.
+    -->
+    <Using Include="Microsoft.AspNetCore.Builder" />
+    <Using Include="Microsoft.AspNetCore.Http" />
+    <Using Include="Microsoft.Extensions.DependencyInjection" />
+    <Using Include="Microsoft.Extensions.Logging" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      DbUpdateException and DbUpdateConcurrencyException come from EF Core; PostgresException
+      and PostgresErrorCodes come from Npgsql, which the provider brings in. Referencing the
+      provider rather than Npgsql directly keeps one centrally pinned version in play —
+      Directory.Packages.props documents an MSB3277 that a second version once caused.
+    -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+  </ItemGroup>
+
+</Project>

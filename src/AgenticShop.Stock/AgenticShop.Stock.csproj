@@ -16,4 +16,13 @@
     <PackageReference Include="Scalar.AspNetCore" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!--
+      Shared infrastructure, not a service. Directory.Build.targets exempts exactly this one
+      project name from the cross-service reference ban; a reference to another service is still
+      a build error.
+    -->
+    <ProjectReference Include="..\AgenticShop.Shared\AgenticShop.Shared.csproj" />
+  </ItemGroup>
+
 </Project>

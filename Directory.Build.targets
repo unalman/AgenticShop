@@ -14,6 +14,14 @@
 
     Test projects are exempt: they live under tests/ and are supposed to reference the
     service they exercise.
+
+    One project under src/ is exempt by name — $(AgenticShopSharedProject), declared in
+    Directory.Build.props. It is shared infrastructure, not a service: it holds the
+    validation filter, the correlation middleware and the ProblemDetails exception-handler
+    skeleton that every service reports through. The exemption is exactly that one name, so
+    a reference between two services is still rejected. The shared project is itself still
+    under src/, so it is forbidden from referencing any service — the dependency only ever
+    points one way.
   -->
   <PropertyGroup>
     <_AgenticShopProjectDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)').Replace('\','/'))</_AgenticShopProjectDir>
@@ -27,7 +35,8 @@
 
     <ItemGroup>
       <_AgenticShopCrossServiceReference Include="@(ProjectReference)"
-          Condition="$([System.String]::Copy('%(ProjectReference.FullPath)').Replace('\','/').Contains('/src/'))" />
+          Condition="$([System.String]::Copy('%(ProjectReference.FullPath)').Replace('\','/').Contains('/src/'))
+                 And '%(ProjectReference.Filename)' != '$(AgenticShopSharedProject)'" />
     </ItemGroup>
 
     <Error Condition="'@(_AgenticShopCrossServiceReference)' != ''"

@@ -1,9 +1,9 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text;
+using AgenticShop.Shared.Middleware;
 using AgenticShop.Stock.Contracts;
 using AgenticShop.Stock.Domain;
-using AgenticShop.Stock.Middleware;
 using FluentAssertions;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;

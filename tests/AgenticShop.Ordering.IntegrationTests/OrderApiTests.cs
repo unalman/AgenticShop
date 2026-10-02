@@ -3,7 +3,7 @@ using System.Net.Http.Json;
 using AgenticShop.Ordering.Contracts;
 using AgenticShop.Ordering.Domain;
 using AgenticShop.Ordering.IntegrationTests.Fakes;
-using AgenticShop.Ordering.Middleware;
+using AgenticShop.Shared.Middleware;
 using FluentAssertions;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;

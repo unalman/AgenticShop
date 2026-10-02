@@ -1,4 +1,4 @@
-using AgenticShop.Ordering.Middleware;
+using AgenticShop.Shared.Middleware;
 
 namespace AgenticShop.Ordering.Clients;
 

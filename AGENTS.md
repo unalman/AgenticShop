@@ -31,20 +31,21 @@ AgenticShop is an educational .NET backend for learning agentic software develop
 evolved gradually into a distributed e-commerce backend. The deferrals in §8 are deliberate —
 do not "improve" the project by adding infrastructure it has declined.
 
-**Phase 0 — all three services exist:**
+**Phase 0 complete, Phase 1 in progress.** All three services exist; the first Phase 1 item — the
+shared infrastructure library — is done.
 
 | Service | Status |
 |---|---|
 | **Catalog** | **Implemented.** The reference implementation; every convention originates here. |
 | **Stock** | **Implemented.** Follows Catalog's conventions, with the deliberate divergences recorded in §10. |
 | **Ordering** | **Implemented.** The orchestrator: the only service with outbound calls, and the one that forced the conventions to be re-derived rather than copied. |
+| **Shared** | **Extracted in Phase 1.** Not a service — the filter, correlation middleware, `IRequestContract` and the exception-handler skeleton. |
 
-Phase 0 is feature-complete. Everything still deferred is deferred on purpose — see §8 and
-`docs/ROADMAP.md`.
+Everything still deferred is deferred on purpose — see §8 and `docs/ROADMAP.md`.
 
 Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **426 pass**
-(Catalog 99 unit + 39 integration, Stock 77 unit + 61 integration, Ordering 93 unit + 57
-integration). Database isolation verified 22/22.
+(Shared 35 unit; Catalog 64 unit + 39 integration; Stock 77 unit + 61 integration; Ordering 93 unit
++ 57 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
 
@@ -60,8 +61,14 @@ integration). Database isolation verified 22/22.
   interface plus a typed `HttpClient` — inside its own project.
 - Cross-service references are `Guid` ids resolved over HTTP. Never foreign keys, joins or shared
   tables.
-- **No shared library.** There is deliberately no `AgenticShop.Shared`, `Common` or `Contracts`
-  project.
+- **One exemption, by name: `AgenticShop.Shared`.** Extracted in Phase 1, it holds cross-cutting
+  infrastructure only — the validation filter, the correlation middleware, `IRequestContract` and
+  the `ProblemDetailsExceptionHandler` skeleton. It is *not* a service: no endpoints, no
+  `DbContext`, no domain, no configuration. `Directory.Build.props` names it once and
+  `Directory.Build.targets` exempts exactly that name, so a reference between two services is
+  still a build error. The dependency only ever points one way — the shared project may not
+  reference any service. **Do not put a domain type, a contract DTO or anything
+  service-specific in it.**
 - Ports are fixed in each service's `Properties/launchSettings.json`. Use the ones above.
 
 ## 3. Database boundaries
@@ -118,19 +125,19 @@ service or mediator layer — handlers call the `DbContext` directly.
 
 ```
 Clients/     downstream contracts: an interface + typed HttpClient per service (orchestrators only)
-Contracts/   request+response records, IRequestContract marker
+Contracts/   request+response records, implementing the shared IRequestContract marker
 Data/        DbContext, IEntityTypeConfiguration<T>, Migrations/
 Domain/      entities and invariants — must not reference EF Core or ASP.NET Core
 Endpoints/   one static class per resource
-Errors/      IExceptionHandler
-Middleware/  correlation id
-Validation/  DataAnnotationValidationFilter
+Errors/      the service's ProblemDetailsExceptionHandler subclass — domain arms and messages only
 ```
 
-`Clients/` exists only in Ordering, and `Domain/` must never reference it. The single sanctioned
-exception to "handlers call the `DbContext` directly" is Ordering's `OrderPlacer`, in `Endpoints/`
-beside its one caller — pre-authorised by `docs/DECISIONS.md`, no interface, no second consumer,
-and not the start of a layer.
+`Clients/` exists only in Ordering, and `Domain/` must never reference it. **`Middleware/` and
+`Validation/` no longer exist in a service** — the correlation middleware and the validation filter
+live in `AgenticShop.Shared`, as does `IRequestContract`. The single sanctioned exception to
+"handlers call the `DbContext` directly" is Ordering's `OrderPlacer`, in `Endpoints/` beside its
+one caller — pre-authorised by `docs/DECISIONS.md`, no interface, no second consumer, and not the
+start of a layer.
 
 **Entities.** `private set` everywhere; `private` parameterless constructor for EF; `static
 Create(...)` factory; explicit mutation methods, not public setters. **Guards run before any
@@ -190,8 +197,12 @@ positional parameters); domain guards protect invariants. Both, deliberately.
   (`Lines[0].Quantity`). Collections are traversed **by element**, not by property.
 - Failures return `Results.ValidationProblem(...)`.
 
-**Errors.** `IExceptionHandler` → `Results.Problem(...)` → `application/problem+json` with a
-`correlationId` extension. Classification, in switch order:
+**Errors.** Each service has a `<Service>ExceptionHandler` deriving from the shared
+`ProblemDetailsExceptionHandler`, which owns `TryHandleAsync`, the cancellation arm, the severity
+decision, the logging and the ProblemDetails shape. **A service supplies only three things:** its
+domain arms (`ClassifyDomain`, returning `null` to fall through), its unique-violation messages
+(`UniqueViolationDetail`) and its concurrency wording (`ConcurrencyDetail`). Classification, in
+switch order:
 
 | Exception | Status |
 |---|---|
@@ -308,16 +319,24 @@ cannot start without a reachable database.
 Deferred by design, not oversights. Phase assignments: `docs/ROADMAP.md`. The reasoning behind
 each deferral, including the few with no assigned phase: `docs/DECISIONS.md`.
 
+**Still deferred — do not add:**
+
 **RabbitMQ or any broker · Outbox / Inbox · Redis · Polly or any resilience library ·
-OpenTelemetry · Serilog or shared logging infrastructure · shared infrastructure library ·
-authentication / authorization · Kubernetes / Helm · API gateway (YARP) · CQRS · DDD tactical
-patterns · event sourcing · idempotency keys · service Dockerfiles · CI pipeline.**
+OpenTelemetry · Serilog or shared logging infrastructure · authentication / authorization ·
+Kubernetes / Helm · API gateway (YARP) · CQRS · DDD tactical patterns · event sourcing ·
+idempotency keys · service Dockerfiles · CI pipeline.**
 
 Also do not add at this size: repository or service layers, an `Application` layer, a mediator,
 `Result<T>` monads, a mapping framework, domain-event plumbing, or a `Money` value object.
 
 The ordering matters: retrying without idempotency keys double-reserves stock; an outbox without
 a broker is dead weight; CQRS without read pressure is ceremony.
+
+**Now permitted, because Phase 1 has started — but only the one that is done:**
+the shared infrastructure library (`AgenticShop.Shared`, §2). It exists and is extracted; nothing
+else on the list above has been unblocked. Serilog, OpenTelemetry, resilience and idempotency keys
+are all still ahead, and each still has to arrive in the order `docs/ROADMAP.md` gives — keys
+before retry, because retrying without keys double-reserves stock.
 
 ## 9. Git rules
 
@@ -346,21 +365,33 @@ constraint names in `UniqueViolationDetail`, conflict-message wording, the entit
 guards are meaningful for the entities at hand. A copied guard that matches nothing passes
 vacuously — that already happened once.
 
-**Copy verbatim, namespace only:** `DataAnnotationValidationFilter`, `CorrelationIdMiddleware`,
-`IRequestContract`, the test harness (`<Service>ApiFactory` / `Fixture` / `Collection`,
-`TestPostgreSql`, `TestHostIsolationTests`, `ComposeConfigurationTests`), and the error-handler
-skeleton — `DescribeForLog`, `Describe`, `DescribePostgres`, `SqlStateOf`, the cancellation arm,
-the `BadHttpRequestException` arm and the four invariants.
+**Copy verbatim, namespace only — the test harness alone.** `<Service>ApiFactory` / `Fixture` /
+`Collection`, `TestPostgreSql`, `TestHostIsolationTests`, `ComposeConfigurationTests`. These stay
+per service because the three integration assemblies must not reference each other.
 
-**Do not re-test copied infrastructure.** Stock asserts only that the filter is *wired* to its
-endpoint groups; its recursion behaviour is specified once, in Catalog's
-`DataAnnotationValidationFilterTests`. Re-testing identical code creates a second place to update
-and proves nothing.
+Everything else that used to be copied is now **referenced, not copied**: `DataAnnotationValidationFilter`,
+`CorrelationIdMiddleware` and `IRequestContract` live in `AgenticShop.Shared`, and the
+exception-handler skeleton is the `ProblemDetailsExceptionHandler` base class. A service's handler
+supplies only its domain arms and its two message strings.
 
-**Duplication counter: 3 of 3.** All three services now carry their own copy of the filter, the
-middleware and the error-handler skeleton. **Extraction is deferred to Phase 1 by decision — do not
-propose it during Phase 0.** Reasoning and accepted cost: `docs/DECISIONS.md` → "No shared library".
-The per-service structural guards are never shared, in any phase.
+**Do not re-test shared infrastructure.** The filter and the middleware are specified once, in
+`AgenticShop.Shared.UnitTests`. Each service asserts only that the filter is *wired* to its own
+endpoint groups, plus — for Ordering, the one service with a real nested DTO — that the cascade
+works over HTTP. Re-testing shared code creates a second place to update and proves nothing.
+Handler tests stay per service, because each exercises that service's own arms and messages.
+
+**Duplication counter: extracted.** The 3-of-3 copies were consolidated into `AgenticShop.Shared`
+as the first Phase 1 item. Reasoning and the two divergences that had to be reconciled:
+`docs/DECISIONS.md` → "Shared infrastructure library". **The per-service structural guards are
+still never shared, in any phase** — sharing them would require the test assemblies to reference
+each other.
+
+**A shared type's guards must not be anchored on a shared type.** `RequestContractCoverageTests`
+and `ContractSchemaAlignmentTests` discover a service's DTOs by reflecting over an assembly. Now
+that `IRequestContract` lives in `AgenticShop.Shared`, anchoring on it scans the shared project —
+which holds no DTOs — and the guard passes having matched nothing. Each anchors on one of its own
+contract types instead. This is the "copied guard that matches nothing" failure arriving through a
+new door; the `TheCoverageCheckIsNotPassingVacuously` assertion is what catches it.
 
 **When a convention proves wrong for a later service, fix it in the earlier ones too.** The open
 divergences are listed in `docs/KNOWN-ISSUES.md`.

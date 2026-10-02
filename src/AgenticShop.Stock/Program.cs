@@ -1,7 +1,7 @@
+using AgenticShop.Shared.Middleware;
 using AgenticShop.Stock.Data;
 using AgenticShop.Stock.Endpoints;
 using AgenticShop.Stock.Errors;
-using AgenticShop.Stock.Middleware;
 using Microsoft.EntityFrameworkCore;
 using Scalar.AspNetCore;
 

@@ -1,7 +1,7 @@
 using AgenticShop.Ordering.Contracts;
 using AgenticShop.Ordering.Data;
 using AgenticShop.Ordering.Domain;
-using AgenticShop.Ordering.Validation;
+using AgenticShop.Shared.Validation;
 using Microsoft.EntityFrameworkCore;
 
 namespace AgenticShop.Ordering.Endpoints;

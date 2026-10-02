@@ -1,7 +1,7 @@
-using AgenticShop.Catalog.Middleware;
+using AgenticShop.Shared.Middleware;
 using FluentAssertions;
 
-namespace AgenticShop.Catalog.UnitTests;
+namespace AgenticShop.Shared.UnitTests;
 
 /// <summary>
 /// The inbound id is echoed into response headers, into the ProblemDetails body and into

@@ -1,7 +1,7 @@
 using AgenticShop.Catalog.Contracts;
 using AgenticShop.Catalog.Data;
 using AgenticShop.Catalog.Domain;
-using AgenticShop.Catalog.Validation;
+using AgenticShop.Shared.Validation;
 using Microsoft.EntityFrameworkCore;
 
 namespace AgenticShop.Catalog.Endpoints;

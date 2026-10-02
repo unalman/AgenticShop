@@ -2,7 +2,7 @@ using AgenticShop.Ordering.Clients;
 using AgenticShop.Ordering.Data;
 using AgenticShop.Ordering.Endpoints;
 using AgenticShop.Ordering.Errors;
-using AgenticShop.Ordering.Middleware;
+using AgenticShop.Shared.Middleware;
 using Microsoft.EntityFrameworkCore;
 using Scalar.AspNetCore;
 

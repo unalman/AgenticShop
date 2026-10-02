@@ -64,30 +64,32 @@ are tabulated with reasons: `src/AgenticShop.Stock/docs/ARCHITECTURE.md` §8 and
 src/AgenticShop.Catalog/    products, prices
 src/AgenticShop.Stock/      on-hand quantities, reservations
 src/AgenticShop.Ordering/   orders, order lines, orchestration
-├── Program.cs              composition root
+src/AgenticShop.Shared/     cross-cutting infrastructure — not a service
+├── Program.cs              composition root (services only)
 ├── Domain/                 entities and their invariants (no EF, no ASP.NET)
 ├── Data/                   DbContext + IEntityTypeConfiguration + Migrations
-├── Contracts/              request/response records + the IRequestContract marker
+├── Contracts/              request/response records, implementing the shared IRequestContract
 ├── Endpoints/              minimal API route groups, one file per resource
-├── Errors/                 IExceptionHandler → RFC 9457 ProblemDetails
-├── Validation/             endpoint filter that runs DataAnnotations
-├── Middleware/             correlation id
+├── Errors/                 the service's ProblemDetailsExceptionHandler subclass
 └── Clients/                Ordering only: an interface + typed HttpClient per downstream service
 tests/
-├── *.UnitTests/            domain rules, filter, error classification — no I/O
+├── AgenticShop.Shared.UnitTests/   the filter and the middleware, specified once
+├── *.UnitTests/            domain rules, error classification — no I/O
 └── *.IntegrationTests/     real API against a real PostgreSQL via Testcontainers
 http/                       catalog.http, stock.http, ordering.http — runnable by hand
 scripts/                    verification utilities (database isolation)
 docker/postgres/            init-dbs.sh — creates the databases and owning roles
-Directory.Build.props       TFM and analyzers, applied to every project
+Directory.Build.props       TFM, analyzers, and the name of the one exempt shared project
 Directory.Build.targets     the service-boundary build guard
 Directory.Packages.props    central package versions
 ```
 
-There is no `AgenticShop.Shared` project. Every service reports errors as standard
-`ProblemDetails`, which is contract enough without a shared assembly to drift. The
-validation filter, exception handler and correlation middleware are copied per service on
-purpose; extraction is a committed Phase 1 item, and the reasoning is in `docs/DECISIONS.md`.
+`AgenticShop.Shared` was extracted at the start of Phase 1. It holds the validation filter, the
+correlation middleware, `IRequestContract` and the `ProblemDetailsExceptionHandler` base class —
+cross-cutting infrastructure and nothing else. It has no endpoints, no `DbContext`, no domain and no
+configuration, and it may not reference a service; the dependency only ever points one way. Before
+that it was three near-identical copies, deliberately, and the reasoning for both halves of that
+history is in `docs/DECISIONS.md`.
 
 ## Documentation
 
@@ -295,11 +297,12 @@ Three hosts, synchronous HTTP, one database per service, Testcontainers. All thr
 are implemented and verified: 426 tests, a clean build under `TreatWarningsAsErrors`,
 database isolation 22/22, and the three-host path driven by hand through `http/ordering.http`.
 
-**Phase 1 — Reliability and observability** *(next)*
-Retry/circuit-breaker/timeout policies · idempotency keys · Serilog ·
-OpenTelemetry distributed tracing · dependency-aware health checks ·
-Dockerfiles and a `full` compose profile · CI. Retry is driven by a measured problem: a
-40-way burst against 10 units of stock held only 4, because `xmin` conflicts are not retried.
+**Phase 1 — Reliability and observability** *(in progress)*
+Shared infrastructure library — **done** · retry/circuit-breaker/timeout policies · idempotency
+keys · Serilog · OpenTelemetry distributed tracing · dependency-aware health checks · Dockerfiles
+and a `full` compose profile · CI. Retry is driven by a measured problem: a 40-way burst against 10
+units of stock held only 4, because `xmin` conflicts are not retried. Idempotency keys come before
+retry, because retrying without them double-reserves stock.
 
 **Phase 2 — Asynchronous messaging** ← the inflection point
 RabbitMQ · replace synchronous reservation with `OrderPlaced` / `StockReserved`

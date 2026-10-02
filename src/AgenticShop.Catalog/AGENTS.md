@@ -56,6 +56,8 @@ Manual requests: `../../http/catalog.http`. Scalar UI: <http://localhost:5081/sc
 
 ## Before changing a convention here
 
-Catalog is the reference implementation, so a change to its shared conventions — the validation
-filter, exception handler, correlation middleware or test harness — must be mirrored into Stock
-**and Ordering**. Which conventions are shared: `../../docs/ARCHITECTURE.md` §4.
+Catalog is the reference implementation, so a change to a *convention* it originated — entity shape,
+EF configuration, endpoint style, the four error invariants — must be mirrored into Stock **and
+Ordering**. The cross-cutting code itself is no longer Catalog's to change: the validation filter,
+the correlation middleware, `IRequestContract` and the exception-handler base class live in
+`src/AgenticShop.Shared/`. Which conventions are shared: `../../docs/ARCHITECTURE.md` §4.

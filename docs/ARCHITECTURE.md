@@ -68,9 +68,20 @@ if any project under `src/` holds a `ProjectReference` to another project under 
 runs `BeforeTargets="BeforeBuild"`, applies to every current and future service
 automatically, and exempts `tests/`.
 
+**One exemption, by name.** `Directory.Build.props` declares
+`<AgenticShopSharedProject>AgenticShop.Shared</AgenticShopSharedProject>` and the target skips a
+reference whose filename matches it. That is the whole of the relaxation: it admits one shared
+infrastructure library and nothing else, so a reference between two services is still a build
+error. Declaring the name in `Directory.Build.props` rather than in the condition means renaming
+the library is a one-line change in one place rather than an edit to guard logic. The shared project
+is itself under `src/`, so the guard still applies *to* it — it may not reference any service, and
+the dependency only ever points one way.
+
 The error message names both projects and states the remedy — define the contract in the
 consuming service as an interface plus a typed `HttpClient`. The guard was verified to fire, and
-verified not to false-positive, using throwaway probe projects; see `DECISIONS.md`.
+verified not to false-positive, using throwaway probe projects; see `DECISIONS.md`. It was
+re-verified after the exemption was added, by pointing Catalog at Stock and confirming the build
+still failed.
 
 **Limitation:** the guard identifies services by the `/src/` path segment. Restructuring the
 repository layout silently disables it.
@@ -152,10 +163,11 @@ code changes.
 
 ## 4. Shared service conventions
 
-These apply to every service identically. They are documented here rather than in a service
-folder because the code is copied per service — `DataAnnotationValidationFilter`,
-`CorrelationIdMiddleware`, `IRequestContract` and the exception-handler skeleton are
-byte-identical apart from namespace. Service-specific application of these conventions lives in
+These apply to every service identically. Four of them are now *literally* shared code rather than
+convention: `DataAnnotationValidationFilter`, `CorrelationIdMiddleware`, `IRequestContract` and the
+`ProblemDetailsExceptionHandler` skeleton all live in `src/AgenticShop.Shared/` and are referenced,
+not copied. The rest — entity shape, EF configuration, endpoint style, the four error invariants —
+are conventions each service implements itself. Service-specific application of any of them lives in
 `src/<Service>/docs/ARCHITECTURE.md`.
 
 ### 4.1 Project structure
@@ -163,16 +175,30 @@ byte-identical apart from namespace. Service-specific application of these conve
 ```
 src/AgenticShop.<Service>/
 ├── Program.cs              composition root
-├── Contracts/              request/response records + IRequestContract marker
+├── Contracts/              request/response records, implementing the shared IRequestContract
 ├── Data/                   <Service>DbContext, <Entity>Configuration, Migrations/
 ├── Domain/                 entities and invariants — no EF, no ASP.NET
 ├── Endpoints/              one static class per resource
-├── Errors/                 <Service>ExceptionHandler
-├── Middleware/             CorrelationIdMiddleware
-├── Validation/             DataAnnotationValidationFilter
+├── Errors/                 <Service>ExceptionHandler : ProblemDetailsExceptionHandler
 ├── Clients/                orchestrators only: an interface + typed HttpClient per downstream
 └── Properties/launchSettings.json
 ```
+
+Two folders a service used to have are now gone from it. `Middleware/` and `Validation/` live in
+`src/AgenticShop.Shared/`, alongside `Contracts/IRequestContract` and the
+`ProblemDetailsExceptionHandler` base class:
+
+```
+src/AgenticShop.Shared/
+├── Contracts/IRequestContract.cs
+├── Errors/ProblemDetailsExceptionHandler.cs, ExceptionClassification.cs
+├── Middleware/CorrelationIdMiddleware.cs
+└── Validation/DataAnnotationValidationFilter.cs
+```
+
+The shared project is not a service — no endpoints, no `DbContext`, no domain, no configuration, no
+`appsettings.json` — and it may not reference one. See §2.1 for how the boundary guard permits
+exactly this and nothing else.
 
 One project per service. No `Api`/`Core`/`Application` split, no repository, service or
 mediator layer, no `Result<T>` monad, no mapping framework. Handlers call the `DbContext`
@@ -358,14 +384,22 @@ The filter's contract:
   `RequestContractCoverageTests`, which reflects over `Contracts/` and fails the build.
 
 **Ordering's `CreateOrderRequest` is the only real nested DTO**, and is what proved the cascade
-against a real contract rather than a synthetic one. Catalog's `DataAnnotationValidationFilterTests`
-remains the specification for the filter and is deliberately not duplicated in Stock or Ordering.
+against a real contract rather than a synthetic one. `AgenticShop.Shared.UnitTests`'s
+`DataAnnotationValidationFilterTests` remains the single specification for the filter and is
+deliberately not duplicated in any service.
 
 ### 4.7 Error handling
 
-Each service has a `<Service>ExceptionHandler` implementing `IExceptionHandler`, always
-answering with `Results.Problem(...)` → `application/problem+json`, RFC 9457, carrying a
-`correlationId` extension. That shared shape is why no `AgenticShop.Shared` project is needed.
+Each service has a `<Service>ExceptionHandler` deriving from the shared
+`ProblemDetailsExceptionHandler`, always answering with `Results.Problem(...)` →
+`application/problem+json`, RFC 9457, carrying a `correlationId` extension. The base class owns
+`TryHandleAsync` — the cancellation arm, the severity decision, the logging and the ProblemDetails
+shape — plus the arms that mean the same thing everywhere. A service supplies three members:
+`ClassifyDomain` (virtual, defaults to `null`, so a service with no domain exceptions overrides
+nothing), `UniqueViolationDetail` and `ConcurrencyDetail`.
+
+That division is what makes the four invariants enforceable rather than merely documented: they
+live in one place, so a service cannot quietly stop honouring one.
 
 Classification, in switch order:
 
@@ -422,7 +456,7 @@ still counts as a fault.
 
 ### 4.8 Correlation ID
 
-`Middleware/CorrelationIdMiddleware.cs`:
+`src/AgenticShop.Shared/Middleware/CorrelationIdMiddleware.cs`:
 
 - Header name is the constant `CorrelationIdMiddleware.HeaderName` (`X-Correlation-Id`).
 - An inbound value is adopted; otherwise `Guid.NewGuid().ToString("N")` — 32 lowercase hex.
@@ -471,12 +505,18 @@ Current counts, all passing:
 
 | Project | Unit | Integration |
 |---|---|---|
-| Catalog | 99 | 39 |
+| Shared | 35 | — |
+| Catalog | 64 | 39 |
 | Stock | 77 | 61 |
 | Ordering | 93 | 57 |
 | **Total** | **269** | **157** |
 
 **426 total.** Build is clean under `TreatWarningsAsErrors`.
+
+The total did not change when the shared library was extracted: 35 tests moved out of
+`AgenticShop.Catalog.UnitTests` into `AgenticShop.Shared.UnitTests`, because they specify the filter
+and the correlation middleware, which are no longer Catalog's. `AgenticShop.Shared` has no
+integration project — it has no host to start.
 
 ### 5.1 Why Testcontainers and never a mocked DbContext
 
@@ -598,12 +638,12 @@ A convention enforced only by prose will be violated. These fail the build or th
 
 | Guard | Protects | Present in |
 |---|---|---|
-| `Directory.Build.targets` | no cross-service `ProjectReference` (build time) | repo root |
+| `Directory.Build.targets` | no cross-service `ProjectReference` (build time); exempts `AgenticShop.Shared` by name only | repo root |
 | `RequestContractCoverageTests` | every `*Request` implements `IRequestContract`, and the check does not pass vacuously | all three |
 | `ContractSchemaAlignmentTests` | schema and contracts agree — see below | all three, differently |
 | `ComposeConfigurationTests` | compose image matches `TestPostgreSql.Image`; port is loopback-only; no literal credentials; isolation script mounted | all three |
 | `TestHostIsolationTests` | the app under test really uses the Testcontainers database | all three |
-| `LeafServiceBoundaryTests` | a service that makes no outbound calls registers no `HttpClient` | Stock |
+| `LeafServiceBoundaryTests` | a service that makes no outbound calls registers no `HttpClient`, and references no `AgenticShop.*` assembly but the shared one | Stock |
 | `ServiceBoundaryTests` | the orchestrator references no other service assembly, and *does* register its clients | Ordering |
 | `scripts/verify-db-isolation.sh` | PostgreSQL role isolation, 22 checks | repo root |
 
@@ -619,3 +659,11 @@ covers the drift *that service* can suffer, and none is a copy of another:
 
 Copying Catalog's version into Stock would have matched nothing and passed vacuously — the concrete
 reason a structural guard must be re-derived per service rather than copied.
+
+The extraction of `AgenticShop.Shared` re-proved the point from a new direction. Both
+`RequestContractCoverageTests` and `ContractSchemaAlignmentTests` had been discovering a service's
+DTOs through `typeof(IRequestContract).Assembly`; once the marker moved into the shared project that
+expression named an assembly with no DTOs in it, and each guard would have scanned nothing and
+passed. Both now anchor on one of their own contract types. What caught it was the
+`TheCoverageCheckIsNotPassingVacuously` assertion, which is the argument for every reflection-based
+guard here carrying one.

@@ -100,11 +100,12 @@ missing connection string. That failure is the configuration guard working, not 
 
 ## Before changing a convention here
 
-The validation filter, the exception-handler skeleton, the correlation middleware and the test
-harness are the third and last copies of Catalog's. **Extraction into a shared library is deferred
-to Phase 1 by decision** — do not propose it during Phase 0. A change to any of them must be
-mirrored into Catalog *and* Stock; which conventions are shared: `../../docs/ARCHITECTURE.md` §4.
+The validation filter, the correlation middleware, `IRequestContract` and the exception-handler base
+class live in `src/AgenticShop.Shared/` — extracted at the start of Phase 1, so a change there
+reaches all three services at once. Only the test harness is still per service. Which conventions are
+shared: `../../docs/ARCHITECTURE.md` §4.
 
-Ordering's two deliberate divergences from the copies — a 502 arm, and a `Classify` that also yields
-an optional order id — exist because neither other service has a dependency to fail or an order to
-name. Do not back-port them.
+Ordering's two deliberate divergences from the other services were reconciled into the shared
+surface rather than forked: the `orderId` extension is data on `ExceptionClassification`, and the
+502 arm lives in `ClassifyDomain` because "a dependency failed" is only expressible where a
+dependency exists. Neither belongs in the other two services — do not back-port them.

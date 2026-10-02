@@ -206,8 +206,10 @@ Each was the right call for this service, and each is the evidence that the conv
 | light concurrency test | **parallel overselling tests** | on `Product` a missed token loses a price edit; on `StockItem` it oversells |
 | DTO-limit vs column-limit guard | **enum/CHECK and bound guards** | copying the original verbatim would have matched nothing and passed vacuously |
 
-Copied verbatim, namespace only: `DataAnnotationValidationFilter`, `CorrelationIdMiddleware`,
-`IRequestContract`, the test harness, and the error-handler skeleton.
+Referenced from `AgenticShop.Shared`, not copied: `DataAnnotationValidationFilter`,
+`CorrelationIdMiddleware`, `IRequestContract` and the `ProblemDetailsExceptionHandler` base class.
+Only the test harness is still copied per service, because the integration assemblies must not
+reference each other.
 
 ## 9. Error classification specific to Stock
 

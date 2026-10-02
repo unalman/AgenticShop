@@ -332,8 +332,11 @@ transfer rather than merely copy:
 | no outbound calls | leaf, asserted by test | **two typed clients**, asserted by test | the boundary guard inverts rather than disappears |
 | structural guards re-derived | re-derived again | **re-derived again** | a copied guard that matches nothing passes vacuously |
 
-Copied verbatim, namespace only: `DataAnnotationValidationFilter`, `CorrelationIdMiddleware`,
-`IRequestContract`, the test harness, and the error-handler skeleton — with the two divergences in §9.
+Referenced from `AgenticShop.Shared`, not copied: `DataAnnotationValidationFilter`,
+`CorrelationIdMiddleware`, `IRequestContract` and the `ProblemDetailsExceptionHandler` base class.
+Only the test harness is still copied per service, because the integration assemblies must not
+reference each other. Ordering's two divergences from the other services — the 502 arm and the
+`orderId` extension — are reconciled into the shared surface rather than forked; see §9.
 
 ## 11. What Ordering still does not exercise
 
