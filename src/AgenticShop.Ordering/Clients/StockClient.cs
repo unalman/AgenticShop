@@ -27,11 +27,18 @@ public sealed class StockClient(HttpClient http) : DownstreamClient(http, "Stock
             Content = JsonContent.Create(new ReserveBody(orderId, quantity))
         };
 
+        // This is the one outbound call that must not be retried, and the reason is the 409 branch
+        // below: a retry after a first attempt that committed but whose 201 was lost would come back
+        // 409 from Stock's UNIQUE(order_id, stock_item_id), and this method would report it as a
+        // refusal. See DownstreamResilience and docs/DECISIONS.md → O18.
+        request.Options.Set(DownstreamResilience.NotRetryable, true);
+
         using var response = await SendAsync(request, operation, cancellationToken);
 
         // 404: Stock has no record for that product. 409: not enough available, or that order
         // already holds it — which cannot happen here, because placement combines duplicate
-        // product lines and mints a fresh order id. Both mean "this line cannot be held".
+        // product lines, mints a fresh order id, and never retries this call. Both mean "this line
+        // cannot be held".
         if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Conflict)
         {
             return null;

@@ -39,12 +39,22 @@ query that would find it is the same one the orphan residual in
 
 ### Resilience
 
-**A slow dependency is worse than an absent one.** *Medium · Phase 1.* There is a ten-second timeout
-and nothing else: no retry, no circuit breaker, no bulkhead. A Catalog that is degraded rather than
-down will hold every placement for ten seconds and then fail it, with no back-pressure and no way to
-shed load. Under that condition Ordering consumes a request thread per placement for the full
-duration. Correct for Phase 0 — it is exactly the problem Phase 1 exists to feel — but it is the
-first thing that will hurt under any real load.
+**Worst-case placement latency roughly tripled.** *Low · accepted 2026-10-04.* Retry, a circuit
+breaker and timeouts landed in Phase 1 (decision O18), which closed the item that used to sit here —
+"a slow dependency is worse than an absent one", with a ten-second timeout and no back-pressure at
+all. It bought transient-failure absorption and load shedding, and it cost latency: a downstream call
+that times out on every attempt now spends up to the 35-second total timeout instead of 10 seconds,
+because two retries follow the first attempt. A degraded Catalog therefore holds a placement longer
+before failing it than it used to, while a *blipping* one now succeeds where it previously failed.
+Judged the right trade for a synchronous placement path — the caller is waiting either way, and
+stock is held for the duration in both cases — but it is a real change and not a free one. There is
+still no bulkhead, so nothing caps concurrent placements; the standard resilience pipeline ships one
+and it was deliberately not enabled.
+
+**Reserve is exempt from retry, and that exemption is load-bearing.** *Info.* A retried reserve whose
+first attempt committed would be answered 409 by Stock's unique index, and the client reads 409 as a
+refusal — stranding the first hold and reporting stock as unavailable when it was taken. See O18.
+`ReserveMarksItsRequestAsNotRetryable` is the guard; if it ever fails, the fix is not to delete it.
 
 **Compensation is best effort and can strand a hold.** *Medium · Phase 3.* A release that fails is
 logged and does not change the order's classification, because the classification describes what

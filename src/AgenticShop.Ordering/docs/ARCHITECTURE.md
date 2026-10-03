@@ -126,10 +126,11 @@ abandoning is free. From the first reserve onward every call — reserve, confir
 reconciliation read and the final `SaveChangesAsync` — uses `CancellationToken.None`.
 
 A client that hangs up mid-placement must not leave stock held against an order nobody recorded. The
-calls are still bounded, by `HttpClient.Timeout` (10s, set in `Program.cs`) and by EF's command
-timeout, so this cannot hang a request. Note what the timeout is *not*: a resilience policy. There is
-no retry, and Polly is Phase 1. It exists so that "timed out" can happen at all — with the 100-second
-default the confirm-phase policy would be unreachable in practice.
+calls are still bounded — by the resilience pipeline's timeouts (10s per attempt, 35s total, in
+`Clients/DownstreamResilience.cs`) and by EF's command timeout — so this cannot hang a request. The
+per-attempt timeout is the same ten seconds this section used to set through `HttpClient.Timeout`,
+kept for the same reason: with no bound at all, "timed out" would never happen and the confirm-phase
+policy would be unreachable in practice. Why `HttpClient.Timeout` is no longer set: decision O18.
 
 ## 5. Confirm-phase failure
 
@@ -361,11 +362,10 @@ Still unexercised, and named so nobody assumes otherwise:
   covered by `http/ordering.http` run by hand, not by CI. Consumer-driven contract tests are Phase 3.
 - **Reconciliation as a process.** `PartiallyConfirmed` is recorded and queryable by id, but nothing
   drives it forward. Discovering one whose id was lost needs `psql`. Phase 2's saga.
-- **Resilience.** One timeout, no retry, no circuit breaker. A dependency that is merely slow, rather
-  than absent, will hold a request for ten seconds and then fail it. Phase 1 — and now unblocked,
-  because idempotent placement landed first.
 - **Distributed tracing.** The correlation id crosses the hop and appears in both logs, but there is
   no span tree, so "which call was slow" is still a reading exercise. Phase 1's OpenTelemetry.
 
 Idempotent placement was on this list until Phase 1 closed it; a stranded claim is the smaller
-residual that replaced it, and it is in `KNOWN-ISSUES.md`.
+residual that replaced it, and it is in `KNOWN-ISSUES.md`. Resilience was on it too, and Phase 1
+closed it as well — timeout, retry and a circuit breaker, with reserve exempt from retry; see
+decision O18.

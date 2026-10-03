@@ -12,10 +12,13 @@ namespace AgenticShop.Ordering.Clients;
 /// and were let down". Operators page on different things for those two.
 /// </para>
 /// <para>
-/// Timeouts arrive as <see cref="TaskCanceledException"/>, which the handler already has an arm for
-/// — but that arm stands down only when the <i>caller</i> aborted. The clients catch it here so a
-/// downstream timeout cannot be mistaken for a client hanging up, which would silently drop the
-/// response instead of reporting the failure.
+/// Timeouts arrive as <see cref="TaskCanceledException"/> from <c>HttpClient</c>, and as
+/// <c>TimeoutRejectedException</c> from the resilience pipeline that now bounds each attempt; an open
+/// circuit arrives as <c>BrokenCircuitException</c>. The handler has an arm for cancellation, but it
+/// stands down only when the <i>caller</i> aborted. The clients catch all three here so a downstream
+/// failure cannot be mistaken for a client hanging up — which would silently drop the response
+/// instead of reporting it — nor fall through to the 500 arm, which would report a dependency that
+/// failed as a bug in this service.
 /// </para>
 /// </remarks>
 public sealed class DownstreamServiceException(

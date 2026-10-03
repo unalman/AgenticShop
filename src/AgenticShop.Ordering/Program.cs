@@ -8,12 +8,6 @@ using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Bounds a downstream call. This is not a resilience policy — there is no retry, and Polly is
-// deliberately Phase 1 — it is the difference between a 502 after ten seconds and a request that
-// hangs for HttpClient's 100-second default while stock stays held. Without a bound the
-// confirm-phase policy would be unreachable in practice, because "timed out" would never arrive.
-const int DownstreamTimeoutSeconds = 10;
-
 // Resolved lazily, inside the options callback, so that configuration sources the host
 // adds after Program.cs has run are visible — notably the override that
 // WebApplicationFactory.ConfigureAppConfiguration applies in the integration tests.
@@ -28,21 +22,23 @@ builder.Services.AddDbContext<OrderingDbContext>(options => options
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddTransient<CorrelationIdPropagatingHandler>();
 
+// The downstream timeout O15 documented now lives in the resilience pipeline as a per-attempt
+// timeout, so HttpClient.Timeout is deliberately not set here. Setting it would be a bug rather
+// than a redundant safety net: HttpClient.Timeout bounds the whole handler pipeline, retries
+// included, so a ten-second value would abort the sequence before a second attempt could start.
+// Left unset it defaults to 100 seconds, which sits above the pipeline's 35-second total timeout
+// and therefore never fires first.
 builder.Services
     .AddHttpClient<ICatalogClient, CatalogClient>(client =>
-    {
-        client.BaseAddress = new Uri(RequireServiceBaseUrl(builder.Configuration, "Catalog"));
-        client.Timeout = TimeSpan.FromSeconds(DownstreamTimeoutSeconds);
-    })
-    .AddHttpMessageHandler<CorrelationIdPropagatingHandler>();
+        client.BaseAddress = new Uri(RequireServiceBaseUrl(builder.Configuration, "Catalog")))
+    .AddHttpMessageHandler<CorrelationIdPropagatingHandler>()
+    .AddDownstreamResilience();
 
 builder.Services
     .AddHttpClient<IStockClient, StockClient>(client =>
-    {
-        client.BaseAddress = new Uri(RequireServiceBaseUrl(builder.Configuration, "Stock"));
-        client.Timeout = TimeSpan.FromSeconds(DownstreamTimeoutSeconds);
-    })
-    .AddHttpMessageHandler<CorrelationIdPropagatingHandler>();
+        client.BaseAddress = new Uri(RequireServiceBaseUrl(builder.Configuration, "Stock")))
+    .AddHttpMessageHandler<CorrelationIdPropagatingHandler>()
+    .AddDownstreamResilience();
 
 // The one collaborator the "no service layer" rule was written to allow; see its remarks and
 // docs/DECISIONS.md. Scoped, so it shares the request's DbContext and therefore its single

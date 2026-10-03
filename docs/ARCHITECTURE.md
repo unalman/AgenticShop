@@ -230,6 +230,19 @@ propagates the correlation id, and the shared send-and-classify plumbing — see
   instead of three copies.
 - `DateTimeOffset` for all timestamps, never `DateTime`. Npgsql maps it to
   `timestamp with time zone`, which is unambiguous across services.
+- **Money is `decimal` plus a separate `Currency` string**, never a `Money` value object. The
+  amount is rounded to 2dp with `MidpointRounding.AwayFromZero` (`Product.NormalizePrice`,
+  `OrderLine.NormalizePrice`) and mapped by `HasPrecision(18, 2)` to `numeric(18,2)`; the currency
+  is a three-letter ISO 4217 code, trimmed and upper-cased on the way in. Catalog and Ordering both
+  carry money — `Product.Price`, `OrderLine.UnitPrice` — and Ordering additionally refuses an order
+  whose lines disagree on currency (`MixedCurrencyException` → 400, raised while the placement is
+  still pure reads, so it costs no compensation). **Stock has no money at all**: do not add fields
+  a service does not need. `Order.CurrencyLength` mirrors Catalog's constant rather than sharing
+  it, because no type crosses a service boundary (§2.1). Catalog's application of the rule — the
+  `"USD"` default, `ToUpperInvariant` rather than `ToUpper`, and ISO 4217 validation by format —
+  is in `src/AgenticShop.Catalog/docs/ARCHITECTURE.md` → "Money and currency"; the reasoning in
+  `src/AgenticShop.Catalog/docs/DECISIONS.md` → "`decimal` plus a `Currency` column, no `Money`
+  value object".
 - **Derived values are computed properties, never stored**, and marked `builder.Ignore(...)`
   so a second copy of the truth cannot drift. Stock's `Available = QuantityOnHand - Reserved`
   is the template.
@@ -357,6 +370,12 @@ race window under retry; a unique index does not. Catalog's unique `sku` and Sto
 
 Two layers, deliberately overlapping: DataAnnotations on `Contracts/` records guard the
 boundary; domain guards protect invariants regardless of entry point.
+
+**Every attribute on a positional record parameter carries the `[property: ...]` target** — in
+`Contracts/` and in the filter's own tests, without exception. An untargeted attribute on a
+positional parameter can bind to the parameter rather than to the property the compiler generates,
+and `Validator.TryValidateObject` reflects over properties, so the limit would stop being enforced
+with nothing to indicate it. The target costs one word.
 
 **Minimal APIs do not validate body DTOs automatically.** Automatic model validation is an
 MVC `[ApiController]` behaviour. Without `DataAnnotationValidationFilter` the attributes in

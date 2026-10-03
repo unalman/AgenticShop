@@ -258,13 +258,14 @@ Resolution against Catalog honours the caller's token; from the first reserve on
 `CancellationToken.None`, including the final `SaveChangesAsync`.
 
 **Why.** A client that hangs up mid-placement must not leave stock held against an order nobody
-recorded. The forward calls are still bounded — by `HttpClient.Timeout` and EF's command timeout — so
-this cannot hang a request.
+recorded. The forward calls are still bounded — by the resilience pipeline's timeouts and EF's
+command timeout — so this cannot hang a request.
 
-**Why the timeout is set at all.** Ten seconds, and it is not a resilience policy: there is no retry
-and Polly is Phase 1. It exists so that "timed out" can happen. With the 100-second default the whole
-confirm-phase policy would be unreachable in practice, and the failure mode O14 exists for would never
-arrive.
+**Why the timeout is set at all.** Ten seconds, and it exists so that "timed out" can happen. With
+the 100-second default the whole confirm-phase policy would be unreachable in practice, and the
+failure mode O14 exists for would never arrive. **Superseded in mechanism, not in value:** the bound
+is now the resilience pipeline's per-attempt timeout, still ten seconds — see O18 for why
+`HttpClient.Timeout` had to stop being set.
 
 ## O16 · Reserve-phase failure — fail fast, compensate, never retry — **added 2026-09-24**
 
@@ -299,8 +300,10 @@ release leaves stock held against an order that no longer exists; Stock's
 because already released" must be treated as success, mirroring the confirm rule in O9 — but only
 after a read, per O10.
 
-**Revisit.** Phase 1, once idempotency keys make a retry safe. **That prerequisite is now met** —
-see O17 — so the retry work is unblocked, though not yet done.
+**Revisit.** Phase 1, once idempotency keys make a retry safe. **That prerequisite was met** — see
+O17 — and the retry work is now done, see **O18**. Note what O18 did *not* change: this decision's
+"no server-side retry" is about re-issuing a **reserve**, and reserve is the one outbound call O18
+deliberately exempts from retry. The reserve phase still fails fast and compensates.
 
 ## O17 · Idempotency keys on `POST /orders` — **added 2026-10-03, Phase 1**
 
@@ -361,9 +364,76 @@ lifts a stranded hold.
 
 **Consequence for the retry work.** This is the prerequisite O16 and `docs/ROADMAP.md` named. Retry
 policies on the typed clients are now safe to add, because a retried placement that reaches Ordering
-again under the same key replays rather than duplicates. Note that it makes *inbound* retries safe;
+again under the key replays rather than duplicates. Note that it makes *inbound* retries safe;
 the outbound calls to Stock are still covered by Stock's own natural idempotency (decision D2) and
-by the reconciliation read (O9).
+by the reconciliation read (O9). **What that turned out to mean in practice is O18.**
+
+## O18 · Retry is per request, and reserve is exempt — **added 2026-10-04, Phase 1**
+
+`Microsoft.Extensions.Http.Resilience` on both typed clients: a per-attempt timeout, a total
+timeout, retry, and a circuit breaker. Retry is enabled **per request**, not per client and not per
+HTTP method, and `StockClient.ReserveAsync` opts its request out.
+
+**Why reserve is exempt.** This is the part O17's closing note left to find out. D2 does make Stock's
+reserve idempotent — a repeated `(order_id, stock_item_id)` cannot double-hold — but idempotence on
+the server is not the same as a safe answer on the client. Stock reports the duplicate as a **409**
+from its unique index, and `ReserveAsync` reads 409 as "this line cannot be held". So if a first
+attempt committed and only its 201 was lost, a retry converts a hold that exists into a reported
+refusal, and two things follow:
+
+- the order is written `Failed` with 409 and the caller is told stock was unavailable, when it was
+  in fact taken;
+- the refusal path deliberately skips the reconciliation read (O9 keeps it off the contention hot
+  path), so it releases only the holds it knows about — and the first attempt's hold is not one of
+  them. It is stranded until Phase 3's expiry worker, which does not exist yet.
+
+The exception path has no such problem: a timeout or a 5xx raises `DownstreamServiceException`, and
+that branch already reconciles by reading `GET /api/v1/reservations?orderId=`, which finds a hold
+whose 201 nobody ever saw (O7). The hazard is specific to a retry that *succeeds in getting an
+answer*, because then there is no exception and no read.
+
+**Why confirm and release are retried.** Both are POSTs and both are safe, for the reason O9 and O10
+already established: a 409 from either is never interpreted, it is resolved by the reconciliation
+read, and `AllConfirmed` reports the lost-response case as the success it was.
+
+**Why not the library's `DisableForUnsafeHttpMethods`.** It is the one-liner that removes the hazard,
+and it was rejected because it disables retry for *every* POST — which is exactly the confirm and
+release calls where retry is both safe and worth having. Marking the one unsafe request costs a line
+in `ReserveAsync` and a predicate that reads it.
+
+**The transient predicate is wrapped, not restated.** The retry option's own `ShouldHandle` decides
+what transient means — 408, 429 and 5xx, plus `HttpRequestException` and `TimeoutRejectedException` —
+and the exemption is `&&`-ed onto it. Restating the status list here would create a second definition
+that could drift from the library's, and would risk retrying a normal 4xx.
+
+**`HttpClient.Timeout` is deliberately not set.** The ten seconds O15 introduced is now the
+pipeline's per-attempt timeout, unchanged in value. Setting `HttpClient.Timeout` as well would not be
+a redundant safety net but a bug: it bounds the entire handler pipeline including retries, so a
+ten-second value would abort the sequence before a second attempt could begin. Left unset it defaults
+to 100 seconds, above the 35-second total timeout, and never fires first.
+
+**Two new exception types had to be classified.** The pipeline reports its own timeouts as
+`TimeoutRejectedException` rather than the `TaskCanceledException` `HttpClient` uses, and an open
+circuit as `BrokenCircuitException`. Neither existed before, and both would have fallen through to
+the handler's default arm and answered **500** — reporting a dependency that failed as a bug in this
+service, the exact inversion the 502 arm exists to prevent. `DownstreamClient` now maps both to
+`DownstreamServiceException`.
+
+**Values.** Attempt timeout 10s (O15's bound) · total timeout 35s, sized for three attempts plus the
+delays between them · two retries, constant 500ms rather than exponential, because the caller is
+waiting synchronously and stock is held throughout · circuit breaker at 10 samples and a 50% failure
+ratio, since Polly's default of 100 samples would mean the breaker never opens at this project's
+traffic and a breaker that cannot trip is not one.
+
+**What this does not do.** It does not make the contention 409 transparent. Stock's `xmin`-conflict
+409 (D9) is a normal 4xx and is not retried, so the 40-way burst measurement in
+`src/AgenticShop.Stock/docs/ARCHITECTURE.md` §7 is unchanged. Turning that into a transparent retry
+needs either Stock to retry internally or its 409 causes to be distinguishable, and the shared error
+contract forbids reading another service's `detail` to tell them apart (O9).
+
+**Revisit.** Phase 2, when the outbox and saga replace synchronous placement — at which point the
+outbound reserve is a published event with at-least-once delivery and an inbox, and per-request retry
+exemption stops being the mechanism that keeps it safe.
 
 ---
 

@@ -1,3 +1,6 @@
+using Polly.CircuitBreaker;
+using Polly.Timeout;
+
 namespace AgenticShop.Ordering.Clients;
 
 /// <summary>
@@ -34,6 +37,19 @@ public abstract class DownstreamClient(HttpClient http, string service)
         // what separates "Stock took too long" from "our caller hung up", which the handler
         // deliberately does not treat as an error.
         catch (TaskCanceledException exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new DownstreamServiceException(Service, operation, statusCode: null, exception);
+        }
+        // The resilience pipeline reports its own timeouts as TimeoutRejectedException rather than
+        // TaskCanceledException, and an open circuit as BrokenCircuitException. Both mean "the
+        // dependency is not answering", which is a 502; left uncaught they would reach the handler's
+        // default arm and be reported as a 500 — blaming this service for a dependency that failed,
+        // the inversion the arm below exists to prevent.
+        catch (TimeoutRejectedException exception)
+        {
+            throw new DownstreamServiceException(Service, operation, statusCode: null, exception);
+        }
+        catch (BrokenCircuitException exception)
         {
             throw new DownstreamServiceException(Service, operation, statusCode: null, exception);
         }

@@ -496,7 +496,6 @@ Each was considered and declined, with the phase that would justify it:
 | RabbitMQ / any broker | Nothing is asynchronous |
 | Outbox / Inbox | An outbox makes "write a row and publish an event" atomic; there are no events. Note the design is already outbox-ready: every write path is a single `SaveChangesAsync`, so an entity and an outbox row would already be atomic. Stock's reserve commits the counter and the reservation row together, which is the same property |
 | Redis | No cache pressure, no distributed idempotency store to hold |
-| Polly / resilience | Retrying without idempotency keys double-reserves stock. Also see D9: Stock deliberately returns 409 on `xmin` conflict rather than retrying. **Now unblocked** — the keys arrived first, in Phase 1 |
 | OpenTelemetry | A correlation id crosses the hop and appears in both logs, which is enough for three services and one synchronous path. A span tree answers "which call was slow", and nothing is slow yet |
 | Serilog | Built-in logging suffices and the configuration is about to change |
 | Authentication / authorization | Deferred by the project owner. Adding it later needs a customer identity column on `Order` plus a cross-cutting policy — a migration and a concern, which is why no placeholder seam was pre-built |
@@ -510,3 +509,11 @@ Each was considered and declined, with the phase that would justify it:
 | CORS policy | No browser client |
 | Rate limiting, HTTPS, HSTS, tightened `AllowedHosts` | No non-local deployment |
 | Stock list/paging endpoint | Nothing needed it; symmetry is not a reason |
+
+**Polly / resilience was on this list until Phase 1 closed it.** It was declined for as long as
+retrying could double-reserve stock, and the ordering held: idempotency keys landed first (Ordering
+O17), then `Microsoft.Extensions.Http.Resilience` on Ordering's typed clients (Ordering **O18**).
+O18 is also where the deferral's stated reasoning turned out to be incomplete — server-side
+idempotence was necessary but not sufficient, because Stock reports a duplicate reserve as a 409 that
+Ordering's client reads as a refusal. Stock's own D9 (no server-side retry on `xmin` conflict) is
+unchanged, and the contention it produces is still open.

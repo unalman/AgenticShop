@@ -77,10 +77,22 @@ Now that a network hop exists, make its failure modes survivable and visible.
   order. This closes the largest residual the repository had and is what makes the retry work below
   safe — which is why it precedes resilience rather than following it.
   `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O17**.
-- Retry, circuit-breaker and timeout policies on the typed clients. **Now unblocked.** Stock's
-  reserve/confirm do not need keys of their own: reserve is already idempotent through
-  `UNIQUE(order_id, stock_item_id)` (Stock decision D2), and confirm's strictness is handled
-  semantically by Ordering treating "already confirmed" as success (O9, O10).
+- ~~Retry, circuit-breaker and timeout policies on the typed clients.~~ **Done.**
+  `Microsoft.Extensions.Http.Resilience` on both of Ordering's clients, with retry enabled **per
+  request** rather than per client. `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O18**.
+
+  This item expected reserve to need nothing, on the reasoning that Stock's reserve is already
+  idempotent through `UNIQUE(order_id, stock_item_id)` (Stock decision D2) and that confirm's
+  strictness is handled semantically by Ordering treating "already confirmed" as success (O9, O10).
+  The confirm half held. **The reserve half was wrong, and it is worth recording why:** D2 makes the
+  *server* idempotent, but it reports the duplicate as a 409, and Ordering's client reads a reserve
+  409 as "this line cannot be held". So a retry after a first attempt that committed but whose 201 was
+  lost would strand that hold and report the order out of stock. Reserve is therefore exempt from
+  retry; the reads and the settles are not, because a 409 from either is resolved by the
+  reconciliation read rather than interpreted.
+
+  Note also what this did **not** fix: the contention measurement below. Stock's `xmin`-conflict 409
+  is a normal 4xx and is not retried, so retry at the HTTP layer leaves it untouched.
 - Serilog structured logging
 - **OpenTelemetry** distributed tracing across the three hosts — the moment "distributed" stops
   being theoretical. Derive the correlation id from `Activity.Current?.TraceId` here, or there

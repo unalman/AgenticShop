@@ -40,6 +40,13 @@ open and resolved issues: `docs/KNOWN-ISSUES.md`.
 - **A reserve that fails after earlier lines were held → release every hold for that order and fail
   it.** No server-side retry in Phase 0, and no partial fill. Stock does not retry on `xmin`
   conflict, so a reserve can fail even when stock was available. See `docs/DECISIONS.md` → **O16**.
+- **The typed clients retry, and reserve is the one call that must not.** `ReserveAsync` marks its
+  request with `DownstreamResilience.NotRetryable`; do not remove that line, and do not add retry to
+  a new outbound call without checking it is safe. A retried reserve whose first attempt committed is
+  answered 409 by Stock's unique index, and the client reads 409 as a refusal — so the hold is
+  stranded and the order is reported out of stock for stock that was taken. Reads and settles *are*
+  retried, because their 409 is resolved by the reconciliation read instead of being interpreted.
+  See `docs/DECISIONS.md` → **O18**.
 - **`POST /orders` requires an `Idempotency-Key` header, and a repeated key replays.** The claim is
   written **after** resolve and **before** reserve — resolve is pure reads, so a bad basket must not
   burn the caller's key; reserve is the first side effect, so the claim must be committed first. The
