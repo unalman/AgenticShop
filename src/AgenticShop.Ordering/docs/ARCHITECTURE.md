@@ -76,12 +76,16 @@ violation.
 ## 3. The placement flow
 
 ```
-POST /api/v1/orders
+POST /api/v1/orders          (Idempotency-Key required)
   │
+  ├─ replay check: is this key already completed?        → replay the recorded status, stop
   ├─ combine duplicate product lines                     (no I/O, no side effects)
-  ├─ resolve every line against Catalog                  (throws → 400/409, nothing to undo)
+  ├─ resolve every line against Catalog                  (throws → 400/409, key not consumed)
   │    └─ agree one currency across the lines
   ├─ build the Order in memory, Pending, OrderNumber derived from its id
+  │
+  ├─ CLAIM the idempotency key                           ◄── committed before any side effect
+  │    └─ already claimed → 409, nothing placed
   │
   ├─ RESERVE each line                                   ◄── first side effect
   │    ├─ refused  → release the holds taken → Failed  → 409 + orderId
@@ -91,17 +95,23 @@ POST /api/v1/orders
   │    ├─ all settled → Confirmed                       → 201
   │    └─ otherwise   → reconcile → classify            → 201 | 502 + orderId
   │
-  └─ one SaveChangesAsync writes the order and its lines, already terminal
+  └─ one SaveChangesAsync writes the order, its lines and the key's completion, already terminal
 ```
 
-Two properties of this ordering are load-bearing:
+Three properties of this ordering are load-bearing:
 
 **Resolution completes before the first mutation anywhere.** An unorderable product or a
 mixed-currency order therefore costs no compensation and writes no row. It is a 409 or a 400 with
-nothing to clean up.
+nothing to clean up — and, since Phase 1, it does not consume the caller's idempotency key either,
+so the basket can be fixed and retried under the same key.
+
+**The claim sits between resolution and the first side effect.** Earlier and a caller's mistake burns
+its key; later and two concurrent requests can both reach Reserve under the same key. Decision O17.
 
 **The row is written once, at the end, already terminal.** There is no `Pending` row, so no reader
-can observe a half-placed order, and there is no second write to fail between. `Pending` remains in
+can observe a half-placed order, and there is no second write to fail between. The key's completion
+rides in the same transaction, which is what closes the window a retry would otherwise exploit.
+`Pending` remains in
 the enum and in the `CHECK` because it is the construction state and because Phase 2's saga writes the
 order *before* Stock replies — at which point a persisted `Pending` becomes the normal case and needs
 the migration that introduces it.
@@ -349,11 +359,13 @@ Still unexercised, and named so nobody assumes otherwise:
   reset sequences is still untested territory.
 - **Real cross-service integration.** Every automated test fakes both clients. The three-host path is
   covered by `http/ordering.http` run by hand, not by CI. Consumer-driven contract tests are Phase 3.
-- **Idempotent placement.** A retried `POST /orders` creates a second order and a second set of holds.
-  Phase 1's idempotency keys.
 - **Reconciliation as a process.** `PartiallyConfirmed` is recorded and queryable by id, but nothing
   drives it forward. Discovering one whose id was lost needs `psql`. Phase 2's saga.
 - **Resilience.** One timeout, no retry, no circuit breaker. A dependency that is merely slow, rather
-  than absent, will hold a request for ten seconds and then fail it. Phase 1.
+  than absent, will hold a request for ten seconds and then fail it. Phase 1 — and now unblocked,
+  because idempotent placement landed first.
 - **Distributed tracing.** The correlation id crosses the hop and appears in both logs, but there is
   no span tree, so "which call was slow" is still a reading exercise. Phase 1's OpenTelemetry.
+
+Idempotent placement was on this list until Phase 1 closed it; a stranded claim is the smaller
+residual that replaced it, and it is in `KNOWN-ISSUES.md`.

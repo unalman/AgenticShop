@@ -2,6 +2,8 @@ using AgenticShop.Ordering.Clients;
 using AgenticShop.Ordering.Contracts;
 using AgenticShop.Ordering.Data;
 using AgenticShop.Ordering.Domain;
+using Microsoft.EntityFrameworkCore;
+using Npgsql;
 
 namespace AgenticShop.Ordering.Endpoints;
 
@@ -43,7 +45,10 @@ public sealed class OrderPlacer(
     /// <summary>Used from the first side-effecting call onward; see the remarks.</summary>
     private static readonly CancellationToken NotCancellable = CancellationToken.None;
 
-    public async Task<Order> PlaceAsync(CreateOrderRequest request, CancellationToken cancellationToken)
+    public async Task<Order> PlaceAsync(
+        CreateOrderRequest request,
+        string idempotencyKey,
+        CancellationToken cancellationToken)
     {
         var wanted = CombineLines(request.Lines);
         var resolved = await ResolveAsync(wanted, cancellationToken);
@@ -63,9 +68,49 @@ public sealed class OrderPlacer(
 
         var order = Order.Create(orderId, resolved[0].Product.Currency, lines);
 
-        var reservations = await ReserveAsync(order, resolved);
+        // Claimed after Resolve and before Reserve, and that placement is the whole design. Resolve
+        // is pure reads, so a bad basket — an unorderable product, a mixed currency — fails before
+        // the key is consumed and the client can retry the same key once it has fixed the request.
+        // Reserve is the first side effect, so the claim has to be committed before it: a duplicate
+        // arriving mid-placement must find the row and be refused rather than placing alongside us.
+        var claim = await ClaimAsync(idempotencyKey);
 
-        return await ConfirmAsync(order, reservations);
+        var reservations = await ReserveAsync(order, resolved, claim);
+
+        return await ConfirmAsync(order, reservations, claim);
+    }
+
+    /// <summary>
+    /// Takes the key's slot, or refuses the request if something else already holds it.
+    /// </summary>
+    /// <remarks>
+    /// Uses <see cref="NotCancellable"/> like every other write here. The claim is the first side
+    /// effect of the placement, so honouring a client cancellation from this point on could commit
+    /// the row and then abandon it, stranding the key for good — the one outcome worse than ignoring
+    /// the cancellation. A stranded claim still fails closed: it blocks one key and can never cause a
+    /// second placement.
+    /// </remarks>
+    private async Task<OrderIdempotencyKey> ClaimAsync(string idempotencyKey)
+    {
+        var claim = OrderIdempotencyKey.Create(idempotencyKey, DateTimeOffset.UtcNow);
+
+        db.IdempotencyKeys.Add(claim);
+
+        try
+        {
+            await db.SaveChangesAsync(NotCancellable);
+        }
+        catch (DbUpdateException exception)
+            when (exception.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation })
+        {
+            // Someone else won the race. Detach rather than leave a doomed entity tracked, so the
+            // caller's context stays usable for the replay path.
+            db.Entry(claim).State = EntityState.Detached;
+
+            throw new IdempotencyKeyInUseException(idempotencyKey);
+        }
+
+        return claim;
     }
 
     /// <summary>
@@ -151,7 +196,10 @@ public sealed class OrderPlacer(
     /// reconciliation goes through <see cref="IStockClient.ListByOrderAsync"/>, which is keyed by
     /// order id and reports the product id every line can be matched on.
     /// </remarks>
-    private async Task<IReadOnlyList<Guid>> ReserveAsync(Order order, IReadOnlyList<ResolvedLine> resolved)
+    private async Task<IReadOnlyList<Guid>> ReserveAsync(
+        Order order,
+        IReadOnlyList<ResolvedLine> resolved,
+        OrderIdempotencyKey claim)
     {
         var reservations = new List<Guid>(resolved.Count);
 
@@ -175,7 +223,7 @@ public sealed class OrderPlacer(
                 // nothing can be Confirmed and Failed stays truthful even if the read failed too.
                 await ReconcileAsync(order);
 
-                await WriteAsync(order, OrderStatus.Failed);
+                await WriteAsync(order, OrderStatus.Failed, StatusCodes.Status502BadGateway, claim);
 
                 throw new OrderPlacementIncompleteException(order.Id, order.Status);
             }
@@ -187,7 +235,7 @@ public sealed class OrderPlacer(
                 // hot path, and a reconciliation read per rejected order would be a real cost.
                 await ReleaseAsync(reservations);
 
-                await WriteAsync(order, OrderStatus.Failed);
+                await WriteAsync(order, OrderStatus.Failed, StatusCodes.Status409Conflict, claim);
 
                 throw new StockUnavailableException(line.Product.Id, order.Id);
             }
@@ -203,7 +251,10 @@ public sealed class OrderPlacer(
     /// reservation, reconcile an ambiguous failure by reading the authoritative state back, and
     /// record what actually happened rather than what was hoped for.
     /// </summary>
-    private async Task<Order> ConfirmAsync(Order order, IReadOnlyList<Guid> reservations)
+    private async Task<Order> ConfirmAsync(
+        Order order,
+        IReadOnlyList<Guid> reservations,
+        OrderIdempotencyKey claim)
     {
         var settled = 0;
 
@@ -233,7 +284,7 @@ public sealed class OrderPlacer(
 
         if (settled == reservations.Count)
         {
-            return await WriteAsync(order, OrderStatus.Confirmed);
+            return await WriteAsync(order, OrderStatus.Confirmed, StatusCodes.Status201Created, claim);
         }
 
         var outcome = await ReconcileAsync(order);
@@ -243,7 +294,7 @@ public sealed class OrderPlacer(
         // caller retry an order that has already shipped.
         if (outcome == ReconciliationOutcome.AllConfirmed)
         {
-            return await WriteAsync(order, OrderStatus.Confirmed);
+            return await WriteAsync(order, OrderStatus.Confirmed, StatusCodes.Status201Created, claim);
         }
 
         // Unknown is recorded as PartiallyConfirmed rather than Failed: "we do not know whether
@@ -252,7 +303,7 @@ public sealed class OrderPlacer(
             ? OrderStatus.Failed
             : OrderStatus.PartiallyConfirmed;
 
-        await WriteAsync(order, status);
+        await WriteAsync(order, status, StatusCodes.Status502BadGateway, claim);
 
         throw new OrderPlacementIncompleteException(order.Id, order.Status);
     }
@@ -341,10 +392,27 @@ public sealed class OrderPlacer(
     }
 
     /// <summary>
-    /// The one and only write of the placement path: transition, add, commit. Every caller reaches
-    /// it exactly once, which is what makes the row write-once.
+    /// The one and only write of the placement path: transition, add, complete the key, commit.
+    /// Every caller reaches it exactly once, which is what makes the row write-once.
     /// </summary>
-    private async Task<Order> WriteAsync(Order order, OrderStatus status)
+    /// <remarks>
+    /// The order insert and the key's completion are the same <c>SaveChangesAsync</c>, so EF wraps
+    /// them in one transaction and there is no window in which an order exists without its key
+    /// pointing at it. That window is exactly what a retry would exploit: a key written afterwards
+    /// could be lost to a crash, and the next attempt would place a second order.
+    /// <para>
+    /// <paramref name="statusCode"/> is recorded verbatim and replayed verbatim. It must stay in
+    /// step with what <c>OrderingExceptionHandler</c> actually returns for the exception thrown
+    /// alongside it, which is why the two are written at the same call site rather than derived
+    /// from <see cref="Order.Status"/> — a <see cref="OrderStatus.Failed"/> order came from either a
+    /// 409 or a 502, and the status is not recoverable from the row.
+    /// </para>
+    /// </remarks>
+    private async Task<Order> WriteAsync(
+        Order order,
+        OrderStatus status,
+        int statusCode,
+        OrderIdempotencyKey claim)
     {
         switch (status)
         {
@@ -361,6 +429,8 @@ public sealed class OrderPlacer(
                 throw new InvalidOperationException(
                     $"Order {order.Id} cannot be persisted as {status}: Phase 0 writes an order once, already terminal.");
         }
+
+        claim.Complete(order.Id, statusCode);
 
         db.Orders.Add(order);
         await db.SaveChangesAsync(NotCancellable);

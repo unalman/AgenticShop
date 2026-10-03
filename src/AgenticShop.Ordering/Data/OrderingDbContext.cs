@@ -9,6 +9,8 @@ public class OrderingDbContext(DbContextOptions<OrderingDbContext> options) : Db
 
     public DbSet<OrderLine> OrderLines => Set<OrderLine>();
 
+    public DbSet<OrderIdempotencyKey> IdempotencyKeys => Set<OrderIdempotencyKey>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
         => modelBuilder.ApplyConfigurationsFromAssembly(typeof(OrderingDbContext).Assembly);
 }

@@ -13,15 +13,21 @@ gap · **Low** hygiene · **Info** a trade-off worth knowing.
 
 ### Consistency
 
-**A retried `POST /orders` creates a second order and a second set of holds.** *Medium · Phase 1.*
-There is no idempotency key, so a client that retries after a timeout — or after a 502 whose body it
-failed to read — places a genuinely new order. For a `Confirmed` first attempt that means shipping
-twice. This is the single largest residual in the service and the reason idempotency keys precede
-retry policies in `docs/ROADMAP.md` rather than following them.
+**A stranded idempotency claim blocks that key forever.** *Low · Phase 3.*
+`POST /orders` now requires an `Idempotency-Key` and a repeated key replays the recorded outcome, so
+the largest residual this service had is closed — see "Resolved" below. What replaces it is smaller
+and fails in the safe direction: if the process dies between claiming a key and writing the order,
+the claim never completes and every later attempt with that key gets a 409. There is no worker to
+notice, and no endpoint can clear it.
 
-Partially mitigated, not solved: the 409 and 502 bodies carry an `orderId` extension, so a client
-that *reads* the failure can query the order instead of blindly re-posting. A client that never
-received the response gets nothing.
+This is deliberate rather than an oversight. Treating an old claim as abandoned would need a clock
+threshold, and two requests could both decide the claim was abandoned and both place — the exact
+failure the key exists to prevent. Refusing blocks one key and can never double-place, so the client
+recovers by choosing a new key. Phase 3's reservation-expiry worker is the mechanism that lifts it,
+and it is the same shape of problem as a stranded hold.
+
+The `orderId` extension on 409 and 502 bodies still does its separate job: a client that *reads* a
+failure can query the order rather than guessing.
 
 **A `PartiallyConfirmed` order whose id was never received is undiscoverable through the API.**
 *Medium · Phase 2.* There is no list endpoint (decision O12), so the only handle on an order is its
@@ -95,6 +101,27 @@ Accepted; a sequence would have reintroduced the fixture problem the derived num
 
 Kept for the lesson, not the fix. Findings about shared infrastructure are recorded in
 `../../../docs/KNOWN-ISSUES.md`.
+
+### A retried `POST /orders` placed a second order and a second set of holds
+
+*Closed 2026-10-03, Phase 1.* There was no idempotency key, so a client that retried after a
+timeout — or after a 502 whose body it failed to read — placed a genuinely new order. For a first
+attempt that reached `Confirmed` that meant shipping twice. It was the single largest residual in
+the repository, and the reason idempotency keys precede retry policies in `docs/ROADMAP.md` rather
+than following them: retrying without a key turns an occasional duplicate into a systematic one.
+
+Fixed by a required `Idempotency-Key` header, a claim row committed before the first side effect,
+and a completion written in the same transaction as the order — decision **O17**.
+
+**Caught by:** reasoning about what a client does when it never receives a response, not by any
+test. No test in the suite could have failed on it, because every test that placed an order placed
+it exactly once and read the result. The residual was invisible until someone asked what a *retry*
+would do — which is the general lesson: a suite that only exercises the happy path once per test
+cannot see a duplicate-submission bug, and "what does the caller do when the response is lost" is a
+question worth asking of every write endpoint.
+
+**What replaced it** is a smaller residual in the safe direction, and it is still open: a claim
+stranded by a crash blocks that one key forever. See "Open" above.
 
 ### `Uri.TryCreate(..., UriKind.Absolute)` accepts `"localhost:5082"`
 

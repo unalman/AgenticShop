@@ -4,6 +4,7 @@ using System.Text;
 using AgenticShop.Ordering.Contracts;
 using AgenticShop.Ordering.Data;
 using AgenticShop.Ordering.Domain;
+using AgenticShop.Ordering.Endpoints;
 using AgenticShop.Ordering.IntegrationTests.Fakes;
 using AgenticShop.Shared.Middleware;
 using FluentAssertions;
@@ -60,9 +61,16 @@ public abstract class OrderApiTestBase(OrderingApiFixture fixture) : IAsyncLifet
     protected static CreateOrderRequest OrderWith(params (Guid ProductId, int Quantity)[] lines)
         => new([.. lines.Select(line => new CreateOrderLineRequest(line.ProductId, line.Quantity))]);
 
+    /// <summary>
+    /// A key that has certainly not been used before. <c>POST /orders</c> requires one, so every
+    /// helper supplies a fresh key unless the test is specifically about repeating one.
+    /// </summary>
+    protected static string NewIdempotencyKey() => Guid.NewGuid().ToString("N");
+
     protected async Task<HttpResponseMessage> PlaceAsync(
         CreateOrderRequest request,
-        string? correlationId = null)
+        string? correlationId = null,
+        string? idempotencyKey = null)
     {
         using var message = new HttpRequestMessage(HttpMethod.Post, "/api/v1/orders")
         {
@@ -70,12 +78,30 @@ public abstract class OrderApiTestBase(OrderingApiFixture fixture) : IAsyncLifet
         };
 
         AddCorrelationId(message, correlationId);
+        AddIdempotencyKey(message, idempotencyKey ?? NewIdempotencyKey());
 
         return await Client.SendAsync(message);
     }
 
+    /// <summary>
+    /// The same request under one key, twice — which is the whole point of the key, and how the
+    /// replay path is asserted rather than assumed.
+    /// </summary>
+    protected async Task<HttpResponseMessage> PlaceTwiceWithSameKeyAsync(
+        CreateOrderRequest request,
+        string idempotencyKey)
+    {
+        var first = await PlaceAsync(request, idempotencyKey: idempotencyKey);
+        first.Dispose();
+
+        return await PlaceAsync(request, idempotencyKey: idempotencyKey);
+    }
+
     /// <summary>For the binding failures that have no valid DTO to send: malformed JSON and friends.</summary>
-    protected async Task<HttpResponseMessage> PlaceRawAsync(string json, string? correlationId = null)
+    protected async Task<HttpResponseMessage> PlaceRawAsync(
+        string json,
+        string? correlationId = null,
+        string? idempotencyKey = null)
     {
         using var message = new HttpRequestMessage(HttpMethod.Post, "/api/v1/orders")
         {
@@ -83,9 +109,14 @@ public abstract class OrderApiTestBase(OrderingApiFixture fixture) : IAsyncLifet
         };
 
         AddCorrelationId(message, correlationId);
+        AddIdempotencyKey(message, idempotencyKey ?? NewIdempotencyKey());
 
         return await Client.SendAsync(message);
     }
+
+    /// <summary>Omits the header entirely, which is its own 400 and needs its own helper to produce.</summary>
+    protected Task<HttpResponseMessage> PlaceWithoutIdempotencyKeyAsync(CreateOrderRequest request)
+        => Client.PostAsJsonAsync("/api/v1/orders", request);
 
     private static void AddCorrelationId(HttpRequestMessage message, string? correlationId)
     {
@@ -94,6 +125,9 @@ public abstract class OrderApiTestBase(OrderingApiFixture fixture) : IAsyncLifet
             message.Headers.Add(CorrelationIdMiddleware.HeaderName, correlationId);
         }
     }
+
+    private static void AddIdempotencyKey(HttpRequestMessage message, string idempotencyKey)
+        => message.Headers.Add(OrderEndpoints.IdempotencyKeyHeader, idempotencyKey);
 
     protected async Task<OrderResponse> PlaceSuccessfullyAsync(params (Guid ProductId, int Quantity)[] lines)
     {
@@ -148,6 +182,31 @@ public abstract class OrderApiTestBase(OrderingApiFixture fixture) : IAsyncLifet
         return await db.Orders
             .AsNoTracking()
             .Include(order => order.Lines)
+            .ToListAsync();
+    }
+
+    /// <summary>The claim row for a key, or null if the key was never taken.</summary>
+    protected async Task<OrderIdempotencyKey?> ReadIdempotencyKeyAsync(string key)
+    {
+        using var scope = Fixture.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<OrderingDbContext>();
+
+        return await db.IdempotencyKeys
+            .AsNoTracking()
+            .FirstOrDefaultAsync(claim => claim.Key == key);
+    }
+
+    /// <summary>
+    /// Every claim row. Counting these is how "the second attempt did not place anything" is proven
+    /// against the database rather than inferred from a status code.
+    /// </summary>
+    protected async Task<List<OrderIdempotencyKey>> ReadAllIdempotencyKeysAsync()
+    {
+        using var scope = Fixture.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<OrderingDbContext>();
+
+        return await db.IdempotencyKeys
+            .AsNoTracking()
             .ToListAsync();
     }
 }

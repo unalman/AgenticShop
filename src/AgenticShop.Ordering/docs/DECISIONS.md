@@ -50,9 +50,11 @@ the three can truthfully describe "some lines shipped and cannot be un-shipped".
 
 **Alternatives rejected.**
 
-- **`Failed`.** Says nothing shipped. `POST /orders` is not idempotent, so a client that believes it
-  re-orders and ships the confirmed lines a second time. This is the one genuinely dangerous answer
-  available, and a three-status vocabulary forces it.
+- **`Failed`.** Says nothing shipped, so a client that believes it starts over. This is the one
+  genuinely dangerous answer available, and a three-status vocabulary forces it. Phase 1's
+  idempotency key (O17) narrows the danger but does not remove it: the key stops a client that
+  retries *the same request*, and a client told "nothing shipped" will deliberately choose a
+  **fresh key** and re-order — which the key cannot and should not block.
 - **`Pending`.** Phase 0 has no worker, so a `Pending` row is a row stuck forever, and it would break
   the property that a completed placement leaves the order terminal.
 - **A `FailureReason` column instead of a status.** More surface, not less: consumers branch on
@@ -178,14 +180,16 @@ distinguishes them. Both are logged; neither changes the classification.
 
 Added as a ProblemDetails extension alongside `correlationId`.
 
-**Why.** `POST /orders` is not idempotent in Phase 0. A failure body that names no order leaves the
-client unable to distinguish "nothing was created" from "something was created and is broken", and
-that ambiguity is precisely what turns one failure into a duplicate shipment. The extension costs one
-line in the handler and is the difference between an actionable failure and a guess.
+**Why.** A failure body that names no order leaves the client unable to distinguish "nothing was
+created" from "something was created and is broken", and that ambiguity is precisely what turns one
+failure into a duplicate shipment. The extension costs one line in the handler and is the difference
+between an actionable failure and a guess. It also survives O17: an idempotency key makes a *retry*
+safe, but a client that cannot see the order cannot decide whether retrying is even the right move.
 
-**Cost accepted.** `Classify` returns a small record rather than the copied skeleton's tuple. That is
-a divergence from the shared handler, recorded in `ARCHITECTURE.md` §9 and to be folded into the
-Phase 1 extraction rather than back-ported now, since neither Catalog nor Stock has an order to name.
+**Cost accepted.** The handler had to return more than a status/title/detail triple. The Phase 1
+extraction resolved it by putting an optional `Extensions` dictionary on the shared
+`ExceptionClassification`, so `orderId` is data on a shared type rather than a fork of it — and
+neither Catalog nor Stock, which have no order to name, carries anything they do not need.
 
 ## O12 · No list endpoint, and no route that mutates a persisted order
 
@@ -229,10 +233,12 @@ is the canonical statement; it is not repeated here.
 
 Three parts of it are decisions rather than mechanics:
 
-- **A fourth status, not a reuse of the other three.** `Failed` says nothing shipped, and
-  `POST /orders` is not idempotent, so a client that believes it re-orders and ships the confirmed
-  lines a second time — the one genuinely dangerous answer available, and the one a three-status
-  vocabulary forces. `Pending` would never advance, because Phase 0 has no worker. A
+- **A fourth status, not a reuse of the other three.** `Failed` says nothing shipped, so a client
+  that believes it starts over — and the confirmed lines ship a second time. That is the one
+  genuinely dangerous answer available, and the one a three-status vocabulary forces. O17's
+  idempotency key does not make this safe: it blocks a repeated *request*, not a client that
+  deliberately picks a new key because it was told nothing happened. `Pending` would never advance,
+  because Phase 0 has no worker. A
   `FailureReason` column is more surface, not less: consumers branch on `Status`, and a second
   vocabulary that must stay in sync costs more than one enum member plus one `CHECK` value.
 - **`PartiallyConfirmed` is reachable only from the confirm phase.** A reserve-phase fault cannot
@@ -293,7 +299,71 @@ release leaves stock held against an order that no longer exists; Stock's
 because already released" must be treated as success, mirroring the confirm rule in O9 — but only
 after a read, per O10.
 
-**Revisit.** Phase 1, once idempotency keys make a retry safe.
+**Revisit.** Phase 1, once idempotency keys make a retry safe. **That prerequisite is now met** —
+see O17 — so the retry work is unblocked, though not yet done.
+
+## O17 · Idempotency keys on `POST /orders` — **added 2026-10-03, Phase 1**
+
+The header is **required**, and a repeated key replays the recorded outcome instead of placing again.
+
+**Why required rather than optional.** An optional key leaves the residual open for every client
+that does not send one, and the residual was the largest in the repository: a retried placement
+created a second order and a second set of holds, which for a first attempt that reached
+`Confirmed` meant shipping twice. Neither Stock's `UNIQUE(order_id, stock_item_id)` nor Catalog's
+unique SKU could help, because a retry carries a *fresh* order id — only the caller knows that two
+requests are the same request. This is a breaking contract change and it is worth it: there are no
+external consumers, and a guarantee that callers can opt out of is not a guarantee.
+
+**The claim is written after resolve and before reserve.** That position is the whole design:
+
+- Resolve is pure reads, so an unorderable product or a mixed currency fails **before** the key is
+  consumed. The caller can fix the basket and retry the same key. Claiming earlier would burn a key
+  on a mistake the caller can still correct.
+- Reserve is the first side effect, so the claim must be committed before it. Claiming later would
+  leave a window in which two concurrent requests both hold stock for the same key.
+
+Validation failures are earlier still — they are rejected in the endpoint filter, before the
+handler — so they consume nothing either.
+
+**The completion is written in the same `SaveChangesAsync` as the order.** One transaction, so there
+is no window in which an order exists without its key pointing at it. That window is exactly what a
+retry would exploit: a key written afterwards could be lost to a crash, and the next attempt would
+place a second order.
+
+**The status code is stored, not derived from `Order.Status`.** The mapping is not one-to-one: a
+`Failed` order came from either a 409 (stock refused) or a 502 (Stock unreachable during reserve).
+Deriving 409 from "Failed" would tell a client to fix its basket when the real problem was ours —
+and would invite the retry this decision exists to prevent.
+
+**Replay rebuilds the body rather than storing it.** The status is replayed verbatim; for a 201 the
+body is byte-identical to the original, because the row is write-once and `OrderResponse.From` is a
+pure function of it. For a failure the detail text differs and says that this is a replay. Storing
+serialised response bodies would have created a second source of truth that could drift from the
+row it describes, which is the same reason `OrderNumber` is derived and reservation ids are never
+persisted.
+
+**A claimed-but-uncompleted key answers 409, and fails closed.** If the process dies between the
+claim and the write, the key is stranded: every later attempt is refused. That is deliberate. The
+alternative — treating an old claim as abandoned — needs a clock threshold, and two requests can both
+decide the claim is abandoned and both place, which is the exact failure the key prevents. Refusing
+blocks one key and can never double-place. Phase 3's expiry worker lifts it, the same mechanism that
+lifts a stranded hold.
+
+**Rejected.**
+
+- *Deriving the key from a hash of the body.* Cannot distinguish an intentional re-order of the same
+  basket from a retry, so it would refuse legitimate repeat purchases.
+- *Storing the response body.* A second source of truth; see above.
+- *A separate surrogate primary key with a unique index on the key.* The row's whole purpose is that
+  a given key resolves to at most one order, and a primary key on the key says that directly.
+- *Blocking the second request until the first settles.* Holds a request thread for the duration of
+  a placement that may already be dead, and needs a timeout whose expiry is the same ambiguity again.
+
+**Consequence for the retry work.** This is the prerequisite O16 and `docs/ROADMAP.md` named. Retry
+policies on the typed clients are now safe to add, because a retried placement that reaches Ordering
+again under the same key replays rather than duplicates. Note that it makes *inbound* retries safe;
+the outbound calls to Stock are still covered by Stock's own natural idempotency (decision D2) and
+by the reconciliation read (O9).
 
 ---
 

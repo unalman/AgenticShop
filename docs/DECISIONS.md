@@ -8,7 +8,7 @@ Service-specific decisions live with the service and are not repeated here:
 
 - `src/AgenticShop.Catalog/docs/DECISIONS.md` — soft delete, paging, money and currency
 - `src/AgenticShop.Stock/docs/DECISIONS.md` — D1–D14 plus three taken during implementation
-- `src/AgenticShop.Ordering/docs/DECISIONS.md` — O1–O16: the orchestrator's placement flow, the
+- `src/AgenticShop.Ordering/docs/DECISIONS.md` — O1–O17: the orchestrator's placement flow, the
   derived order number, the confirm-phase policy and the downstream client seam
 
 Rules live in `AGENTS.md`; design detail in `ARCHITECTURE.md`; open problems in
@@ -496,14 +496,13 @@ Each was considered and declined, with the phase that would justify it:
 | RabbitMQ / any broker | Nothing is asynchronous |
 | Outbox / Inbox | An outbox makes "write a row and publish an event" atomic; there are no events. Note the design is already outbox-ready: every write path is a single `SaveChangesAsync`, so an entity and an outbox row would already be atomic. Stock's reserve commits the counter and the reservation row together, which is the same property |
 | Redis | No cache pressure, no distributed idempotency store to hold |
-| Polly / resilience | Retrying without idempotency keys double-reserves stock. Also see D9: Stock deliberately returns 409 on `xmin` conflict rather than retrying |
+| Polly / resilience | Retrying without idempotency keys double-reserves stock. Also see D9: Stock deliberately returns 409 on `xmin` conflict rather than retrying. **Now unblocked** — the keys arrived first, in Phase 1 |
 | OpenTelemetry | A correlation id crosses the hop and appears in both logs, which is enough for three services and one synchronous path. A span tree answers "which call was slow", and nothing is slow yet |
 | Serilog | Built-in logging suffices and the configuration is about to change |
 | Authentication / authorization | Deferred by the project owner. Adding it later needs a customer identity column on `Order` plus a cross-cutting policy — a migration and a concern, which is why no placeholder seam was pre-built |
 | Kubernetes / Helm, YARP gateway | Phase 4 |
 | CQRS, DDD tactical patterns, event sourcing | No read pressure, no aggregate boundaries to enforce |
-| Idempotency keys | Phase 1. Two operations are already naturally idempotent through unique constraints: `POST /products` (unique SKU) and `POST /stock/{id}/reservations` (unique order + stock item). **`POST /orders` is not** — a retried placement creates a second order and a second set of holds, which for an order that actually confirmed means shipping twice. That is now the largest open residual in the repository, and it is why keys precede retry policies rather than following them |
-| Reservation expiry / `ExpiresAtUtc` | Phase 3. Release is an explicit call only; no background worker. The cost became concrete with Ordering: a release that fails during compensation strands the hold, and nothing lifts it |
+| Reservation expiry / `ExpiresAtUtc` | Phase 3. Release is an explicit call only; no background worker. The cost became concrete with Ordering: a release that fails during compensation strands the hold, and nothing lifts it. Since Phase 1 the same worker would also lift a stranded idempotency claim |
 | Payment / any money movement | Not in scope at any phase. It is also what keeps the confirm-phase residual survivable — a `PartiallyConfirmed` order strands *inventory*, not money. Adding a payment step would turn it into a financial inconsistency and would need the outbox and the saga first |
 | Compensating return-to-stock for a confirmed reservation | Stock's `Confirmed` is terminal by decision D3 and confirm decrements `quantity_on_hand`, so undoing one needs a new inventory-adjustment transition with its own audit trail. Ordering records a terminal `PartiallyConfirmed` order instead — see `src/AgenticShop.Ordering/docs/DECISIONS.md` → O14 |
 | Service Dockerfiles | Phase 0 runs APIs on the host for a fast inner loop |

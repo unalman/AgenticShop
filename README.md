@@ -294,15 +294,18 @@ Each phase adds one capability, and only once the previous phase makes it necess
 
 **Phase 0 — Foundation** *(complete)*
 Three hosts, synchronous HTTP, one database per service, Testcontainers. All three services
-are implemented and verified: 426 tests, a clean build under `TreatWarningsAsErrors`,
-database isolation 22/22, and the three-host path driven by hand through `http/ordering.http`.
+are implemented and verified: at the close of Phase 0, 426 tests, a clean build under
+`TreatWarningsAsErrors`, database isolation 22/22, and the three-host path driven by hand
+through `http/ordering.http`. **The suite is now at 471.**
 
 **Phase 1 — Reliability and observability** *(in progress)*
-Shared infrastructure library — **done** · retry/circuit-breaker/timeout policies · idempotency
-keys · Serilog · OpenTelemetry distributed tracing · dependency-aware health checks · Dockerfiles
-and a `full` compose profile · CI. Retry is driven by a measured problem: a 40-way burst against 10
-units of stock held only 4, because `xmin` conflicts are not retried. Idempotency keys come before
-retry, because retrying without them double-reserves stock.
+Shared infrastructure library — **done** · idempotency keys on `POST /orders` — **done** ·
+retry/circuit-breaker/timeout policies · Serilog · OpenTelemetry distributed tracing ·
+dependency-aware health checks · Dockerfiles and a `full` compose profile · CI. Retry is driven by a
+measured problem: a 40-way burst against 10 units of stock held only 4, because `xmin` conflicts are
+not retried. Idempotency keys came first, because retrying without them double-reserves stock — and
+they closed the largest residual the repository had, since a retried `POST /orders` used to create a
+second order and a second set of holds.
 
 **Phase 2 — Asynchronous messaging** ← the inflection point
 RabbitMQ · replace synchronous reservation with `OrderPlaced` / `StockReserved`

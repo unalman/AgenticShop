@@ -40,9 +40,16 @@ open and resolved issues: `docs/KNOWN-ISSUES.md`.
 - **A reserve that fails after earlier lines were held → release every hold for that order and fail
   it.** No server-side retry in Phase 0, and no partial fill. Stock does not retry on `xmin`
   conflict, so a reserve can fail even when stock was available. See `docs/DECISIONS.md` → **O16**.
-- **A confirm-phase failure ends as `PartiallyConfirmed`, not `Failed`.** `Failed` invites a re-order
-  that ships the confirmed lines a second time, and `POST /orders` is not idempotent. See
-  `docs/DECISIONS.md` → **O14** and `docs/ARCHITECTURE.md` §5.
+- **`POST /orders` requires an `Idempotency-Key` header, and a repeated key replays.** The claim is
+  written **after** resolve and **before** reserve — resolve is pure reads, so a bad basket must not
+  burn the caller's key; reserve is the first side effect, so the claim must be committed first. The
+  completion commits in the **same** `SaveChangesAsync` as the order. Keep it that way: moving the
+  claim earlier wastes keys, moving it later reopens double-placement. See `docs/DECISIONS.md` → **O17**.
+- **A confirm-phase failure ends as `PartiallyConfirmed`, not `Failed`.** `Failed` says nothing
+  shipped, so a client that believes it re-orders — and the lines that were already confirmed ship a
+  second time. The idempotency key stops an *accidental* retry; it cannot stop a client that
+  deliberately chooses a new key because it was told nothing shipped. See `docs/DECISIONS.md` →
+  **O14** and `docs/ARCHITECTURE.md` §5.
 - **`PartiallyConfirmed` is reachable only from the confirm phase.** A reserve-phase fault cannot
   have shipped anything, so its order is `Failed` even when the reconciliation read also failed.
 - **A 502 or 409 that wrote a row must echo the order id.** The handler puts it in a ProblemDetails

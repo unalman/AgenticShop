@@ -40,6 +40,15 @@ public sealed class OrderingExceptionHandler(ILogger<OrderingExceptionHandler> l
 {
     private const string DownstreamTitle = "Downstream failure.";
 
+    /// <summary>
+    /// Exposed for <c>OrderEndpoints</c>' idempotency replay path, which rebuilds a recorded failure
+    /// without going through this handler and must therefore produce the same titles rather than
+    /// inventing parallel ones.
+    /// </summary>
+    internal const string ConflictFailureTitle = ConflictTitle;
+
+    internal const string DownstreamFailureTitle = DownstreamTitle;
+
     private const string DownstreamDetail =
         "The request could not be completed because a downstream service did not respond.";
 
@@ -86,6 +95,18 @@ public sealed class OrderingExceptionHandler(ILogger<OrderingExceptionHandler> l
             "orderId",
             incomplete.OrderId),
 
+        // Another request holds this key and has not recorded an outcome yet, so there is nothing to
+        // replay. A 409 rather than a 425 or a 503: the request is well-formed and conflicts with
+        // the key's current state, and retrying the same key after the first attempt settles is
+        // exactly what should succeed. The key itself stays out of the body — it is untrusted input
+        // and echoing it back tells the caller nothing it did not just send — but it is on the
+        // exception, so the log line names it.
+        IdempotencyKeyInUseException => new(
+            StatusCodes.Status409Conflict,
+            ConflictTitle,
+            "That idempotency key is already in use and has no recorded outcome yet. " +
+            "Wait for the first attempt to settle, then retry the same key."),
+
         // No order exists for this one: the failure came from Catalog, before anything was held. The
         // service name stays in the log and out of the body, because naming our dependencies in a
         // response discloses internal topology.
@@ -109,6 +130,13 @@ public sealed class OrderingExceptionHandler(ILogger<OrderingExceptionHandler> l
         // enforces by combining duplicate lines before it can be reached.
         OrderLineConfiguration.UniqueOrderProductIndexName =>
             "That order already has a line for this product.",
+
+        // Unreachable in practice — OrderPlacer.ClaimAsync catches this violation and raises
+        // IdempotencyKeyInUseException, which has a better message — but the constraint name is
+        // declared for the handler to branch on, so it is branched on. Without this case a lost race
+        // that escaped the catch would report a generic conflict.
+        OrderIdempotencyKeyConfiguration.PrimaryKeyName =>
+            "That idempotency key is already in use.",
 
         _ => FallbackConflictDetail
     };

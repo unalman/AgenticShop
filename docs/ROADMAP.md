@@ -72,14 +72,21 @@ Now that a network hop exists, make its failure modes survivable and visible.
   per-service structural guards and the test harness were **not** shared, and two of those guards
   had to be re-anchored because they had been discovering DTOs through the now-shared marker
   interface. `DECISIONS.md` → "Shared infrastructure library".
-- Retry, circuit-breaker and timeout policies on the typed clients
-- **Idempotency keys** on `POST /orders` and on reserve/confirm — a prerequisite for safe retries,
-  which is why it precedes resilience rather than following it
+- ~~**Idempotency keys** on `POST /orders`.~~ **Done.** A required `Idempotency-Key` header, a claim
+  row committed before the first side effect, and a completion written in the same transaction as the
+  order. This closes the largest residual the repository had and is what makes the retry work below
+  safe — which is why it precedes resilience rather than following it.
+  `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O17**.
+- Retry, circuit-breaker and timeout policies on the typed clients. **Now unblocked.** Stock's
+  reserve/confirm do not need keys of their own: reserve is already idempotent through
+  `UNIQUE(order_id, stock_item_id)` (Stock decision D2), and confirm's strictness is handled
+  semantically by Ordering treating "already confirmed" as success (O9, O10).
 - Serilog structured logging
 - **OpenTelemetry** distributed tracing across the three hosts — the moment "distributed" stops
   being theoretical. Derive the correlation id from `Activity.Current?.TraceId` here, or there
   will be two parallel correlation concepts
-- Dependency-aware health checks
+- Dependency-aware health checks — `/health` currently registers no checks at all, so it reports
+  healthy with the database down
 - Dockerfiles for all three services plus a `full` compose profile
 - CI: build, test, and `dotnet ef migrations has-pending-model-changes` as a drift gate
 

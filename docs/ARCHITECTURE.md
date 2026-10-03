@@ -508,10 +508,10 @@ Current counts, all passing:
 | Shared | 35 | — |
 | Catalog | 64 | 39 |
 | Stock | 77 | 61 |
-| Ordering | 93 | 57 |
-| **Total** | **269** | **157** |
+| Ordering | 120 | 75 |
+| **Total** | **296** | **175** |
 
-**426 total.** Build is clean under `TreatWarningsAsErrors`.
+**471 total.** Build is clean under `TreatWarningsAsErrors`.
 
 The total did not change when the shared library was extracted: 35 tests moved out of
 `AgenticShop.Catalog.UnitTests` into `AgenticShop.Shared.UnitTests`, because they specify the filter

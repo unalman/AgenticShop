@@ -12,6 +12,11 @@
 # forwards it to Catalog and Stock, so one id appears in all three logs — that is the thing to look
 # at first, because it is the only end-to-end check of outbound propagation the suite cannot make
 # with the clients faked.
+#
+# POST /orders requires an Idempotency-Key header. Each request below uses a different one, so they
+# each place for real; step 3b deliberately repeats a key to show the replay. A missing key is a 400
+# binding failure, and an over-long or oddly punctuated one is a 400 too — the key reaches a primary
+# key column and the log, so it is treated as untrusted.
 
 @ordering = http://localhost:5083
 @catalog = http://localhost:5081
@@ -52,6 +57,22 @@ X-Correlation-Id: ordering-smoke
 POST {{ordering}}/api/v1/orders
 Content-Type: application/json
 X-Correlation-Id: ordering-smoke
+Idempotency-Key: smoke-place-1
+
+{
+  "lines": [
+    { "productId": "{{productId}}", "quantity": 2 }
+  ]
+}
+
+### 3b. Repeat step 3 with the same key -> 201, and nothing placed
+# Same status, same order id, same Location — but stock is still at 8 on hand, because the second
+# request was replayed rather than placed. This is the request to run twice and then check step 5
+# again: if on-hand dropped to 6, idempotency is broken.
+POST {{ordering}}/api/v1/orders
+Content-Type: application/json
+X-Correlation-Id: ordering-smoke
+Idempotency-Key: smoke-place-1
 
 {
   "lines": [
@@ -70,9 +91,10 @@ GET {{stock}}/api/v1/reservations?orderId={{orderId}}
 
 ### Duplicate lines for one product are combined into a single hold
 # Stock's UNIQUE(order_id, stock_item_id) allows one hold per product per order, so this places one
-# reservation for 5 units, not two.
+# reservation for 5 units, not two. On-hand goes 8 -> 3.
 POST {{ordering}}/api/v1/orders
 Content-Type: application/json
+Idempotency-Key: smoke-combined
 
 {
   "lines": [
@@ -82,9 +104,11 @@ Content-Type: application/json
 }
 
 ### Ordering more than is available -> 409, the earlier holds released, the order written as Failed
-# The response body carries an orderId extension: a failed placement still writes a row.
+# The response body carries an orderId extension: a failed placement still writes a row. Repeating
+# this key replays the same 409 with the same orderId rather than placing again.
 POST {{ordering}}/api/v1/orders
 Content-Type: application/json
+Idempotency-Key: smoke-overstock
 
 {
   "lines": [
@@ -93,8 +117,11 @@ Content-Type: application/json
 }
 
 ### A product Catalog does not have -> 409, and nothing is reserved
+# This one does NOT consume its key. An unorderable product is caught while resolving against
+# Catalog, which runs before the claim, so the caller can fix the basket and retry the same key.
 POST {{ordering}}/api/v1/orders
 Content-Type: application/json
+Idempotency-Key: smoke-missing-product
 
 {
   "lines": [
@@ -108,8 +135,10 @@ Content-Type: application/json
 DELETE {{catalog}}/api/v1/products/{{productId}}
 
 ### No lines -> 400 ValidationProblemDetails with an error against "Lines"
+# Validation runs in the endpoint filter, before the handler, so this key is never claimed either.
 POST {{ordering}}/api/v1/orders
 Content-Type: application/json
+Idempotency-Key: smoke-no-lines
 
 {
   "lines": []
@@ -120,6 +149,7 @@ Content-Type: application/json
 # validation filter's collection recursion for real.
 POST {{ordering}}/api/v1/orders
 Content-Type: application/json
+Idempotency-Key: smoke-bad-quantity
 
 {
   "lines": [
@@ -130,13 +160,40 @@ Content-Type: application/json
 ### Malformed JSON -> 400 ProblemDetails (never a 500)
 POST {{ordering}}/api/v1/orders
 Content-Type: application/json
+Idempotency-Key: smoke-malformed
 
 {
+
+### No idempotency key -> 400, nothing placed
+# A required header that is absent is a binding failure, answered through the shared
+# BadHttpRequestException arm — the same path that handles the malformed JSON above.
+POST {{ordering}}/api/v1/orders
+Content-Type: application/json
+
+{
+  "lines": [
+    { "productId": "{{productId}}", "quantity": 1 }
+  ]
+}
+
+### An unsafe idempotency key -> 400, nothing placed
+# Spaces, semicolons, quotes, newlines and non-ASCII are all refused rather than sanitised: the key
+# is a caller-chosen identifier, so silently rewriting it would make two different keys collide.
+POST {{ordering}}/api/v1/orders
+Content-Type: application/json
+Idempotency-Key: has spaces
+
+{
+  "lines": [
+    { "productId": "{{productId}}", "quantity": 1 }
+  ]
+}
 
 ### Unknown order -> 404
 GET {{ordering}}/api/v1/orders/88888888-8888-8888-8888-888888888888
 
 ### A 502 cannot be provoked from here
 # It needs Catalog or Stock to fail mid-placement, which no request can arrange. The confirm-phase
-# policy is covered by ConfirmPhaseFailureTests, where the client seam can be scripted; the residual
-# it accepts is in docs/KNOWN-ISSUES.md under "Cross-service consistency".
+# policy is covered by ConfirmPhaseFailureTests, and the idempotency replay of a 502 by
+# OrderIdempotencyTests, both of which script the client seam. The residual both accept is in
+# docs/KNOWN-ISSUES.md under "Cross-service consistency".

@@ -43,9 +43,9 @@ shared infrastructure library — is done.
 
 Everything still deferred is deferred on purpose — see §8 and `docs/ROADMAP.md`.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **426 pass**
-(Shared 35 unit; Catalog 64 unit + 39 integration; Stock 77 unit + 61 integration; Ordering 93 unit
-+ 57 integration). Database isolation verified 22/22.
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **471 pass**
+(Shared 35 unit; Catalog 64 unit + 39 integration; Stock 77 unit + 61 integration; Ordering 120 unit
++ 75 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
 
@@ -324,7 +324,7 @@ each deferral, including the few with no assigned phase: `docs/DECISIONS.md`.
 **RabbitMQ or any broker · Outbox / Inbox · Redis · Polly or any resilience library ·
 OpenTelemetry · Serilog or shared logging infrastructure · authentication / authorization ·
 Kubernetes / Helm · API gateway (YARP) · CQRS · DDD tactical patterns · event sourcing ·
-idempotency keys · service Dockerfiles · CI pipeline.**
+service Dockerfiles · CI pipeline.**
 
 Also do not add at this size: repository or service layers, an `Application` layer, a mediator,
 `Result<T>` monads, a mapping framework, domain-event plumbing, or a `Money` value object.
@@ -332,11 +332,13 @@ Also do not add at this size: repository or service layers, an `Application` lay
 The ordering matters: retrying without idempotency keys double-reserves stock; an outbox without
 a broker is dead weight; CQRS without read pressure is ceremony.
 
-**Now permitted, because Phase 1 has started — but only the one that is done:**
-the shared infrastructure library (`AgenticShop.Shared`, §2). It exists and is extracted; nothing
-else on the list above has been unblocked. Serilog, OpenTelemetry, resilience and idempotency keys
-are all still ahead, and each still has to arrive in the order `docs/ROADMAP.md` gives — keys
-before retry, because retrying without keys double-reserves stock.
+**Now permitted, because Phase 1 has started — but only the ones that are done:**
+the shared infrastructure library (`AgenticShop.Shared`, §2) and **idempotency keys on
+`POST /orders`** (Ordering decision O17 — a required `Idempotency-Key` header, a claim committed
+before the first side effect, a completion written in the same transaction as the order). Nothing
+else on the list above has been unblocked. Serilog, OpenTelemetry and dependency-aware health checks
+are still ahead. **Resilience policies are now unblocked but not built** — the key existed to make
+them safe, so do not add retry before reading O17.
 
 ## 9. Git rules
 

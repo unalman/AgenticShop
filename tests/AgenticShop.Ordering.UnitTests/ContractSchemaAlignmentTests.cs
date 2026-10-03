@@ -140,10 +140,17 @@ public class ContractSchemaAlignmentTests
 
         var order = db.Model.FindEntityType(typeof(Order))!;
         var line = db.Model.FindEntityType(typeof(OrderLine))!;
+        var claim = db.Model.FindEntityType(typeof(OrderIdempotencyKey))!;
 
         order.FindProperty(nameof(Order.Currency))!.GetMaxLength().Should().Be(Order.CurrencyLength);
         order.FindProperty(nameof(Order.OrderNumber))!.GetMaxLength().Should().Be(Order.OrderNumberMaxLength);
         line.FindProperty(nameof(OrderLine.ProductName))!.GetMaxLength().Should().Be(OrderLine.ProductNameMaxLength);
+
+        // The key's bound is enforced twice, in OrderIdempotencyKey.Create and by this column, and
+        // the two have to agree. Widen the constant without widening the column and every key longer
+        // than the old bound reaches PostgreSQL and comes back a 22001 the caller sees as a bare 400.
+        claim.FindProperty(nameof(OrderIdempotencyKey.Key))!.GetMaxLength()
+            .Should().Be(OrderIdempotencyKey.MaxKeyLength);
     }
 
     [Fact]

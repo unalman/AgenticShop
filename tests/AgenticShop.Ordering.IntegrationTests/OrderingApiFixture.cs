@@ -86,6 +86,10 @@ public sealed class OrderingApiFixture : IAsyncLifetime
         using var scope = CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<OrderingDbContext>();
 
+        // No foreign key from order_idempotency_keys to orders — the key names an order id but
+        // deliberately does not reference it, so a stranded claim can outlive the row it points at.
+        // That means the delete order here is free, unlike order_lines → orders.
+        await db.IdempotencyKeys.ExecuteDeleteAsync();
         await db.OrderLines.ExecuteDeleteAsync();
         await db.Orders.ExecuteDeleteAsync();
 
