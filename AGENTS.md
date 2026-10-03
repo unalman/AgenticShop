@@ -26,8 +26,8 @@ one that forced the conventions to be re-derived rather than copied. **`AgenticS
 extracted in Phase 1 and is not a service: it holds the filter, the correlation middleware,
 `IRequestContract` and the exception-handler skeleton.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **483 pass**
-(Shared 35 unit; Catalog 64 unit + 39 integration; Stock 77 unit + 61 integration; Ordering 132 unit
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **484 pass**
+(Shared 35 unit; Catalog 64 unit + 39 integration; Stock 78 unit + 61 integration; Ordering 132 unit
 + 75 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries

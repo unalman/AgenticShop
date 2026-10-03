@@ -105,11 +105,13 @@ Now that a network hop exists, make its failure modes survivable and visible.
 The extraction came first on purpose: Serilog and OpenTelemetry both touch the logging arms, so
 wiring them before consolidating would have meant writing the same change three times.
 
-Also resolves, or forces a decision on, the three open observability items in `KNOWN-ISSUES.md`:
+Also resolves, or forces a decision on, the three observability items in `KNOWN-ISSUES.md`:
 the `Database.Command` Error entry for handled 409s, the fact that validation rejections are
-invisible, and the verbose `DbUpdateConcurrencyException` log line that dominates Stock's output
-under contention. The last is the cheapest, but it belongs in **all three** handlers, so it is
-naturally batched with the extraction above.
+invisible, and the verbose `DbUpdateConcurrencyException` log line that dominated Stock's output
+under contention. **The third is done** — it was the cheapest, and the extraction above is what made
+it cheap, since `Describe` now exists once in `AgenticShop.Shared` rather than in three handlers.
+The first two still wait on Serilog, because both are decisions about *what to log* rather than
+about how to format it.
 
 **Contention is the phase's real driver.** Stock measured a 40-way burst holding only 4 of 10 units
 because there is no server-side retry on `xmin` conflict (decision D9) — the measurement and the log

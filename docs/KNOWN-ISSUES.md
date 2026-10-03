@@ -35,20 +35,24 @@ the 3 validation ones were silent. "Clients are sending invalid data" is therefo
 Logging every malformed request would be noise, so this wants metrics or sampled request logging
 rather than a log line.
 
-**`DbUpdateConcurrencyException` logs the least useful line under contention.** *Low · Phase 1.*
-Each warning carries EF's full boilerplate including a documentation URL — roughly 230 characters.
-In one verified Stock run, **55 of 144 log lines** were this message and the URL appeared 55 times.
-
-`DescribeForLog` is not at fault: it walked the chain correctly and found nothing to walk to,
-because a zero-rows-affected `UPDATE` is not a SQL error and there is no inner `PostgresException`.
-Contrast the 2 unique violations, which logged `PostgresException 23505: duplicate key ...
+**`DbUpdateConcurrencyException` logs the least useful line under contention.** *Resolved
+2026-10-04.* Each warning used to carry EF's full boilerplate including a documentation URL —
+roughly 230 characters, and **55 of 144 log lines** in one verified Stock run. `DescribeForLog` was
+never at fault: it walked the chain correctly and found nothing to walk to, because a
+zero-rows-affected `UPDATE` is not a SQL error and there is no inner `PostgresException`. Contrast
+the 2 unique violations, which logged `PostgresException 23505: duplicate key ...
 (table=stock_reservations, constraint=ix_stock_reservations_order_id_stock_item_id)` — genuinely
 diagnostic.
 
-A special case in `Describe` would reduce it to something like
-`DbUpdateConcurrencyException: 0 rows affected (concurrency token mismatch)`. Not done, because the
-fix belongs in **all three** handlers — raising it rather than folding it in. Batch it with the
-Phase 1 shared-library extraction, which is now a committed item rather than an open trigger.
+The deferral reason was that the fix belonged in **all three** handlers. That stopped being true when
+the shared-library extraction landed: `Describe` now exists once, in
+`AgenticShop.Shared/Errors/ProblemDetailsExceptionHandler.cs`, so the fix was one switch arm. It
+emits `DbUpdateConcurrencyException: no rows updated, the concurrency token did not match`. Naming
+the conflicting entities would be more useful still, but `Entries` can only be populated by real EF
+internals, so that branch could not be tested without mocking EF Core — and an untested arm in the
+shared error path is the one thing this file exists to prevent.
+`AConcurrencyConflict_LogsOneConciseLineInsteadOfEFsBoilerplate` pins the result, in Stock alone,
+because that is where the volume was measured.
 
 ### Testing
 

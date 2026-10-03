@@ -296,7 +296,7 @@ Each phase adds one capability, and only once the previous phase makes it necess
 Three hosts, synchronous HTTP, one database per service, Testcontainers. All three services
 are implemented and verified: at the close of Phase 0, 426 tests, a clean build under
 `TreatWarningsAsErrors`, database isolation 22/22, and the three-host path driven by hand
-through `http/ordering.http`. **The suite is now at 483.**
+through `http/ordering.http`. **The suite is now at 484.**
 
 **Phase 1 — Reliability and observability** *(in progress)*
 Shared infrastructure library — **done** · idempotency keys on `POST /orders` — **done** ·

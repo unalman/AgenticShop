@@ -461,6 +461,10 @@ is true. Logging only the outermost exception reports nothing useful, because EF
 says only "see the inner exception for details". `PostgresException` is formatted specially to
 surface `SqlState`, `MessageText`, and `table=` / `column=` / `constraint=` when present;
 `MessageText` is used rather than `Message`, which re-prefixes the same SQLSTATE.
+`DbUpdateConcurrencyException` is the other special case, and for the opposite reason: its chain
+walk finds nothing, because a zero-rows-affected `UPDATE` is not a SQL error and there is no inner
+`PostgresException`, so EF's own ~230-character message plus documentation URL is replaced by one
+concise line. It was 55 of 144 log lines in one Stock contention run.
 
 `Microsoft.EntityFrameworkCore.Update` is set to `"None"` in every service's `appsettings.json`.
 EF logs every `SaveChanges` failure at Error with a full stack trace before rethrowing and

@@ -207,6 +207,17 @@ public abstract class ProblemDetailsExceptionHandler(ILogger logger) : IExceptio
     private static string Describe(Exception exception) => exception switch
     {
         PostgresException postgres => DescribePostgres(postgres),
+
+        // EF's own message here is roughly 230 characters of boilerplate ending in a documentation
+        // URL, and none of it is diagnostic. DescribeForLog is not at fault either: a
+        // zero-rows-affected UPDATE is not a SQL failure, so there is no inner PostgresException to
+        // walk to — the walk is correct, there is simply nothing at the end of it. Under contention
+        // this was the largest single source of log volume, 55 of 144 lines in one verified Stock
+        // run. Naming the conflicting entities would be more useful still, but Entries can only be
+        // populated by real EF internals, so that branch could not be tested without mocking EF Core.
+        DbUpdateConcurrencyException =>
+            "DbUpdateConcurrencyException: no rows updated, the concurrency token did not match",
+
         _ => $"{exception.GetType().Name}: {exception.Message}"
     };
 

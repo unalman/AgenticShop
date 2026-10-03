@@ -226,6 +226,29 @@ public class StockExceptionHandlerTests
     }
 
     [Fact]
+    public async Task AConcurrencyConflict_LogsOneConciseLineInsteadOfEFsBoilerplate()
+    {
+        // EF's message for this exception is ~230 characters ending in a documentation URL, and in
+        // one verified run 55 of 144 log lines were that message. There is no inner
+        // PostgresException to reach, because a zero-rows-affected UPDATE is not a SQL failure — so
+        // the chain walk was already correct and had nothing to find. Asserted in Stock alone, not
+        // in all three suites: the description is shared infrastructure and one specification is
+        // enough. Stock is the one place the volume was measured.
+        var outcome = await HandleAsync(new DbUpdateConcurrencyException("The row was changed."));
+
+        var entry = outcome.Log.Entries.Should().ContainSingle().Subject;
+
+        entry.Level.Should().Be(LogLevel.Warning);
+        entry.Exception.Should().BeNull("a handled rejection is not an incident, so it needs no stack trace");
+        entry.Message.Should().Contain("DbUpdateConcurrencyException: no rows updated");
+        entry.Message.Should().Contain("concurrency token did not match");
+        entry.Message.Should().NotContain("https://", "EF's documentation URL is not diagnostic content");
+        entry.Message.Should().NotContain("\n");
+        entry.Message.Should()
+            .NotContain("The row was changed.", "EF's own message must be replaced, not appended to");
+    }
+
+    [Fact]
     public async Task EveryHandledResponse_IsProblemJsonWithTheCorrelationId()
     {
         var outcome = await HandleAsync(new InvalidOperationException("boom"));
