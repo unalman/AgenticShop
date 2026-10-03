@@ -30,6 +30,17 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!--
+      Copied so CatalogLoggingTests can build a logger from the *shipped* configuration instead of
+      a hand-written mirror of it. A mirror is what let an invalid level name sit in appsettings.json
+      undetected; reading the real file means the test fails when the file is wrong.
+    -->
+    <None Include="..\..\src\AgenticShop.Catalog\appsettings.json" Link="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\AgenticShop.Catalog\AgenticShop.Catalog.csproj" />
   </ItemGroup>
 

@@ -26,8 +26,8 @@ one that forced the conventions to be re-derived rather than copied. **`AgenticS
 extracted in Phase 1 and is not a service: it holds the filter, the correlation middleware,
 `IRequestContract` and the exception-handler skeleton.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **484 pass**
-(Shared 35 unit; Catalog 64 unit + 39 integration; Stock 78 unit + 61 integration; Ordering 132 unit
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **492 pass**
+(Shared 35 unit; Catalog 72 unit + 39 integration; Stock 78 unit + 61 integration; Ordering 132 unit
 + 75 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
@@ -207,8 +207,8 @@ each deferral, including the few with no assigned phase: `docs/DECISIONS.md`.
 
 **Still deferred — do not add:**
 
-**RabbitMQ or any broker · Outbox / Inbox · Redis · OpenTelemetry · Serilog or shared logging
-infrastructure · authentication / authorization · Kubernetes / Helm · API gateway (YARP) · CQRS ·
+**RabbitMQ or any broker · Outbox / Inbox · Redis · OpenTelemetry · Serilog outside Catalog ·
+authentication / authorization · Kubernetes / Helm · API gateway (YARP) · CQRS ·
 DDD tactical patterns · event sourcing · service Dockerfiles · CI pipeline.**
 
 Also do not add at this size: repository or service layers, an `Application` layer, a mediator,
@@ -220,12 +220,16 @@ a broker is dead weight; CQRS without read pressure is ceremony.
 **Now permitted, because Phase 1 has started — but only the ones that are done:**
 the shared infrastructure library (`AgenticShop.Shared`, §2), **idempotency keys on
 `POST /orders`** (Ordering decision O17 — a required `Idempotency-Key` header, a claim committed
-before the first side effect, a completion written in the same transaction as the order), and
+before the first side effect, a completion written in the same transaction as the order),
 **resilience policies on Ordering's typed clients** (Ordering decision O18 — timeout, retry and a
-circuit breaker, with retry enabled per request and reserve exempt). Nothing else on the list above
-has been unblocked. Serilog, OpenTelemetry and dependency-aware health checks are still ahead.
-**Do not extend retry to another outbound call before reading O18** — the exemption on reserve is
-what stops a retry from stranding a hold and reporting it as out-of-stock.
+circuit breaker, with retry enabled per request and reserve exempt), and **Serilog in Catalog only**
+(`docs/DECISIONS.md` → "Serilog, adopted in Catalog first"). Nothing else on the list above has been
+unblocked. OpenTelemetry and dependency-aware health checks are still ahead, and so is Serilog for
+Stock and Ordering — do not migrate them yet. **Migrating one means reading that decision first:**
+Serilog has no `None` log level, and carrying Stock's or Ordering's existing `"None"` across verbatim
+stops the host from starting. **Do not extend retry to another outbound call before reading O18** —
+the exemption on reserve is what stops a retry from stranding a hold and reporting it as
+out-of-stock.
 
 ## 9. Git rules
 

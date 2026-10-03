@@ -93,7 +93,13 @@ Now that a network hop exists, make its failure modes survivable and visible.
 
   Note also what this did **not** fix: the contention measurement below. Stock's `xmin`-conflict 409
   is a normal 4xx and is not retried, so retry at the HTTP layer leaves it untouched.
-- Serilog structured logging
+- ~~Serilog structured logging.~~ **Done in Catalog**, the reference implementation; Stock and
+  Ordering still use the built-in providers. `docs/DECISIONS.md` → "Serilog, adopted in Catalog
+  first". Both observability items that waited on it are closed in Catalog as a result, and the
+  `Database.Command` one turned out to have been **diagnosed wrongly**: the plan was a filter that
+  inspected the exception, and EF Core attaches no exception to that event, so no filter could ever
+  have worked. The category is silenced by level instead, extending the decision already taken for
+  `Microsoft.EntityFrameworkCore.Update`.
 - **OpenTelemetry** distributed tracing across the three hosts — the moment "distributed" stops
   being theoretical. Derive the correlation id from `Activity.Current?.TraceId` here, or there
   will be two parallel correlation concepts
@@ -108,10 +114,13 @@ wiring them before consolidating would have meant writing the same change three 
 Also resolves, or forces a decision on, the three observability items in `KNOWN-ISSUES.md`:
 the `Database.Command` Error entry for handled 409s, the fact that validation rejections are
 invisible, and the verbose `DbUpdateConcurrencyException` log line that dominated Stock's output
-under contention. **The third is done** — it was the cheapest, and the extraction above is what made
-it cheap, since `Describe` now exists once in `AgenticShop.Shared` rather than in three handlers.
-The first two still wait on Serilog, because both are decisions about *what to log* rather than
-about how to format it.
+under contention. **All three are now resolved** — the third by the shared-handler fix the extraction
+made cheap, the first two by Catalog's Serilog migration. The first two remain open for Stock and
+Ordering, which still use the built-in providers.
+
+What the migration did *not* do is add per-field detail to a validation rejection: the request log
+says that a request was rejected and where, not which field failed. That is deliberate, and recorded
+as an accepted residual rather than left implicit.
 
 **Contention is the phase's real driver.** Stock measured a 40-way burst holding only 4 of 10 units
 because there is no server-side retry on `xmin` conflict (decision D9) — the measurement and the log

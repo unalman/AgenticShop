@@ -181,6 +181,7 @@ src/AgenticShop.<Service>/
 ├── Endpoints/              one static class per resource
 ├── Errors/                 <Service>ExceptionHandler : ProblemDetailsExceptionHandler
 ├── Clients/                orchestrators only: an interface + typed HttpClient per downstream
+├── Logging/                Catalog only, for now: what Serilog configuration cannot express
 └── Properties/launchSettings.json
 ```
 
@@ -466,7 +467,13 @@ walk finds nothing, because a zero-rows-affected `UPDATE` is not a SQL error and
 `PostgresException`, so EF's own ~230-character message plus documentation URL is replaced by one
 concise line. It was 55 of 144 log lines in one Stock contention run.
 
-`Microsoft.EntityFrameworkCore.Update` is set to `"None"` in every service's `appsettings.json`.
+`Microsoft.EntityFrameworkCore.Update` is silenced in every service's `appsettings.json` — as
+`"None"` in Stock and Ordering, and as `"Fatal"` in Catalog, because Catalog runs Serilog and
+Serilog's `LogEventLevel` has no `None` member. Catalog also silences
+`Microsoft.EntityFrameworkCore.Database.Command`, the sibling category that logs a failed command at
+Error with the SQL text; the reasoning, and why no filter can distinguish a handled failure from an
+unhandled one, are in `KNOWN-ISSUES.md` → Observability.
+
 EF logs every `SaveChanges` failure at Error with a full stack trace before rethrowing and
 cannot know whether it was handled, so a routine duplicate-key 409 used to emit roughly 40
 lines. Severity classification belongs to the handler because only it knows whether the error

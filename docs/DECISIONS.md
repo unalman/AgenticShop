@@ -288,14 +288,22 @@ rethrowing, and cannot know whether it was handled. A routine duplicate-key 409 
 40 lines; a genuine failure emitted two Error entries.
 
 **Decision.** Set the category to `"None"` in `appsettings.json` (not the Development file —
-the reasoning is environment-independent).
+the reasoning is environment-independent). Catalog now says `"Fatal"` instead, because Serilog's
+`LogEventLevel` has no `None` member and an unrecognised name is parsed as a level switch, which
+throws at host build time; `Fatal` is the effective equivalent, as EF Core never logs there.
 
 **Why this is not a loss.** The handler logs unhandled failures at Error *with* the exception
 object, so the inner chain and stack traces survive. Only the component that knows whether an
 error was handled should classify its severity.
 
 **Rejected alternative.** A custom `ILoggerProvider` filtering by exception type. That is real
-machinery, and Phase 1's Serilog work replaces it.
+machinery, and this entry used to say Phase 1's Serilog work would replace it. **It did not, and it
+could not** — the premise was wrong. A Serilog `ILogEventFilter` was built to inspect the exception
+on EF Core's sibling `Database.Command` entry and suppress only the failures the handler answers as
+4xx; its tests passed and it never fired, because **EF Core attaches no exception to that event**.
+The information the filter needed does not exist at the moment the event is written, and cannot: EF
+logs before the handler runs. See `KNOWN-ISSUES.md` → Observability, which records the correction
+and the level-based answer that replaced it.
 
 ### Log the whole exception chain for handled rejections
 
@@ -379,7 +387,48 @@ validated nothing below the first level.
 ### Built-in logging, no Serilog yet
 
 Sufficient for one service, and its configuration is about to change anyway. **Revisit:**
-Phase 1.
+Phase 1. **Revisited and adopted — in Catalog only, 2026-10-04.** See the next entry; Stock and
+Ordering still use the built-in providers.
+
+### Serilog, adopted in Catalog first
+
+**Context.** Phase 1's logging item. Two observability gaps were waiting on it — EF Core's
+`Database.Command` Error entry for a handled 409, and validation rejections leaving no trace at all
+— and both were explicitly deferred to "decide with Serilog".
+
+**Decision.** `Serilog.AspNetCore` in Catalog only, as the reference implementation, leaving Stock
+and Ordering untouched. Three pieces: a `Serilog` configuration section replacing `Logging`;
+`CatalogLogging`, holding what configuration cannot express; and request logging in the pipeline.
+
+**What it bought.** The shared handler's message templates already carried named placeholders, so
+its `{StatusCode}`, `{Method}`, `{Path}` and `{CorrelationId}` became structured properties with no
+change to the handler — the migration is additive there. Request logging is what closed the
+validation gap: one structured line per completed request, so a 400 from the filter is now visible
+along with its path. The ambient correlation id now reaches EF Core's lines too, which carry none of
+their own.
+
+**Why request logging makes no severity claim.** The library returns Error for a status above 499 or
+a non-null exception. That would put a second Error beside the one the handler writes, so
+`CatalogLogging.RequestLogLevel` returns Information unconditionally. Severity stays with the single
+component that knows whether a failure was handled — the same principle that silenced
+`Microsoft.EntityFrameworkCore.Update`. This matters more once the policy reaches Ordering, whose
+**handled** 502 would otherwise be logged at Error by the access log.
+
+**The trap, worth recording because it is a startup crash.** Serilog's `LogEventLevel` has no `None`
+member — that is a `Microsoft.Extensions.Logging.LogLevel` value — and an unrecognised name in
+`MinimumLevel:Override` is parsed as a level *switch*, which throws while the host builds. Carrying
+the existing `"None"` across verbatim therefore stopped Catalog from starting. It was caught by a
+configuration test, not by the build. Stock and Ordering still say `"None"` and are correct to.
+
+**What was deliberately not touched.** The shared handler, the shared validation filter and the
+shared correlation middleware. Changing any of them would have changed Stock's and Ordering's
+behaviour, which this item was scoped not to do.
+
+**On replication.** `CatalogLogging` is named for Catalog but contains nothing Catalog-specific: the
+property name, the output template and the access-log level policy are the same in all three. When
+Stock and Ordering migrate it should move to `AgenticShop.Shared` rather than be copied — the same
+call the shared-library extraction made, and for the same reason. The two EF level overrides travel
+with it, and both need the `"None"` → `"Fatal"` change.
 
 ### Correlation id, not OpenTelemetry
 
@@ -497,7 +546,6 @@ Each was considered and declined, with the phase that would justify it:
 | Outbox / Inbox | An outbox makes "write a row and publish an event" atomic; there are no events. Note the design is already outbox-ready: every write path is a single `SaveChangesAsync`, so an entity and an outbox row would already be atomic. Stock's reserve commits the counter and the reservation row together, which is the same property |
 | Redis | No cache pressure, no distributed idempotency store to hold |
 | OpenTelemetry | A correlation id crosses the hop and appears in both logs, which is enough for three services and one synchronous path. A span tree answers "which call was slow", and nothing is slow yet |
-| Serilog | Built-in logging suffices and the configuration is about to change |
 | Authentication / authorization | Deferred by the project owner. Adding it later needs a customer identity column on `Order` plus a cross-cutting policy — a migration and a concern, which is why no placeholder seam was pre-built |
 | Kubernetes / Helm, YARP gateway | Phase 4 |
 | CQRS, DDD tactical patterns, event sourcing | No read pressure, no aggregate boundaries to enforce |
@@ -517,3 +565,9 @@ O18 is also where the deferral's stated reasoning turned out to be incomplete �
 idempotence was necessary but not sufficient, because Stock reports a duplicate reserve as a 409 that
 Ordering's client reads as a refusal. Stock's own D9 (no server-side retry on `xmin` conflict) is
 unchanged, and the contention it produces is still open.
+
+**Serilog was on this list until Phase 1 half-closed it.** Adopted in Catalog on 2026-10-04 as the
+reference implementation; Stock and Ordering still use the built-in providers, so the deferral is
+partly live rather than finished. See "Serilog, adopted in Catalog first" above — including the
+`"None"` level that crashes a Serilog host at startup, which is the one thing a replicating service
+must not carry across verbatim.

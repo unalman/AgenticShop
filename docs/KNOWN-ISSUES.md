@@ -16,24 +16,49 @@ observability gap · **Low** hygiene · **Info** a trade-off worth knowing.
 ### Observability
 
 **`Microsoft.EntityFrameworkCore.Database.Command[20102]` logs at Error for a handled 409.**
-*Medium · Phase 1.* `Microsoft.EntityFrameworkCore.Update` is silenced in all three services, but this
-separate category still emits four lines including the failing SQL for a routine duplicate key.
-Category-level filtering cannot distinguish handled from unhandled failures — only a filter
-inspecting the exception can. Silencing this category too would cost the SQL text for genuine
-failures, which is the single most useful thing when diagnosing an EF translation bug.
-**Decide with Serilog in Phase 1**, not before.
+*Resolved in Catalog 2026-10-04 · still open for Stock and Ordering.* Catalog silences the category
+with a `Fatal` level override; the other two still use the built-in providers and still emit it.
+
+**The documented diagnosis was wrong, and the correction matters more than the fix.** This entry
+claimed that "category-level filtering cannot distinguish handled from unhandled failures — only a
+filter inspecting the exception can." It cannot. A Serilog `ILogEventFilter` was written to do
+exactly that, its tests passed, and a live duplicate-SKU 409 still logged at Error — because
+**EF Core attaches no exception to this event at all**. It logs from inside `RelationalCommand` and
+rethrows separately, so the entry carries the SQL text and nothing else. Verified by reading the
+real log line; the rendered `{Exception}` segment was empty.
+
+Nothing else on the event distinguishes the cases either, and nothing could: EF writes the entry
+before the handler has run, so whether the failure will be handled does not exist yet. The choice is
+therefore binary — silence the category or keep a false Error on every duplicate key — and it was
+silenced, extending the reasoning already accepted for `Microsoft.EntityFrameworkCore.Update`: only
+the component that knows whether an error was handled should classify its severity.
+
+**What that costs, stated plainly.** The literal SQL and parameter list for a genuine failure. Less
+than the old text implied: the handler logs every failure at Error with the full exception chain, and
+its `PostgresException` formatting already surfaces `SqlState` plus `table=`, `column=` and
+`constraint=`. The old text also justified keeping the category by "diagnosing an EF translation
+bug", but a translation failure throws before any command executes and is logged under
+`Microsoft.EntityFrameworkCore.Query`, not here.
 
 *Narrower than first thought.* In Stock's full verification run this category fired **once** — on
 the deliberate duplicate reserve. The 55 `xmin` conflicts produced no SQL-level error at all,
 because a zero-rows-affected `UPDATE` is not a SQL failure. So this affects unique and CHECK
-violations, not concurrency conflicts, which lowers its priority.
+violations, not concurrency conflicts, which lowers its priority for the two services still carrying
+it.
 
-**Validation rejections are not logged at all.** *Medium · Phase 1.*
-`DataAnnotationValidationFilter` returns a result rather than throwing, so it never reaches the
-handler. In a verified Catalog smoke run, 8 client-error responses produced 5 handler warnings —
-the 3 validation ones were silent. "Clients are sending invalid data" is therefore invisible.
-Logging every malformed request would be noise, so this wants metrics or sampled request logging
-rather than a log line.
+**Validation rejections are not logged at all.** *Resolved in Catalog 2026-10-04 · still open for
+Stock and Ordering.* `DataAnnotationValidationFilter` returns a result rather than throwing, so it
+never reaches the handler; in a verified Catalog smoke run, 8 client-error responses produced 5
+handler warnings and the 3 validation ones were silent. Catalog now runs Serilog request logging, so
+each rejected request produces one structured line carrying its status and path — the "sampled
+request logging" this entry asked for, rather than a line per rejected field.
+
+**Residual, accepted.** The line says *that* a request was rejected with 400 and where, not *which
+field* failed. That detail is in the `ValidationProblemDetails` response body and is deliberately not
+logged: a request with twenty bad fields would otherwise produce twenty lines, and the malformed
+traffic this exists to reveal is exactly the traffic that would generate them. Distinguishing a
+validation 400 from a handler 400 needs no extra field — the handler logs its own Warning, so a 400
+with no accompanying Warning came from the filter.
 
 **`DbUpdateConcurrencyException` logs the least useful line under contention.** *Resolved
 2026-10-04.* Each warning used to carry EF's full boilerplate including a documentation URL —
