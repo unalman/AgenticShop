@@ -22,6 +22,7 @@
     -->
     <Using Include="Microsoft.AspNetCore.Builder" />
     <Using Include="Microsoft.AspNetCore.Http" />
+    <Using Include="Microsoft.Extensions.Configuration" />
     <Using Include="Microsoft.Extensions.DependencyInjection" />
     <Using Include="Microsoft.Extensions.Logging" />
   </ItemGroup>
@@ -35,6 +36,13 @@
     -->
     <PackageReference Include="Microsoft.EntityFrameworkCore" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+    <!--
+      Logging/ServiceLogging.cs configures a LoggerConfiguration and Middleware pushes the
+      correlation id into Serilog's ambient context, so the shared project needs Serilog itself.
+      Each service also declares it, because each calls UseSerilog and UseSerilogRequestLogging
+      directly; the version lives once in Directory.Packages.props, so the duplication cannot drift.
+    -->
+    <PackageReference Include="Serilog.AspNetCore" />
   </ItemGroup>
 
 </Project>

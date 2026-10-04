@@ -51,6 +51,28 @@ stock is held for the duration in both cases — but it is a real change and not
 still no bulkhead, so nothing caps concurrent placements; the standard resilience pipeline ships one
 and it was deliberately not enabled.
 
+*Measured 2026-10-04*, with Catalog not running at all: **14.3 s** end to end for one placement. Each
+of the three attempts cost ~4.1 s rather than failing instantly, which on Windows is what a connect to
+`localhost` with no listener does — `::1` is tried before `127.0.0.1`. So the per-attempt cost of an
+*absent* dependency is platform-dependent and nowhere near zero, and the 10 s attempt timeout is a
+ceiling rather than the typical case. Worth remembering before reading a slow placement as a slow
+dependency.
+
+**A dead dependency fills the log.** *Low · observed 2026-10-04.* One placement against an absent
+Catalog produced **seven lines**: four Polly Warnings (an "Execution attempt" and an "OnRetry" event
+per retry), a Polly **Error** for the final attempt, the handler's **Error**, and the access-log
+Information line — most of them carrying a full stack trace. Two Errors for one classified failure is
+one too many, and the Polly one is the duplicate: the handler's Error already names the request, the
+status and the cause.
+
+Left as it is, deliberately. The resilience category is not silenced — a retry that recovered is worth
+seeing and is not an error — and `LoggingConfigurationTests.TheResiliencePipelineIsNotSilenced`
+asserts that. Trimming only the final-attempt Error would need a filter keyed on Polly's event, which
+is the same shape as the EF filter that could not work; unlike that one it is feasible, because Polly
+does attach a result to its events. Worth doing if an outage ever makes the volume hurt. Note that
+the access log is already excluded from this: `ServiceLogging.RequestLogLevel` keeps it at
+Information, so a 502 does not add a third Error.
+
 **Reserve is exempt from retry, and that exemption is load-bearing.** *Info.* A retried reserve whose
 first attempt committed would be answered 409 by Stock's unique index, and the client reads 409 as a
 refusal — stranding the first hold and reporting stock as unavailable when it was taken. See O18.

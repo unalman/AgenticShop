@@ -296,21 +296,20 @@ Each phase adds one capability, and only once the previous phase makes it necess
 Three hosts, synchronous HTTP, one database per service, Testcontainers. All three services
 are implemented and verified: at the close of Phase 0, 426 tests, a clean build under
 `TreatWarningsAsErrors`, database isolation 22/22, and the three-host path driven by hand
-through `http/ordering.http`. **The suite is now at 492.**
+through `http/ordering.http`. **The suite is now at 499.**
 
 **Phase 1 — Reliability and observability** *(in progress)*
 Shared infrastructure library — **done** · idempotency keys on `POST /orders` — **done** ·
 retry/circuit-breaker/timeout policies on Ordering's typed clients — **done** · Serilog structured
-logging — **done in Catalog**, the reference implementation, with Stock and Ordering still to
-migrate · OpenTelemetry distributed tracing · dependency-aware health checks · Dockerfiles and a
-`full` compose profile · CI. Retry is driven by a measured problem: a 40-way burst against 10 units
-of stock held only 4, because `xmin` conflicts are not retried. Idempotency keys came first, because
-retrying without them double-reserves stock — and they closed the largest residual the repository
-had, since a retried `POST /orders` used to create a second order and a second set of holds. Note
-that the HTTP retry now in place does **not** address that burst: Stock's conflict 409 is a normal
-4xx and is not retried. Reserve is also exempt from retry, because a retried reserve whose first
-attempt committed is answered 409 and would be misread as out-of-stock — see
-`src/AgenticShop.Ordering/docs/DECISIONS.md` → O18.
+logging — **done in all three services** · OpenTelemetry distributed tracing · dependency-aware
+health checks · Dockerfiles and a `full` compose profile · CI. Retry is driven by a measured problem:
+a 40-way burst against 10 units of stock held only 4, because `xmin` conflicts are not retried.
+Idempotency keys came first, because retrying without them double-reserves stock — and they closed
+the largest residual the repository had, since a retried `POST /orders` used to create a second order
+and a second set of holds. Note that the HTTP retry now in place does **not** address that burst:
+Stock's conflict 409 is a normal 4xx and is not retried. Reserve is also exempt from retry, because a
+retried reserve whose first attempt committed is answered 409 and would be misread as out-of-stock —
+see `src/AgenticShop.Ordering/docs/DECISIONS.md` → O18.
 
 **Phase 2 — Asynchronous messaging** ← the inflection point
 RabbitMQ · replace synchronous reservation with `OrderPlaced` / `StockReserved`

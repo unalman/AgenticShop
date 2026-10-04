@@ -288,9 +288,9 @@ rethrowing, and cannot know whether it was handled. A routine duplicate-key 409 
 40 lines; a genuine failure emitted two Error entries.
 
 **Decision.** Set the category to `"None"` in `appsettings.json` (not the Development file —
-the reasoning is environment-independent). Catalog now says `"Fatal"` instead, because Serilog's
-`LogEventLevel` has no `None` member and an unrecognised name is parsed as a level switch, which
-throws at host build time; `Fatal` is the effective equivalent, as EF Core never logs there.
+the reasoning is environment-independent). All three services now say `"Fatal"` instead, because
+Serilog's `LogEventLevel` has no `None` member and an unrecognised name is parsed as a level switch,
+which throws at host build time; `Fatal` is the effective equivalent, as EF Core never logs there.
 
 **Why this is not a loss.** The handler logs unhandled failures at Error *with* the exception
 object, so the inner chain and stack traces survive. Only the component that knows whether an
@@ -387,8 +387,7 @@ validated nothing below the first level.
 ### Built-in logging, no Serilog yet
 
 Sufficient for one service, and its configuration is about to change anyway. **Revisit:**
-Phase 1. **Revisited and adopted — in Catalog only, 2026-10-04.** See the next entry; Stock and
-Ordering still use the built-in providers.
+Phase 1. **Revisited and adopted in all three services, 2026-10-04.** See the next entry.
 
 ### Serilog, adopted in Catalog first
 
@@ -396,39 +395,58 @@ Ordering still use the built-in providers.
 `Database.Command` Error entry for a handled 409, and validation rejections leaving no trace at all
 — and both were explicitly deferred to "decide with Serilog".
 
-**Decision.** `Serilog.AspNetCore` in Catalog only, as the reference implementation, leaving Stock
-and Ordering untouched. Three pieces: a `Serilog` configuration section replacing `Logging`;
-`CatalogLogging`, holding what configuration cannot express; and request logging in the pipeline.
+**Decision.** `Serilog.AspNetCore` in all three services. Catalog went first as the reference
+implementation, was reviewed, and the rest followed the same day; the helper that began as Catalog's
+`CatalogLogging` now lives in `AgenticShop.Shared/Logging/ServiceLogging.cs`, because it turned out
+to contain nothing Catalog-specific. Three pieces per service: a `Serilog` configuration section
+replacing `Logging`, `AddServiceLogging`, and request logging in the pipeline.
 
 **What it bought.** The shared handler's message templates already carried named placeholders, so
 its `{StatusCode}`, `{Method}`, `{Path}` and `{CorrelationId}` became structured properties with no
 change to the handler — the migration is additive there. Request logging is what closed the
 validation gap: one structured line per completed request, so a 400 from the filter is now visible
-along with its path. The ambient correlation id now reaches EF Core's lines too, which carry none of
-their own.
+along with its path.
 
 **Why request logging makes no severity claim.** The library returns Error for a status above 499 or
 a non-null exception. That would put a second Error beside the one the handler writes, so
-`CatalogLogging.RequestLogLevel` returns Information unconditionally. Severity stays with the single
-component that knows whether a failure was handled — the same principle that silenced
-`Microsoft.EntityFrameworkCore.Update`. This matters more once the policy reaches Ordering, whose
-**handled** 502 would otherwise be logged at Error by the access log.
+`ServiceLogging.RequestLogLevel` returns Information unconditionally. Severity stays with the single
+component that classified the failure — the same principle that silenced
+`Microsoft.EntityFrameworkCore.Update`.
+
+One correction this owed to observation rather than reasoning. The first draft justified the override
+by saying Ordering's **handled** 502 would otherwise be logged at Error "beside the handler's single
+Warning". Running Ordering against a dead Catalog showed the handler logging that 502 at **Error**,
+because its split is `statusCode >= 500`, not handled-versus-unhandled. The override is still right —
+it removes a duplicate — but for a plainer reason: the handler already said it, at the level it
+chose.
 
 **The trap, worth recording because it is a startup crash.** Serilog's `LogEventLevel` has no `None`
 member — that is a `Microsoft.Extensions.Logging.LogLevel` value — and an unrecognised name in
 `MinimumLevel:Override` is parsed as a level *switch*, which throws while the host builds. Carrying
 the existing `"None"` across verbatim therefore stopped Catalog from starting. It was caught by a
-configuration test, not by the build. Stock and Ordering still say `"None"` and are correct to.
+configuration test, not by the build. All three services now say `"Fatal"`, the effective equivalent
+since EF Core never logs there.
 
-**What was deliberately not touched.** The shared handler, the shared validation filter and the
-shared correlation middleware. Changing any of them would have changed Stock's and Ordering's
-behaviour, which this item was scoped not to do.
+**The one shared component that did change.** The plan was to touch nothing in `AgenticShop.Shared`,
+and the handler and the validation filter were indeed left alone. The correlation middleware was not:
+it now pushes the resolved id into Serilog's ambient context, which is what makes
+`ARCHITECTURE.md` §4.8's claim that the id is "written to every log line for the request" literally
+true — EF Core's lines carry no id of their own. Doing it inside the middleware rather than in a
+second one is deliberate. `UseCorrelationId` is registered first, so its scope necessarily wraps
+everything downstream; a separate push registered *after* the request logger would already be popped
+by the time the completion event is written, and the id would be missing from exactly the line that
+summarises the request. That was Catalog's first shape, and the ordering constraint had to be
+documented to keep it correct. Folding it in removed the constraint instead.
 
-**On replication.** `CatalogLogging` is named for Catalog but contains nothing Catalog-specific: the
-property name, the output template and the access-log level policy are the same in all three. When
-Stock and Ordering migrate it should move to `AgenticShop.Shared` rather than be copied — the same
-call the shared-library extraction made, and for the same reason. The two EF level overrides travel
-with it, and both need the `"None"` → `"Fatal"` change.
+The cost is that `AgenticShop.Shared` now depends on Serilog. Accepted: all three services use it,
+and the push is inert where Serilog is not the active provider.
+
+**Verification.** Each service's unit tests build a logger from that service's *shipped*
+`appsettings.json`, copied to the test output, rather than a mirror of it — the mirror is what let
+the `"None"` crash hide. The shared policy is specified once, in `AgenticShop.Shared.UnitTests`,
+including that the ambient id is popped when the request ends. Catalog and Stock were also run
+against the real database: a handled 409 produces one Warning and no Error, and a validation 400
+produces a request line where it previously produced nothing.
 
 ### Correlation id, not OpenTelemetry
 
@@ -566,8 +584,6 @@ idempotence was necessary but not sufficient, because Stock reports a duplicate 
 Ordering's client reads as a refusal. Stock's own D9 (no server-side retry on `xmin` conflict) is
 unchanged, and the contention it produces is still open.
 
-**Serilog was on this list until Phase 1 half-closed it.** Adopted in Catalog on 2026-10-04 as the
-reference implementation; Stock and Ordering still use the built-in providers, so the deferral is
-partly live rather than finished. See "Serilog, adopted in Catalog first" above — including the
-`"None"` level that crashes a Serilog host at startup, which is the one thing a replicating service
-must not carry across verbatim.
+**Serilog was on this list until Phase 1 closed it.** Adopted on 2026-10-04 — in Catalog first as
+the reference implementation, then in Stock and Ordering the same day. See "Serilog, adopted in
+Catalog first" above, including the `"None"` level that crashes a Serilog host at startup.

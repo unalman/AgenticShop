@@ -24,10 +24,10 @@ reference every convention originates from, **Stock** follows it with the delibe
 recorded in §10, **Ordering** is the orchestrator — the only service with outbound calls, and the
 one that forced the conventions to be re-derived rather than copied. **`AgenticShop.Shared`** was
 extracted in Phase 1 and is not a service: it holds the filter, the correlation middleware,
-`IRequestContract` and the exception-handler skeleton.
+`IRequestContract`, the logging configuration and the exception-handler skeleton.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **492 pass**
-(Shared 35 unit; Catalog 72 unit + 39 integration; Stock 78 unit + 61 integration; Ordering 132 unit
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **499 pass**
+(Shared 39 unit; Catalog 67 unit + 39 integration; Stock 81 unit + 61 integration; Ordering 137 unit
 + 75 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
@@ -131,8 +131,8 @@ otherwise guess wrong.
   anything else → 500. **Do not add an arm for `23514`** — a CHECK restates an invariant the entity
   already guards, so a violation means *our* code has a bug and belongs in the 5xx bucket. **No
   exception message reaches the client:** `detail` is `null` for domain 400s and all 500s, built
-  from typed properties for domain 409s. **The handler decides severity:** handled rejections log
-  one `Warning` with no exception object, unhandled failures log `Error` *with* it.
+  from typed properties for domain 409s. **The handler decides severity:** a 4xx logs one `Warning`
+  with no exception object, a 5xx logs `Error` *with* it.
 - **Correlation ID (§4.8).** Use `CorrelationIdMiddleware.HeaderName`, never the literal string.
   **Inbound values are untrusted:** accept 1–128 characters of ASCII letters, digits and `-_.`,
   otherwise **replace** with a minted id — never reject the request. Registered first, before
@@ -207,9 +207,9 @@ each deferral, including the few with no assigned phase: `docs/DECISIONS.md`.
 
 **Still deferred — do not add:**
 
-**RabbitMQ or any broker · Outbox / Inbox · Redis · OpenTelemetry · Serilog outside Catalog ·
-authentication / authorization · Kubernetes / Helm · API gateway (YARP) · CQRS ·
-DDD tactical patterns · event sourcing · service Dockerfiles · CI pipeline.**
+**RabbitMQ or any broker · Outbox / Inbox · Redis · OpenTelemetry · authentication / authorization ·
+Kubernetes / Helm · API gateway (YARP) · CQRS · DDD tactical patterns · event sourcing · service
+Dockerfiles · CI pipeline.**
 
 Also do not add at this size: repository or service layers, an `Application` layer, a mediator,
 `Result<T>` monads, a mapping framework, domain-event plumbing, or a `Money` value object.
@@ -222,14 +222,12 @@ the shared infrastructure library (`AgenticShop.Shared`, §2), **idempotency key
 `POST /orders`** (Ordering decision O17 — a required `Idempotency-Key` header, a claim committed
 before the first side effect, a completion written in the same transaction as the order),
 **resilience policies on Ordering's typed clients** (Ordering decision O18 — timeout, retry and a
-circuit breaker, with retry enabled per request and reserve exempt), and **Serilog in Catalog only**
-(`docs/DECISIONS.md` → "Serilog, adopted in Catalog first"). Nothing else on the list above has been
-unblocked. OpenTelemetry and dependency-aware health checks are still ahead, and so is Serilog for
-Stock and Ordering — do not migrate them yet. **Migrating one means reading that decision first:**
-Serilog has no `None` log level, and carrying Stock's or Ordering's existing `"None"` across verbatim
-stops the host from starting. **Do not extend retry to another outbound call before reading O18** —
-the exemption on reserve is what stops a retry from stranding a hold and reporting it as
-out-of-stock.
+circuit breaker, with retry enabled per request and reserve exempt), and **Serilog in all three
+services** (`docs/DECISIONS.md` → "Serilog, adopted in Catalog first", configured once in
+`AgenticShop.Shared/Logging`). Nothing else on the list above has been unblocked. OpenTelemetry and
+dependency-aware health checks are still ahead. **Do not extend retry to another outbound call before
+reading O18** — the exemption on reserve is what stops a retry from stranding a hold and reporting it
+as out-of-stock.
 
 ## 9. Git rules
 

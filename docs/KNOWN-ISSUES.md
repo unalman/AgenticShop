@@ -16,8 +16,7 @@ observability gap · **Low** hygiene · **Info** a trade-off worth knowing.
 ### Observability
 
 **`Microsoft.EntityFrameworkCore.Database.Command[20102]` logs at Error for a handled 409.**
-*Resolved in Catalog 2026-10-04 · still open for Stock and Ordering.* Catalog silences the category
-with a `Fatal` level override; the other two still use the built-in providers and still emit it.
+*Resolved 2026-10-04.* All three services silence the category with a `Fatal` level override.
 
 **The documented diagnosis was wrong, and the correction matters more than the fix.** This entry
 claimed that "category-level filtering cannot distinguish handled from unhandled failures — only a
@@ -43,15 +42,15 @@ bug", but a translation failure throws before any command executes and is logged
 *Narrower than first thought.* In Stock's full verification run this category fired **once** — on
 the deliberate duplicate reserve. The 55 `xmin` conflicts produced no SQL-level error at all,
 because a zero-rows-affected `UPDATE` is not a SQL failure. So this affects unique and CHECK
-violations, not concurrency conflicts, which lowers its priority for the two services still carrying
-it.
+violations, not concurrency conflicts — fewer lines than the `DbUpdateConcurrencyException` item
+below, but each one a false alarm in the log an operator pages from.
 
-**Validation rejections are not logged at all.** *Resolved in Catalog 2026-10-04 · still open for
-Stock and Ordering.* `DataAnnotationValidationFilter` returns a result rather than throwing, so it
-never reaches the handler; in a verified Catalog smoke run, 8 client-error responses produced 5
-handler warnings and the 3 validation ones were silent. Catalog now runs Serilog request logging, so
-each rejected request produces one structured line carrying its status and path — the "sampled
-request logging" this entry asked for, rather than a line per rejected field.
+**Validation rejections are not logged at all.** *Resolved 2026-10-04.*
+`DataAnnotationValidationFilter` returns a result rather than throwing, so it never reaches the
+handler; in a verified Catalog smoke run, 8 client-error responses produced 5 handler warnings and
+the 3 validation ones were silent. All three services now run Serilog request logging, so each
+rejected request produces one structured line carrying its status and path — the "sampled request
+logging" this entry asked for, rather than a line per rejected field.
 
 **Residual, accepted.** The line says *that* a request was rejected with 400 and where, not *which
 field* failed. That detail is in the `ValidationProblemDetails` response body and is deliberately not
@@ -59,6 +58,20 @@ logged: a request with twenty bad fields would otherwise produce twenty lines, a
 traffic this exists to reveal is exactly the traffic that would generate them. Distinguishing a
 validation 400 from a handler 400 needs no extra field — the handler logs its own Warning, so a 400
 with no accompanying Warning came from the filter.
+
+**The 5xx log line says "Unhandled exception" even when the handler handled it.** *Low · observed
+2026-10-04.* `ProblemDetailsExceptionHandler` splits severity on `statusCode >= 500`, so Ordering's
+classified **502** for a dependency that failed is logged at Error with the message
+`"Unhandled exception on POST /api/v1/orders"`. The level is right — a dependency being down is worth
+paging on — but the wording contradicts it, and it is the only place in the repository where
+"handled" and "5xx" come apart. Found by running Ordering against a dead Catalog and reading the
+line; the same run corrected a draft of the Serilog decision that had assumed the handler logged a
+502 at Warning.
+
+Not changed, because the message is shared and three services' handler tests are built around the
+current severity rules. The fix is one string — `"Unhandled exception"` to something like
+`"Request failed with {StatusCode}"` — but it belongs with a look at invariant 4's wording in
+`ARCHITECTURE.md` §4.7, which now states the split precisely rather than as handled-versus-unhandled.
 
 **`DbUpdateConcurrencyException` logs the least useful line under contention.** *Resolved
 2026-10-04.* Each warning used to carry EF's full boilerplate including a documentation URL —

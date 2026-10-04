@@ -2,11 +2,19 @@ using AgenticShop.Ordering.Clients;
 using AgenticShop.Ordering.Data;
 using AgenticShop.Ordering.Endpoints;
 using AgenticShop.Ordering.Errors;
+using AgenticShop.Shared.Logging;
 using AgenticShop.Shared.Middleware;
 using Microsoft.EntityFrameworkCore;
 using Scalar.AspNetCore;
+using Serilog;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Levels and category overrides come from appsettings.json, where each one is justified; ambient
+// enrichment and the access-log severity policy are in ServiceLogging.
+builder.Host.UseSerilog((context, configuration) => configuration
+    .AddServiceLogging(context.Configuration)
+    .WriteTo.Console(outputTemplate: ServiceLogging.ConsoleOutputTemplate));
 
 // Resolved lazily, inside the options callback, so that configuration sources the host
 // adds after Program.cs has run are visible — notably the override that
@@ -64,8 +72,19 @@ RequireConnectionString(app.Configuration);
 RequireServiceBaseUrl(app.Configuration, "Catalog");
 RequireServiceBaseUrl(app.Configuration, "Stock");
 
-// Correlation id first so failures raised by later middleware still carry it.
+// Correlation id first so failures raised by later middleware still carry it. The middleware also
+// makes the id ambient for every log line of the request, which is why it has to be out here — and
+// out here it also wraps the resilience pipeline, so a retry is logged against the request that
+// caused it. CorrelationIdPropagatingHandler reads the id from the HttpContext, not from this scope,
+// so the outbound direction is unaffected.
 app.UseCorrelationId();
+
+// One structured line per completed request, at Information whatever the status: severity belongs to
+// the exception handler alone. Verified against a real dependency failure — with the library default
+// a 502 produced an Error here *and* in the handler, plus another from the resilience pipeline's
+// final attempt, so one classified failure filled the log with three Errors saying the same thing.
+app.UseSerilogRequestLogging(options => options.GetLevel = ServiceLogging.RequestLogLevel);
+
 app.UseExceptionHandler();
 
 app.MapHealthChecks("/health");

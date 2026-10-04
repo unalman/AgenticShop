@@ -93,13 +93,13 @@ Now that a network hop exists, make its failure modes survivable and visible.
 
   Note also what this did **not** fix: the contention measurement below. Stock's `xmin`-conflict 409
   is a normal 4xx and is not retried, so retry at the HTTP layer leaves it untouched.
-- ~~Serilog structured logging.~~ **Done in Catalog**, the reference implementation; Stock and
-  Ordering still use the built-in providers. `docs/DECISIONS.md` → "Serilog, adopted in Catalog
-  first". Both observability items that waited on it are closed in Catalog as a result, and the
-  `Database.Command` one turned out to have been **diagnosed wrongly**: the plan was a filter that
-  inspected the exception, and EF Core attaches no exception to that event, so no filter could ever
-  have worked. The category is silenced by level instead, extending the decision already taken for
-  `Microsoft.EntityFrameworkCore.Update`.
+- ~~Serilog structured logging.~~ **Done in all three services.** Catalog went first as the
+  reference implementation and the rest followed the same day; the helper now lives in
+  `AgenticShop.Shared`. `docs/DECISIONS.md` → "Serilog, adopted in Catalog first". Both
+  observability items that waited on it are closed, and the `Database.Command` one turned out to have
+  been **diagnosed wrongly**: the plan was a filter that inspected the exception, and EF Core attaches
+  no exception to that event, so no filter could ever have worked. The category is silenced by level
+  instead, extending the decision already taken for `Microsoft.EntityFrameworkCore.Update`.
 - **OpenTelemetry** distributed tracing across the three hosts — the moment "distributed" stops
   being theoretical. Derive the correlation id from `Activity.Current?.TraceId` here, or there
   will be two parallel correlation concepts
@@ -115,8 +115,7 @@ Also resolves, or forces a decision on, the three observability items in `KNOWN-
 the `Database.Command` Error entry for handled 409s, the fact that validation rejections are
 invisible, and the verbose `DbUpdateConcurrencyException` log line that dominated Stock's output
 under contention. **All three are now resolved** — the third by the shared-handler fix the extraction
-made cheap, the first two by Catalog's Serilog migration. The first two remain open for Stock and
-Ordering, which still use the built-in providers.
+made cheap, the first two by the Serilog migration that followed it in all three services.
 
 What the migration did *not* do is add per-field detail to a validation rejection: the request log
 says that a request was rejected and where, not which field failed. That is deliberate, and recorded

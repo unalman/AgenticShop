@@ -1,9 +1,12 @@
+using AgenticShop.Shared.Logging;
+using Serilog.Context;
+
 namespace AgenticShop.Shared.Middleware;
 
 /// <summary>
-/// Accepts an inbound X-Correlation-Id or mints one, then echoes it on the response.
-/// Adopting an inbound value is what lets a single request be traced across Ordering, Catalog
-/// and Stock.
+/// Accepts an inbound X-Correlation-Id or mints one, echoes it on the response, and makes it ambient
+/// for every log line written while handling the request. Adopting an inbound value is what lets a
+/// single request be traced across Ordering, Catalog and Stock.
 /// </summary>
 /// <remarks>
 /// Registered first in the pipeline, before <c>UseExceptionHandler</c>, so a failure in any later
@@ -34,7 +37,16 @@ public sealed class CorrelationIdMiddleware(RequestDelegate next)
             return Task.CompletedTask;
         });
 
-        await next(context);
+        // Pushed here rather than in a second middleware so the scope necessarily wraps everything
+        // downstream. That matters for request logging, whose completion event is written after the
+        // inner pipeline returns: a push registered *after* it would already be popped by then and
+        // the id would be missing from exactly the line that summarises the request. Inert where
+        // Serilog is not the active provider, and EF Core's own lines carry no id of their own, so
+        // this is what makes "written to every log line for the request" true.
+        using (LogContext.PushProperty(ServiceLogging.CorrelationIdProperty, correlationId))
+        {
+            await next(context);
+        }
     }
 
     /// <summary>

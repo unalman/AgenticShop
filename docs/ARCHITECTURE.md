@@ -181,7 +181,6 @@ src/AgenticShop.<Service>/
 ├── Endpoints/              one static class per resource
 ├── Errors/                 <Service>ExceptionHandler : ProblemDetailsExceptionHandler
 ├── Clients/                orchestrators only: an interface + typed HttpClient per downstream
-├── Logging/                Catalog only, for now: what Serilog configuration cannot express
 └── Properties/launchSettings.json
 ```
 
@@ -193,6 +192,7 @@ Two folders a service used to have are now gone from it. `Middleware/` and `Vali
 src/AgenticShop.Shared/
 ├── Contracts/IRequestContract.cs
 ├── Errors/ProblemDetailsExceptionHandler.cs, ExceptionClassification.cs
+├── Logging/ServiceLogging.cs
 ├── Middleware/CorrelationIdMiddleware.cs
 └── Validation/DataAnnotationValidationFilter.cs
 ```
@@ -451,9 +451,12 @@ Four invariants, all test-guarded:
 3. **No exception message reaches the client.** `detail` is `null` for domain 400s and all
    500s. Those messages carry internal parameter names and are formatted with the *server's*
    culture — on this host `-5.00` renders as `-5,00`.
-4. **The handler decides severity, not EF Core.** Handled rejections log one `Warning` line
-   with no exception object; unhandled failures log `Error` *with* the exception object, so
-   the full inner chain and stack traces survive.
+4. **The handler decides severity, not EF Core.** The split is by **status**: a 4xx logs one
+   `Warning` line with no exception object, a 5xx logs `Error` *with* the exception object, so the
+   full inner chain and stack traces survive. Status and handled-versus-unhandled coincide everywhere
+   except Ordering, whose dependency failure is classified as a 502 and therefore logs at `Error` —
+   deliberate, since a dependency being down is worth paging on. It does mean the line reads
+   "Unhandled exception" for a failure the handler did handle; see `KNOWN-ISSUES.md` → Observability.
 
 **Log content.** Non-5xx lines walk the whole exception chain via `DescribeForLog`, capped at
 depth 5 and joined with `->`. Both ends matter: for a binding failure the outer message names
@@ -467,12 +470,12 @@ walk finds nothing, because a zero-rows-affected `UPDATE` is not a SQL error and
 `PostgresException`, so EF's own ~230-character message plus documentation URL is replaced by one
 concise line. It was 55 of 144 log lines in one Stock contention run.
 
-`Microsoft.EntityFrameworkCore.Update` is silenced in every service's `appsettings.json` — as
-`"None"` in Stock and Ordering, and as `"Fatal"` in Catalog, because Catalog runs Serilog and
-Serilog's `LogEventLevel` has no `None` member. Catalog also silences
-`Microsoft.EntityFrameworkCore.Database.Command`, the sibling category that logs a failed command at
-Error with the SQL text; the reasoning, and why no filter can distinguish a handled failure from an
-unhandled one, are in `KNOWN-ISSUES.md` → Observability.
+Both EF Core failure categories are silenced in every service's `appsettings.json`:
+`Microsoft.EntityFrameworkCore.Update`, and `Microsoft.EntityFrameworkCore.Database.Command`, the
+sibling that logs a failed command at Error with the SQL text. The level is `"Fatal"` rather than
+`"None"`, because Serilog's `LogEventLevel` has no `None` member and an unrecognised name is parsed as
+a level switch, which throws while the host builds. The reasoning, and why no filter can distinguish a
+handled failure from an unhandled one, are in `KNOWN-ISSUES.md` → Observability.
 
 EF logs every `SaveChanges` failure at Error with a full stack trace before rethrowing and
 cannot know whether it was handled, so a routine duplicate-key 409 used to emit roughly 40
@@ -495,6 +498,11 @@ still counts as a fault.
   for the request. It is accepted only if it is 1–128 characters (`MaxLength`) and contains
   nothing outside ASCII letters, digits and `-_.` — the characters that appear in GUIDs, W3C
   trace ids and conventional prefixed tokens.
+- **The middleware also pushes it into Serilog's ambient context**, which is what makes "every log
+  line" literally true: EF Core's entries and the request logger's completion event carry no id of
+  their own and pick it up from there. Pushed inside this middleware rather than a second one so the
+  scope necessarily wraps everything downstream — a push registered after the request logger would be
+  popped before the completion event is written.
 - An unacceptable value is **replaced**, not rejected: a malformed correlation id does not
   make the underlying request invalid, and refusing the call would turn a tracing concern into
   an availability one.
