@@ -182,7 +182,6 @@ Clients/
                                           POST /api/v1/reservations/{id}/release
                                           GET  /api/v1/reservations?orderId=
   CatalogProduct, StockReservationSnapshot    consumer-owned contracts
-  CorrelationIdPropagatingHandler             outbound X-Correlation-Id
   DownstreamClient                            shared send + classify plumbing
   DownstreamServiceException
 ```
@@ -196,26 +195,41 @@ Three rules govern it:
 - **An unexpected 4xx is our bug.** A 400 from Stock means Ordering sent something Stock's contract
   does not allow, so it becomes an `InvalidOperationException` → 500. Answering 502 would blame the
   other service for our defect.
-- **Timeouts are caught explicitly.** `HttpClient` reports its own timeout as
-  `TaskCanceledException`, and the exception handler already has an arm for that type — guarded on
-  `RequestAborted`, so it stands down only when the *caller* hung up. Without the catch, a downstream
-  timeout would produce no response at all.
+- **Timeouts and circuit breaks are caught explicitly.** `HttpClient` reports its own timeout as
+  `TaskCanceledException`, while the resilience pipeline reports its timeouts as
+  `TimeoutRejectedException` and an open circuit as `BrokenCircuitException`. All three become
+  `DownstreamServiceException`. Left uncaught, the first would produce no response at all, and the
+  other two would fall through to the handler's default arm and answer 500 — blaming this service for
+  a dependency that failed. The handler's own cancellation arm is guarded on `RequestAborted`, so it
+  stands down only when the *caller* hung up. See decision O18.
 
 Paths are rooted (`/api/v1/...`) rather than relative, so a base URL configured with a path prefix
 cannot silently rewrite a route.
 
-**Outbound correlation propagation was verified live, not only in tests.** The fakes replace the
-clients, so no integration test can observe the header on the wire; `CorrelationIdPropagatingHandler`
-is unit-tested in isolation instead. The wiring was then proven end to end by driving
-`http/ordering.http` against all three hosts and finding Ordering's inbound id in *Stock's* log line:
+**Outbound trace propagation was verified live, not only in tests.** The fakes replace the clients, so
+no integration test can observe anything on the wire. It is also no longer code of ours to unit-test:
+`traceparent` is injected by the HttpClient instrumentation, and the hand-written
+`CorrelationIdPropagatingHandler` that used to forward `X-Correlation-Id` was **deleted** when tracing
+landed — the header it sent is not read by anything now that the id is the trace id.
+
+Proven end to end by running all three hosts and sending Ordering a caller-supplied `traceparent`. The
+same trace id appeared in all three logs, including Stock's reserve call made *by* Ordering:
 
 ```
-Request rejected with 409 on POST /api/v1/stock/052d5e7e-…/reservations:
-InsufficientStockException: Requested 100000 unit(s) but only 4 are available. | Correlation smoke-1643430592
+[04:20:32 INF] abcdef0123456789abcdef0123456789 Serilog.AspNetCore.RequestLoggingMiddleware:
+    HTTP POST /api/v1/stock/c59bc6ef-…/reservations responded 201
 ```
 
-That is the one property of this service that a faked suite cannot establish, so it is recorded here
-rather than left as an assumption.
+and Catalog's server span for Ordering's product lookup carried Ordering's client span as its parent:
+
+```
+Activity.ParentSpanId:       ff4996224ca85680
+Activity.DisplayName:        GET /api/v1/products/{id:guid}
+```
+
+That is the one property of this service a faked suite cannot establish, so it is recorded here rather
+than left as an assumption. This evidence supersedes the `X-Correlation-Id` observation that used to
+sit here, which described a mechanism that no longer exists.
 
 ## 7. Schema
 
@@ -362,10 +376,10 @@ Still unexercised, and named so nobody assumes otherwise:
   covered by `http/ordering.http` run by hand, not by CI. Consumer-driven contract tests are Phase 3.
 - **Reconciliation as a process.** `PartiallyConfirmed` is recorded and queryable by id, but nothing
   drives it forward. Discovering one whose id was lost needs `psql`. Phase 2's saga.
-- **Distributed tracing.** The correlation id crosses the hop and appears in both logs, but there is
-  no span tree, so "which call was slow" is still a reading exercise. Phase 1's OpenTelemetry.
 
 Idempotent placement was on this list until Phase 1 closed it; a stranded claim is the smaller
 residual that replaced it, and it is in `KNOWN-ISSUES.md`. Resilience was on it too, and Phase 1
 closed it as well — timeout, retry and a circuit breaker, with reserve exempt from retry; see
-decision O18.
+decision O18. **Distributed tracing** was the third, and Phase 1 closed it last: there is now a span
+tree, the correlation id *is* the trace id, and "which call was slow" is a span question rather than a
+reading exercise across three logs. See `docs/ARCHITECTURE.md` §4.9 and §6 above.

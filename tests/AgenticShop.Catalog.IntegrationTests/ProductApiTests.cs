@@ -15,8 +15,14 @@ public sealed class ProductApiTests(CatalogApiFixture fixture) : IAsyncLifetime
 {
     private const string ProductsUrl = "/api/v1/products";
 
-    /// <summary>The format CorrelationIdMiddleware mints when it rejects an inbound value.</summary>
-    private const string MintedCorrelationIdPattern = "^[0-9a-f]{32}$";
+    /// <summary>
+    /// A W3C trace id — the only form <c>X-Correlation-Id</c> carries now that an inbound value is
+    /// ignored rather than adopted.
+    /// </summary>
+    private const string TraceIdPattern = "^[0-9a-f]{32}$";
+
+    /// <summary>A valid trace id, sent inside a <c>traceparent</c> to join an existing trace.</summary>
+    private const string InboundTraceId = "4bf92f3577b34da6a3ce929d0e0e4736";
 
     private HttpClient Client => fixture.Client;
 
@@ -260,57 +266,48 @@ public sealed class ProductApiTests(CatalogApiFixture fixture) : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Responses_EchoAnInboundCorrelationId()
+    public async Task Responses_CarryTheTraceIdAsTheCorrelationId()
     {
+        var response = await Client.GetAsync("/health");
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        response.Headers.GetValues(CorrelationIdMiddleware.HeaderName)
+            .Single()
+            .Should().MatchRegex(TraceIdPattern, "a W3C trace id, not a GUID");
+    }
+
+    [Fact]
+    public async Task ACallerSuppliedTraceparent_BecomesTheCorrelationId()
+    {
+        // The property the whole unification exists for, asserted over the wire: a caller who joins
+        // an existing trace gets that trace's id back, so the value in the response header, in the
+        // log lines and in a collector's index is one value rather than two that happen to coexist.
         using var request = new HttpRequestMessage(HttpMethod.Get, ProductsUrl);
-        request.Headers.Add(CorrelationIdMiddleware.HeaderName, "correlation-abc-123");
+        request.Headers.Add("traceparent", $"00-{InboundTraceId}-00f067aa0ba902b7-01");
 
         var response = await Client.SendAsync(request);
 
         response.Headers.GetValues(CorrelationIdMiddleware.HeaderName)
             .Single()
-            .Should().Be("correlation-abc-123");
-    }
-
-    [Fact]
-    public async Task Responses_MintACorrelationIdWhenNoneIsSupplied()
-    {
-        var response = await Client.GetAsync("/health");
-
-        response.StatusCode.Should().Be(HttpStatusCode.OK);
-        response.Headers.TryGetValues(CorrelationIdMiddleware.HeaderName, out var values)
-            .Should().BeTrue();
-        values!.Single().Should().NotBeNullOrWhiteSpace();
+            .Should().Be(InboundTraceId);
     }
 
     [Theory]
+    [InlineData("correlation-abc-123")]
     [InlineData("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")]
-    [InlineData("order_9f2c.1")]
-    public async Task ACorrelationIdWithinTheAllowedCharset_IsEchoedUnchanged(string inbound)
-        => (await SendWithCorrelationIdAsync(inbound)).Should().Be(inbound);
-
-    [Fact]
-    public async Task AnOverLongCorrelationId_IsReplacedRatherThanEchoed()
-    {
-        var hostile = new string('a', CorrelationIdMiddleware.MaxLength + 1);
-
-        var echoed = await SendWithCorrelationIdAsync(hostile);
-
-        echoed.Should().NotBe(hostile);
-        echoed.Should().MatchRegex(MintedCorrelationIdPattern);
-    }
-
-    [Theory]
     [InlineData("contains a space")]
     [InlineData("semi;colon")]
-    public async Task ACorrelationIdWithDisallowedCharacters_IsReplaced(string inbound)
+    public async Task AnInboundCorrelationIdHeader_IsIgnoredWhateverItContains(string inbound)
     {
-        // The value would otherwise be echoed into a response header, embedded in the
-        // ProblemDetails body and written to every log line for the request.
+        // X-Correlation-Id is response-only now. It used to be adopted inbound, which is why it needed
+        // a charset-and-length guard: arbitrary caller text was headed for a response header, the
+        // ProblemDetails body and every log line. The guard is gone rather than relaxed, and this is
+        // the evidence that removing it was safe — no inbound value reaches any of the three.
         var echoed = await SendWithCorrelationIdAsync(inbound);
 
         echoed.Should().NotBe(inbound);
-        echoed.Should().MatchRegex(MintedCorrelationIdPattern);
+        echoed.Should().MatchRegex(TraceIdPattern);
     }
 
     [Fact]

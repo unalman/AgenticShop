@@ -3,6 +3,7 @@ using AgenticShop.Catalog.Endpoints;
 using AgenticShop.Catalog.Errors;
 using AgenticShop.Shared.Logging;
 using AgenticShop.Shared.Middleware;
+using AgenticShop.Shared.Tracing;
 using Microsoft.EntityFrameworkCore;
 using Scalar.AspNetCore;
 using Serilog;
@@ -14,6 +15,15 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Host.UseSerilog((context, configuration) => configuration
     .AddServiceLogging(context.Configuration)
     .WriteTo.Console(outputTemplate: ServiceLogging.ConsoleOutputTemplate));
+
+// One span per inbound request, exported to the console here so the span tree is visible with no
+// collector running, and over OTLP whenever OTEL_EXPORTER_OTLP_ENDPOINT is set. Registering this is
+// also what makes the correlation id a trace id: CorrelationIdMiddleware reads Activity.Current, and
+// without an instrumentation source there is no activity to read.
+builder.Services.AddServiceTracing(
+    builder.Configuration,
+    serviceName: "AgenticShop.Catalog",
+    exportToConsole: builder.Environment.IsDevelopment());
 
 // Resolved lazily, inside the options callback, so that configuration sources the host
 // adds after Program.cs has run are visible — notably the override that

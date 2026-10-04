@@ -1,9 +1,7 @@
 using System.Net;
 using System.Text;
 using AgenticShop.Ordering.Clients;
-using AgenticShop.Shared.Middleware;
 using FluentAssertions;
-using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Polly.CircuitBreaker;
 using Polly.Timeout;
@@ -25,6 +23,12 @@ namespace AgenticShop.Ordering.UnitTests;
 /// The integration suite cannot cover this. It replaces <c>ICatalogClient</c> and <c>IStockClient</c>
 /// with fakes, which sits above the HTTP pipeline entirely — so it still proves the wiring in
 /// <c>Program.cs</c> builds a host, and nothing else here.
+/// </para>
+/// <para>
+/// There used to be a test here asserting that every retry attempt carried the ambient correlation
+/// id. It went with <c>CorrelationIdPropagatingHandler</c>: trace context on an outbound call is now
+/// the HttpClient instrumentation's job, so there is no code of ours left to assert. Testing it here
+/// would mean testing OpenTelemetry.
 /// </para>
 /// </remarks>
 public class DownstreamResilienceTests
@@ -135,37 +139,6 @@ public class DownstreamResilienceTests
     }
 
     [Fact]
-    public async Task PreservesTheCorrelationIdOnEveryAttempt()
-    {
-        var downstream = new ScriptedHandler(
-            _ => Respond(HttpStatusCode.ServiceUnavailable),
-            _ => Respond(HttpStatusCode.OK));
-
-        var services = new ServiceCollection();
-
-        services
-            .AddHttpClient("under-test", client => client.BaseAddress = new Uri("http://downstream.test/"))
-            .ConfigurePrimaryHttpMessageHandler(() => downstream)
-            // Same order as Program.cs: correlation outermost, so it runs once and the header is
-            // already on the message before the pipeline retries it.
-            .AddHttpMessageHandler(() => new CorrelationIdPropagatingHandler(new Accessor("trace-across-retries")))
-            .AddDownstreamResilience();
-
-        var client = services.BuildServiceProvider().GetRequiredService<IHttpClientFactory>().CreateClient("under-test");
-
-        await client.SendAsync(new HttpRequestMessage(HttpMethod.Get, "api/v1/products/1"));
-
-        downstream.Attempts.Should().Be(2);
-
-        foreach (var attempt in downstream.Requests)
-        {
-            attempt.Headers.GetValues(CorrelationIdMiddleware.HeaderName)
-                .Should()
-                .BeEquivalentTo(["trace-across-retries"], "every attempt must carry the one ambient id");
-        }
-    }
-
-    [Fact]
     public async Task ClassifiesAPipelineTimeoutAsADependencyFailure()
     {
         // The pipeline reports its own timeouts as TimeoutRejectedException, not the
@@ -249,14 +222,5 @@ public class DownstreamResilienceTests
 
             return Task.FromResult(script[Math.Min(served++, script.Length - 1)](request));
         }
-    }
-
-    /// <summary>Stands in for the ambient request, as in the correlation-handler tests.</summary>
-    private sealed class Accessor(string correlationId) : IHttpContextAccessor
-    {
-        public HttpContext? HttpContext { get; set; } = new DefaultHttpContext
-        {
-            TraceIdentifier = correlationId
-        };
     }
 }

@@ -1,69 +1,86 @@
+using AgenticShop.Shared.Logging;
 using AgenticShop.Shared.Middleware;
 using FluentAssertions;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration;
+using Serilog;
+using Serilog.Core;
+using Serilog.Events;
+using System.Diagnostics;
 
 namespace AgenticShop.Shared.UnitTests;
 
 /// <summary>
-/// The inbound id is echoed into response headers, into the ProblemDetails body and into
-/// every log line for the request, so it is untrusted input from the moment it arrives.
+/// How the correlation id is resolved. The id is the ambient W3C trace id, so one value ties
+/// together the log lines, the response header, the ProblemDetails body and the span tree.
 /// </summary>
+/// <remarks>
+/// The response-header echo itself is asserted in the integration suites against a real Kestrel,
+/// because <c>DefaultHttpContext</c> never runs the <c>OnStarting</c> callback that writes it. What
+/// is tested here is the resolution — which is where the contract change lives.
+/// </remarks>
 public class CorrelationIdMiddlewareTests
 {
-    private const string MintedPattern = "^[0-9a-f]{32}$";
+    /// <summary>A W3C trace id, which is what the middleware now emits in every case.</summary>
+    private const string TraceIdPattern = "^[0-9a-f]{32}$";
 
-    [Theory]
-    [InlineData("7e7a0d13746049cd87af65157e2a2dd5")]
-    [InlineData("correlation-abc-123")]
-    [InlineData("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")]
-    [InlineData("order_9f2c.1")]
-    [InlineData("A")]
-    public void AcceptsIdsWithinTheAllowedCharset(string value)
+    private const string InboundTraceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    [Fact]
+    public async Task TheIdIsTheAmbientTraceId()
     {
-        CorrelationIdMiddleware.IsAcceptable(value).Should().BeTrue();
+        using var activity = new Activity("test-request").Start();
 
-        CorrelationIdMiddleware.Resolve(value).Should().Be(value, "a usable id must pass through unchanged");
-    }
+        var context = await InvokeAsync();
 
-    [Theory]
-    [InlineData(null)]
-    [InlineData("")]
-    public void MintsAnIdWhenNoneIsSupplied(string? value)
-    {
-        CorrelationIdMiddleware.IsAcceptable(value).Should().BeFalse();
-
-        CorrelationIdMiddleware.Resolve(value).Should().MatchRegex(MintedPattern);
+        context.TraceIdentifier.Should().Be(activity.TraceId.ToString());
+        context.Items[CorrelationIdMiddleware.HeaderName].Should().Be(activity.TraceId.ToString());
     }
 
     [Fact]
-    public void AcceptsTheMaximumLengthButRejectsOneCharacterMore()
+    public async Task ACallerWhoJoinsAnExistingTraceGetsThatTraceIdBack()
     {
-        var atLimit = new string('a', CorrelationIdMiddleware.MaxLength);
-        var overLimit = new string('a', CorrelationIdMiddleware.MaxLength + 1);
+        // The property that makes this one concept rather than two: when a caller arrives under an
+        // existing trace — in practice by sending traceparent, which ASP.NET Core turns into the
+        // parent of the request's activity — the id in the logs and the response is the id a
+        // collector indexes that trace under, not a value this service invented beside it.
+        using var activity = new Activity("test-request")
+            .SetParentId(
+                ActivityTraceId.CreateFromString(InboundTraceId.AsSpan()),
+                ActivitySpanId.CreateRandom(),
+                ActivityTraceFlags.None)
+            .Start();
 
-        CorrelationIdMiddleware.IsAcceptable(atLimit).Should().BeTrue();
-        CorrelationIdMiddleware.IsAcceptable(overLimit).Should().BeFalse();
-        CorrelationIdMiddleware.Resolve(overLimit).Should().MatchRegex(MintedPattern);
+        (await InvokeAsync()).TraceIdentifier.Should().Be(InboundTraceId);
     }
 
     [Theory]
-    [InlineData("has space")]
+    [InlineData("correlation-abc-123")]
+    [InlineData("stock-smoke")]
+    [InlineData("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")]
     [InlineData("line\nbreak")]
-    [InlineData("carriage\rreturn")]
-    [InlineData("tab\tchar")]
-    [InlineData("semi;colon")]
-    [InlineData("quote\"char")]
-    [InlineData("colon:char")]
-    [InlineData("slash/char")]
-    [InlineData("unicode-ünicode")]
     [InlineData("emoji-😀")]
-    public void RejectsCharactersThatCouldReshapeAHeaderOrALogLine(string value)
+    public async Task AnInboundCorrelationIdHeaderIsIgnoredWhateverItContains(string inbound)
     {
-        CorrelationIdMiddleware.IsAcceptable(value).Should().BeFalse();
+        // The header used to be adopted, which is why it needed a charset-and-length guard: arbitrary
+        // caller text was headed for logs and response headers. It is response-only now, so the guard
+        // is gone rather than relaxed — and the reason that is safe is exactly what this asserts.
+        // Hostile input cannot reach a log line because no inbound value is ever used.
+        var context = await InvokeAsync((CorrelationIdMiddleware.HeaderName, inbound));
 
-        // Replaced rather than rejected: a malformed correlation id does not make the
-        // underlying request invalid, and refusing the call would turn a tracing concern
-        // into an availability one.
-        CorrelationIdMiddleware.Resolve(value).Should().MatchRegex(MintedPattern);
+        context.TraceIdentifier.Should().MatchRegex(TraceIdPattern);
+        context.TraceIdentifier.Should().NotBe(inbound);
+        context.Items[CorrelationIdMiddleware.HeaderName].Should().NotBe(inbound);
+    }
+
+    [Fact]
+    public async Task TheIdIsStillAMinted32HexValueWhenThereIsNoActivity()
+    {
+        // Not reachable through a real request — ASP.NET Core's hosting layer starts an activity for
+        // every one, with or without OpenTelemetry registered — but TraceIdentifier cannot be null.
+        Activity.Current.Should().BeNull("this test must not run inside an ambient activity");
+
+        (await InvokeAsync()).TraceIdentifier.Should().MatchRegex(TraceIdPattern);
     }
 
     [Fact]
@@ -71,7 +88,62 @@ public class CorrelationIdMiddlewareTests
         => CorrelationIdMiddleware.Mint().Should().NotBe(CorrelationIdMiddleware.Mint());
 
     [Fact]
-    public void TheMintedFormatIsItselfAcceptable()
-        => CorrelationIdMiddleware.IsAcceptable(CorrelationIdMiddleware.Mint())
-            .Should().BeTrue("a minted id must satisfy the same rule it is minted under");
+    public async Task TheResolvedIdIsAmbientForLogLinesWrittenDuringTheRequest()
+    {
+        // The Serilog property and the correlation id must be the same value, or a log line cannot be
+        // joined to the trace it belongs to.
+        var sink = new CollectingSink();
+
+        var logger = new LoggerConfiguration()
+            .AddServiceLogging(new ConfigurationBuilder().Build())
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+
+        using var activity = new Activity("test-request").Start();
+
+        await new CorrelationIdMiddleware(_ =>
+        {
+            logger.Information("written during the request");
+            return Task.CompletedTask;
+        }).InvokeAsync(new DefaultHttpContext());
+
+        sink.Events.Should().ContainSingle()
+            .Which.Properties[ServiceLogging.CorrelationIdProperty]
+            .ToString()
+            .Should()
+            .Contain(activity.TraceId.ToString());
+    }
+
+    [Fact]
+    public void FromCurrentTraceIsNullOutsideARequest()
+    {
+        Activity.Current.Should().BeNull();
+
+        CorrelationIdMiddleware.FromCurrentTrace().Should().BeNull();
+    }
+
+    // --- Helpers ------------------------------------------------------------------------
+
+    private static async Task<HttpContext> InvokeAsync(params (string Name, string Value)[] headers)
+    {
+        var context = new DefaultHttpContext();
+
+        foreach (var (name, value) in headers)
+        {
+            // TryAddWithoutValidation, because the point is sending values a well-behaved client
+            // would never produce.
+            context.Request.Headers.TryAdd(name, value);
+        }
+
+        await new CorrelationIdMiddleware(_ => Task.CompletedTask).InvokeAsync(context);
+
+        return context;
+    }
+
+    private sealed class CollectingSink : ILogEventSink
+    {
+        public List<LogEvent> Events { get; } = [];
+
+        public void Emit(LogEvent logEvent) => Events.Add(logEvent);
+    }
 }

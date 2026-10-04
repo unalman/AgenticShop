@@ -205,33 +205,31 @@ public sealed class StockApiTests(StockApiFixture fixture) : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Responses_EchoAnInboundCorrelationId()
+    public async Task Responses_CarryTheTraceIdAsTheCorrelationId()
     {
-        using var request = new HttpRequestMessage(HttpMethod.Get, $"{StockUrl}/{Guid.NewGuid()}");
-        request.Headers.Add(CorrelationIdMiddleware.HeaderName, "stock-corr-42");
-
-        var response = await Client.SendAsync(request);
+        var response = await Client.GetAsync($"{StockUrl}/{Guid.NewGuid()}");
 
         response.Headers.GetValues(CorrelationIdMiddleware.HeaderName)
             .Single()
-            .Should().Be("stock-corr-42");
+            .Should().MatchRegex("^[0-9a-f]{32}$", "a W3C trace id, not a GUID");
     }
 
     [Fact]
-    public async Task Responses_ReplaceAnUnusableCorrelationIdRatherThanEchoingIt()
+    public async Task AnInboundCorrelationIdHeader_IsIgnored()
     {
+        // Response-only since tracing landed: the id is the ambient trace id, so there is no inbound
+        // value to sanitise and no caller text reaches a response header or a log line.
         using var request = new HttpRequestMessage(HttpMethod.Get, $"{StockUrl}/{Guid.NewGuid()}");
 
         // TryAddWithoutValidation, because the point is sending what a well-behaved client never would.
-        request.Headers.TryAddWithoutValidation(
-            CorrelationIdMiddleware.HeaderName,
-            new string('a', CorrelationIdMiddleware.MaxLength + 1));
+        request.Headers.TryAddWithoutValidation(CorrelationIdMiddleware.HeaderName, "stock-corr-42");
 
         var response = await Client.SendAsync(request);
 
-        response.Headers.GetValues(CorrelationIdMiddleware.HeaderName)
-            .Single()
-            .Should().MatchRegex("^[0-9a-f]{32}$");
+        var echoed = response.Headers.GetValues(CorrelationIdMiddleware.HeaderName).Single();
+
+        echoed.Should().MatchRegex("^[0-9a-f]{32}$");
+        echoed.Should().NotBe("stock-corr-42");
     }
 
     private static StringContent RawJson(string json) => new(json, Encoding.UTF8, "application/json");

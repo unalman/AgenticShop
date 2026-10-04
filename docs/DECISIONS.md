@@ -454,11 +454,77 @@ A correlation id is 60 lines and immediately useful. Distributed tracing had not
 a second service existed; one now makes an outbound call and the id does cross the hop. What it
 still cannot answer is *which call was slow*, because there is no span tree — the gap Phase 1 closes.
 
-**Consequence to handle in Phase 1:** `Guid.NewGuid().ToString("N")` is not W3C
-`traceparent`-compatible, so the id should be derived from `Activity.Current?.TraceId` when
-OpenTelemetry arrives, or there will be two parallel correlation concepts. A hint of that already
-shows up in responses: `Results.Problem` adds a `traceId` extension from the ambient activity, so a
-ProblemDetails body carries both ids today and only one of them is ours.
+**Superseded 2026-10-04** by the next entry, which closed the gap and handled the consequence this
+one flagged. Two corrections to the text above, both found by running the services rather than by
+reading it:
+
+- The consequence was real and is now done: the id **is** `Activity.Current.TraceId`.
+- "A ProblemDetails body carries both ids today" was **not** true when written, and became true only
+  once OpenTelemetry was registered. `Results.Problem` takes its `traceId` from `Activity.Id`, which
+  is populated only for a *recorded* activity; with no listener there was no `traceId` member at all.
+  Both ids do appear now — the same trace id in two formats. See `KNOWN-ISSUES.md` → Observability.
+
+### OpenTelemetry, and the correlation id became the trace id
+
+**Context.** Phase 1's tracing item, and the last observability gap the correlation id could not
+close: with no span tree, "which downstream call was slow" was a reading exercise across three logs.
+
+**Decision.** `OpenTelemetry.Extensions.Hosting` plus the AspNetCore, HttpClient, Console and OTLP
+packages, configured once in `AgenticShop.Shared/Tracing/ServiceTracing.cs` and called from all three
+services. Exporters: console in Development, OTLP only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. No
+collector was added to `docker-compose.yml` — that is new infrastructure, and the compose `full`
+profile is a separate Phase 1 item.
+
+**The correlation id is now the trace id.** `CorrelationIdMiddleware` resolves
+`Activity.Current.TraceId` and nothing else, so the value in a log line, in the `X-Correlation-Id`
+response header, in the ProblemDetails body and in a collector's index is one value. This is what the
+previous entry said Phase 1 had to do; not doing it would have left two parallel concepts.
+
+**The inbound `X-Correlation-Id` contract changed, and the sanitisation went with it.** The header is
+**response-only**: an inbound value is ignored. Adoption is what required `MaxLength` and
+`IsAcceptable`, because arbitrary caller text was headed for a header, a body and every log line —
+and the guard is *deleted* rather than relaxed, because nothing caller-controlled is used any more.
+The id echoed is either runtime-generated or taken from a `traceparent` the W3C propagator already
+validated. A caller who wants to choose the id sends `traceparent`, which is the standard mechanism
+and now works end to end.
+
+**Rejected: seeding the activity from an inbound `X-Correlation-Id`.** That was the obvious way to
+preserve the old contract, and it was examined and dropped for two reasons. Mechanically,
+`Activity.TraceId` is read-only once started, so the only correct route is a custom
+`TextMapPropagator` registered process-wide — real machinery. And it would have preserved nothing:
+every inbound value in the repository (`stock-smoke`, `ordering-smoke`, `correlation-abc-123`,
+`manual-smoke-test`) is a human-readable token, not a 32-hex trace id, so all of them would have been
+rejected by the seeding rule anyway. The cost of that choice is real and accepted: a hand-run smoke
+request can no longer pick a greppable id, and reads it off the response instead. `http/*.http` says
+so.
+
+**`CorrelationIdPropagatingHandler` was deleted**, together with the `AddHttpContextAccessor` that
+existed only for it. The HttpClient instrumentation injects `traceparent` on every attempt including
+retries, so outbound propagation needs no code of ours — and once Catalog stopped adopting the
+header, the handler was forwarding something nothing read. Its tests went with it, as did the
+resilience test asserting the header survived a retry; that assertion would now be testing
+OpenTelemetry, and the reason is recorded in `DownstreamResilienceTests` so nobody reinstates it.
+
+**What could not be done service-by-service.** The plan was Catalog first as the reference, and it did
+not survive contact: the middleware is shared, and ASP.NET Core populates `Activity.Current` in a
+plain host too, so the contract changed in all three at once. Verified rather than assumed — running
+Stock with no tracing registered returned a 32-hex id, and the integration suites of all three
+services failed on their correlation assertions before any of them had OpenTelemetry.
+
+**Verification.** All three services run against the real database with a caller-supplied
+`traceparent`: the same trace id appeared in Catalog's, Stock's and Ordering's logs; Catalog's server
+span carried Ordering's client span as its `ParentSpanId`; and the direct `POST /api/v1/products` span
+carried the caller's span id as parent, so joining an existing trace works. Ordering produced server
+and client spans for the Catalog lookup, the Stock reserve and the Stock confirm. Polly's retry lines
+carry the same id, so a retry is attributable to the request that caused it. All rows the check
+created were deleted.
+
+**Not verified.** How many client spans a *retried* outbound call produces — whether the resilience
+handler's retries appear as one span or several. The smoke run had no failures to retry, and answering
+it needs a collector or a failing dependency mid-trace. Recorded rather than guessed.
+
+**Deliberately not configured:** `RecordException`, span enrichment, and a `/health` span filter. See
+`ARCHITECTURE.md` §4.9.
 
 ---
 
@@ -563,7 +629,6 @@ Each was considered and declined, with the phase that would justify it:
 | RabbitMQ / any broker | Nothing is asynchronous |
 | Outbox / Inbox | An outbox makes "write a row and publish an event" atomic; there are no events. Note the design is already outbox-ready: every write path is a single `SaveChangesAsync`, so an entity and an outbox row would already be atomic. Stock's reserve commits the counter and the reservation row together, which is the same property |
 | Redis | No cache pressure, no distributed idempotency store to hold |
-| OpenTelemetry | A correlation id crosses the hop and appears in both logs, which is enough for three services and one synchronous path. A span tree answers "which call was slow", and nothing is slow yet |
 | Authentication / authorization | Deferred by the project owner. Adding it later needs a customer identity column on `Order` plus a cross-cutting policy — a migration and a concern, which is why no placeholder seam was pre-built |
 | Kubernetes / Helm, YARP gateway | Phase 4 |
 | CQRS, DDD tactical patterns, event sourcing | No read pressure, no aggregate boundaries to enforce |
@@ -587,3 +652,10 @@ unchanged, and the contention it produces is still open.
 **Serilog was on this list until Phase 1 closed it.** Adopted on 2026-10-04 — in Catalog first as
 the reference implementation, then in Stock and Ordering the same day. See "Serilog, adopted in
 Catalog first" above, including the `"None"` level that crashes a Serilog host at startup.
+
+**OpenTelemetry was on this list until Phase 1 closed it too.** Adopted 2026-10-04, in all three
+services at once — unlike Serilog, this one could not be staged per service, because the correlation
+id lives in shared middleware and ASP.NET Core populates `Activity.Current` regardless. See
+"OpenTelemetry, and the correlation id became the trace id" above. It is the only item on this list
+whose adoption **removed** a documented public contract: inbound `X-Correlation-Id` is no longer
+adopted, and the sanitisation that existed to make adoption safe was deleted with it.

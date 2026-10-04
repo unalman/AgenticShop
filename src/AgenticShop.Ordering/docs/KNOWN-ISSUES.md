@@ -86,13 +86,17 @@ is inventory *under*-availability, never negative stock, so it is lossy rather t
 
 ### Testing
 
-**The outbound correlation header is proven by hand, not by the suite.** *Low.* Every integration
-test replaces `ICatalogClient` and `IStockClient` at the seam, which is the right thing for scripting
-failures and the reason no automated test can observe what actually goes on the wire.
-`CorrelationIdPropagatingHandlerTests` covers the handler in isolation; the `AddHttpMessageHandler`
-attachment that puts it in the real pipeline was verified once, live, by finding Ordering's inbound id
-in Stock's log line (recorded in `docs/ARCHITECTURE.md` §6). A regression in that one registration
-line would not fail any test.
+**Outbound trace propagation is proven by hand, not by the suite.** *Low.* Every integration test
+replaces `ICatalogClient` and `IStockClient` at the seam, which is the right thing for scripting
+failures and the reason no automated test can observe what actually goes on the wire. It was verified
+live instead — a caller-supplied `traceparent` produced the same trace id in all three services' logs,
+with Catalog's server span parented to Ordering's client span (recorded in `docs/ARCHITECTURE.md` §6).
+
+The exposure changed shape when `CorrelationIdPropagatingHandler` was deleted. It used to be one
+`AddHttpMessageHandler` registration line that no test covered; it is now the `instrumentHttpClient:
+true` argument Ordering passes to `AddServiceTracing`, which no test covers either. Drop it and
+`traceparent` stops being injected, the trace breaks at the first hop, and the whole suite stays
+green. Same risk, different line.
 
 **A malformed downstream response is only partly covered.** *Low.* The clients throw
 `InvalidOperationException` on a 2xx they cannot read, which the handler answers as a 500. No test

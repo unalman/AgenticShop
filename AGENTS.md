@@ -24,10 +24,10 @@ reference every convention originates from, **Stock** follows it with the delibe
 recorded in §10, **Ordering** is the orchestrator — the only service with outbound calls, and the
 one that forced the conventions to be re-derived rather than copied. **`AgenticShop.Shared`** was
 extracted in Phase 1 and is not a service: it holds the filter, the correlation middleware,
-`IRequestContract`, the logging configuration and the exception-handler skeleton.
+`IRequestContract`, the logging and tracing configuration and the exception-handler skeleton.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **499 pass**
-(Shared 39 unit; Catalog 67 unit + 39 integration; Stock 81 unit + 61 integration; Ordering 137 unit
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **483 pass**
+(Shared 30 unit; Catalog 67 unit + 38 integration; Stock 81 unit + 61 integration; Ordering 131 unit
 + 75 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
@@ -133,9 +133,12 @@ otherwise guess wrong.
   exception message reaches the client:** `detail` is `null` for domain 400s and all 500s, built
   from typed properties for domain 409s. **The handler decides severity:** a 4xx logs one `Warning`
   with no exception object, a 5xx logs `Error` *with* it.
-- **Correlation ID (§4.8).** Use `CorrelationIdMiddleware.HeaderName`, never the literal string.
-  **Inbound values are untrusted:** accept 1–128 characters of ASCII letters, digits and `-_.`,
-  otherwise **replace** with a minted id — never reject the request. Registered first, before
+- **Correlation ID (§4.8).** The id **is** the W3C trace id — `Activity.Current.TraceId`, which
+  ASP.NET Core populates for every request whether or not OpenTelemetry is registered. Do not mint a
+  parallel one. `X-Correlation-Id` is **response-only**: an inbound value is ignored, so there is
+  nothing to sanitise and no charset guard to maintain. Propagation across a hop is `traceparent`,
+  done by the instrumentation — **do not add a `DelegatingHandler` for it**. Use
+  `CorrelationIdMiddleware.HeaderName`, never the literal string. Registered first, before
   `UseExceptionHandler`.
 
 ## 6. Testing rules
@@ -207,7 +210,7 @@ each deferral, including the few with no assigned phase: `docs/DECISIONS.md`.
 
 **Still deferred — do not add:**
 
-**RabbitMQ or any broker · Outbox / Inbox · Redis · OpenTelemetry · authentication / authorization ·
+**RabbitMQ or any broker · Outbox / Inbox · Redis · authentication / authorization ·
 Kubernetes / Helm · API gateway (YARP) · CQRS · DDD tactical patterns · event sourcing · service
 Dockerfiles · CI pipeline.**
 
@@ -222,12 +225,14 @@ the shared infrastructure library (`AgenticShop.Shared`, §2), **idempotency key
 `POST /orders`** (Ordering decision O17 — a required `Idempotency-Key` header, a claim committed
 before the first side effect, a completion written in the same transaction as the order),
 **resilience policies on Ordering's typed clients** (Ordering decision O18 — timeout, retry and a
-circuit breaker, with retry enabled per request and reserve exempt), and **Serilog in all three
+circuit breaker, with retry enabled per request and reserve exempt), **Serilog in all three
 services** (`docs/DECISIONS.md` → "Serilog, adopted in Catalog first", configured once in
-`AgenticShop.Shared/Logging`). Nothing else on the list above has been unblocked. OpenTelemetry and
-dependency-aware health checks are still ahead. **Do not extend retry to another outbound call before
-reading O18** — the exemption on reserve is what stops a retry from stranding a hold and reporting it
-as out-of-stock.
+`AgenticShop.Shared/Logging`), and **OpenTelemetry tracing in all three** (`docs/DECISIONS.md` →
+"OpenTelemetry, and the correlation id became the trace id", configured once in
+`AgenticShop.Shared/Tracing`). Nothing else on the list above has been unblocked; dependency-aware
+health checks are still ahead. **Do not extend retry to another outbound call before reading O18** —
+the exemption on reserve is what stops a retry from stranding a hold and reporting it as
+out-of-stock.
 
 ## 9. Git rules
 

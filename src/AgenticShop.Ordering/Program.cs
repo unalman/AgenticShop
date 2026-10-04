@@ -4,6 +4,7 @@ using AgenticShop.Ordering.Endpoints;
 using AgenticShop.Ordering.Errors;
 using AgenticShop.Shared.Logging;
 using AgenticShop.Shared.Middleware;
+using AgenticShop.Shared.Tracing;
 using Microsoft.EntityFrameworkCore;
 using Scalar.AspNetCore;
 using Serilog;
@@ -16,6 +17,16 @@ builder.Host.UseSerilog((context, configuration) => configuration
     .AddServiceLogging(context.Configuration)
     .WriteTo.Console(outputTemplate: ServiceLogging.ConsoleOutputTemplate));
 
+// One span per inbound request plus one per outbound call, which is what makes the Ordering ->
+// Catalog / Stock hop visible as a tree rather than as two unrelated log lines. Exported to the
+// console here so that is observable with no collector running, and over OTLP whenever
+// OTEL_EXPORTER_OTLP_ENDPOINT is set.
+builder.Services.AddServiceTracing(
+    builder.Configuration,
+    serviceName: "AgenticShop.Ordering",
+    exportToConsole: builder.Environment.IsDevelopment(),
+    instrumentHttpClient: true);
+
 // Resolved lazily, inside the options callback, so that configuration sources the host
 // adds after Program.cs has run are visible — notably the override that
 // WebApplicationFactory.ConfigureAppConfiguration applies in the integration tests.
@@ -25,11 +36,12 @@ builder.Services.AddDbContext<OrderingDbContext>(options => options
     .UseNpgsql(RequireConnectionString(builder.Configuration))
     .UseSnakeCaseNamingConvention());
 
-// Read by CorrelationIdPropagatingHandler so no client method has to carry a tracing concern
-// in its signature.
-builder.Services.AddHttpContextAccessor();
-builder.Services.AddTransient<CorrelationIdPropagatingHandler>();
-
+// No DelegatingHandler is registered on these clients to carry a correlation id, and none is
+// needed: traceparent propagation is done by the HttpClient instrumentation added above, which
+// injects it on every attempt including retries. The handler that used to do this by hand —
+// CorrelationIdPropagatingHandler, plus the AddHttpContextAccessor it required — is gone, because
+// the inbound X-Correlation-Id it forwarded is no longer adopted by anything. See docs/DECISIONS.md.
+//
 // The downstream timeout O15 documented now lives in the resilience pipeline as a per-attempt
 // timeout, so HttpClient.Timeout is deliberately not set here. Setting it would be a bug rather
 // than a redundant safety net: HttpClient.Timeout bounds the whole handler pipeline, retries
@@ -39,13 +51,11 @@ builder.Services.AddTransient<CorrelationIdPropagatingHandler>();
 builder.Services
     .AddHttpClient<ICatalogClient, CatalogClient>(client =>
         client.BaseAddress = new Uri(RequireServiceBaseUrl(builder.Configuration, "Catalog")))
-    .AddHttpMessageHandler<CorrelationIdPropagatingHandler>()
     .AddDownstreamResilience();
 
 builder.Services
     .AddHttpClient<IStockClient, StockClient>(client =>
         client.BaseAddress = new Uri(RequireServiceBaseUrl(builder.Configuration, "Stock")))
-    .AddHttpMessageHandler<CorrelationIdPropagatingHandler>()
     .AddDownstreamResilience();
 
 // The one collaborator the "no service layer" rule was written to allow; see its remarks and
@@ -75,8 +85,7 @@ RequireServiceBaseUrl(app.Configuration, "Stock");
 // Correlation id first so failures raised by later middleware still carry it. The middleware also
 // makes the id ambient for every log line of the request, which is why it has to be out here — and
 // out here it also wraps the resilience pipeline, so a retry is logged against the request that
-// caused it. CorrelationIdPropagatingHandler reads the id from the HttpContext, not from this scope,
-// so the outbound direction is unaffected.
+// caused it.
 app.UseCorrelationId();
 
 // One structured line per completed request, at Information whatever the status: severity belongs to

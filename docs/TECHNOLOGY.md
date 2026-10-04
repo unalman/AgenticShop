@@ -26,6 +26,7 @@ Everything here describes the verified current state.
 | API docs | `Microsoft.AspNetCore.OpenApi` + `Scalar.AspNetCore` | 10.0.12 / 2.17.8 |
 | Resilience | `Microsoft.Extensions.Http.Resilience` — Ordering only, the sole service with outbound calls | 10.0.0 |
 | Logging | `Serilog.AspNetCore` — all three services, configured once in `AgenticShop.Shared` | 10.0.0 |
+| Tracing | `OpenTelemetry.Extensions.Hosting` + AspNetCore/Http instrumentation + Console/OTLP exporters, configured once in `AgenticShop.Shared` | 1.19.1 / 1.19.0 |
 | Containers | Docker / Compose | 29.8.0 / 5.5.1 |
 | Test DB / host | `Testcontainers.PostgreSql` / `Mvc.Testing` | 4.15.0 / 10.0.12 |
 | Tests | xunit + FluentAssertions | 2.9.3 / 8.11.0 |
@@ -53,7 +54,12 @@ not `net11.0`" · "Minimal APIs, not controllers" · "`.slnx` rather than `.sln`
 management with transitive pinning" · "`dotnet-tools.json` at the repository root" · "One
 PostgreSQL container hosting three databases" · "Testcontainers, never a mocked `DbContext`" ·
 "An endpoint filter, not FluentValidation" · "Serilog, adopted in Catalog first", which supersedes
-"Built-in logging, no Serilog yet" and now covers all three services.
+"Built-in logging, no Serilog yet" and now covers all three services · "OpenTelemetry, and the
+correlation id became the trace id", which supersedes "Correlation id, not OpenTelemetry".
+
+The tracing row is the one whose version does **not** follow the 10.0.x line: OpenTelemetry .NET
+versions independently of the runtime, and its instrumentation packages lag the core ones. Both facts
+are recorded in `Directory.Packages.props`, where the versions live.
 
 A decision taken while building one service lives in that service's `docs/DECISIONS.md` instead. The
 resilience row is such a case: `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O18**, which covers

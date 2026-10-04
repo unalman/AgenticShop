@@ -59,8 +59,11 @@ public class ServiceLoggingTests
             .CreateLogger();
 
         var context = new DefaultHttpContext();
-        context.Request.Headers[CorrelationIdMiddleware.HeaderName] = "ambient-id";
 
+        // No inbound header is set on purpose. X-Correlation-Id is response-only now, so whatever the
+        // middleware resolves is what must appear in the log — asserting a specific inbound value here
+        // would be testing a contract that no longer exists. The resolution itself is covered by
+        // CorrelationIdMiddlewareTests; the invariant this test owns is that the two agree.
         var middleware = new CorrelationIdMiddleware(_ =>
         {
             logger.Information("written from inside the pipeline");
@@ -77,7 +80,7 @@ public class ServiceLoggingTests
         logEvent.Properties[ServiceLogging.CorrelationIdProperty]
             .ToString()
             .Should()
-            .Contain("ambient-id");
+            .Contain(context.GetCorrelationId(), "a log line must be joinable to its request");
     }
 
     [Fact]
@@ -94,7 +97,6 @@ public class ServiceLoggingTests
             .CreateLogger();
 
         var context = new DefaultHttpContext();
-        context.Request.Headers[CorrelationIdMiddleware.HeaderName] = "leaky-id";
 
         await new CorrelationIdMiddleware(_ => Task.CompletedTask).InvokeAsync(context);
 

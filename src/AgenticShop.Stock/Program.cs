@@ -1,5 +1,6 @@
 using AgenticShop.Shared.Logging;
 using AgenticShop.Shared.Middleware;
+using AgenticShop.Shared.Tracing;
 using AgenticShop.Stock.Data;
 using AgenticShop.Stock.Endpoints;
 using AgenticShop.Stock.Errors;
@@ -14,6 +15,14 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Host.UseSerilog((context, configuration) => configuration
     .AddServiceLogging(context.Configuration)
     .WriteTo.Console(outputTemplate: ServiceLogging.ConsoleOutputTemplate));
+
+// One span per inbound request, exported to the console here so the span tree is visible with no
+// collector running, and over OTLP whenever OTEL_EXPORTER_OTLP_ENDPOINT is set. Stock is a leaf
+// service: no outbound calls, so no HttpClient instrumentation.
+builder.Services.AddServiceTracing(
+    builder.Configuration,
+    serviceName: "AgenticShop.Stock",
+    exportToConsole: builder.Environment.IsDevelopment());
 
 // Resolved lazily, inside the options callback, so that configuration sources the host
 // adds after Program.cs has run are visible — notably the override that

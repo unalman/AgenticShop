@@ -100,9 +100,15 @@ Now that a network hop exists, make its failure modes survivable and visible.
   been **diagnosed wrongly**: the plan was a filter that inspected the exception, and EF Core attaches
   no exception to that event, so no filter could ever have worked. The category is silenced by level
   instead, extending the decision already taken for `Microsoft.EntityFrameworkCore.Update`.
-- **OpenTelemetry** distributed tracing across the three hosts — the moment "distributed" stops
-  being theoretical. Derive the correlation id from `Activity.Current?.TraceId` here, or there
-  will be two parallel correlation concepts
+- ~~**OpenTelemetry** distributed tracing across the three hosts.~~ **Done**, in all three at once —
+  it could not be staged per service the way Serilog was, because the correlation id lives in shared
+  middleware and ASP.NET Core populates `Activity.Current` whether or not tracing is registered. The
+  warning above was heeded: the correlation id **is** `Activity.Current.TraceId`, so there is one
+  concept rather than two. `docs/DECISIONS.md` → "OpenTelemetry, and the correlation id became the
+  trace id". Verified end to end with a caller-supplied `traceparent`: one trace id across all three
+  services' logs, and Catalog's server span parented to Ordering's client span. The cost is a
+  **removed public contract** — inbound `X-Correlation-Id` is no longer adopted, so a hand-run smoke
+  request can no longer choose a greppable id and reads it off the response instead.
 - Dependency-aware health checks — `/health` currently registers no checks at all, so it reports
   healthy with the database down
 - Dockerfiles for all three services plus a `full` compose profile

@@ -8,10 +8,15 @@
 #   dotnet run --project src/AgenticShop.Ordering    # http://localhost:5083
 #
 # Run the requests top to bottom: the order at the bottom consumes the product and the stock
-# provisioned above it. Every response carries the X-Correlation-Id it was sent, and Ordering
-# forwards it to Catalog and Stock, so one id appears in all three logs — that is the thing to look
-# at first, because it is the only end-to-end check of outbound propagation the suite cannot make
-# with the clients faked.
+# provisioned above it. Every response carries an X-Correlation-Id, which is that request's W3C trace
+# id: read it off the step 3 response and grep all three logs for it, and the placement's Catalog and
+# Stock calls appear under the same id. That is the end-to-end check of outbound propagation the suite
+# cannot make with the clients faked.
+#
+# Propagation is traceparent, injected by the HttpClient instrumentation. The requests below send no
+# correlation header, because an inbound X-Correlation-Id is ignored rather than adopted — the id
+# comes back to you, you do not choose it. To join a trace you already have, send
+# `traceparent: 00-<32 hex trace id>-<16 hex span id>-01` and the response echoes that trace id.
 #
 # POST /orders requires an Idempotency-Key header. Each request below uses a different one, so they
 # each place for real; step 3b deliberately repeats a key to show the replay. A missing key is a 400
@@ -29,7 +34,6 @@ GET {{ordering}}/health
 # @name createProduct
 POST {{catalog}}/api/v1/products
 Content-Type: application/json
-X-Correlation-Id: ordering-smoke
 
 {
   "sku": "ORD-SMOKE-1",
@@ -44,7 +48,6 @@ X-Correlation-Id: ordering-smoke
 # calls both.
 POST {{stock}}/api/v1/stock
 Content-Type: application/json
-X-Correlation-Id: ordering-smoke
 
 {
   "productId": "{{productId}}",
@@ -56,7 +59,6 @@ X-Correlation-Id: ordering-smoke
 # @name placeOrder
 POST {{ordering}}/api/v1/orders
 Content-Type: application/json
-X-Correlation-Id: ordering-smoke
 Idempotency-Key: smoke-place-1
 
 {
@@ -71,7 +73,6 @@ Idempotency-Key: smoke-place-1
 # again: if on-hand dropped to 6, idempotency is broken.
 POST {{ordering}}/api/v1/orders
 Content-Type: application/json
-X-Correlation-Id: ordering-smoke
 Idempotency-Key: smoke-place-1
 
 {

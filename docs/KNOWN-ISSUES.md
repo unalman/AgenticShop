@@ -73,6 +73,20 @@ current severity rules. The fix is one string — `"Unhandled exception"` to som
 `"Request failed with {StatusCode}"` — but it belongs with a look at invariant 4's wording in
 `ARCHITECTURE.md` §4.7, which now states the split precisely rather than as handled-versus-unhandled.
 
+**A ProblemDetails body carries the trace id twice.** *Info · observed 2026-10-04.* Since tracing
+landed, an error body contains both `"correlationId":"<32 hex>"` — added by the shared handler — and
+`"traceId":"00-<same 32 hex>-<span id>-01"`, added by `Results.Problem` from the ambient activity.
+Same trace id, two formats, two member names.
+
+Not a defect and not new information, but it is the kind of thing a client author will ask about, so
+it is recorded rather than left to be discovered. Both existed by design: `correlationId` is this
+repository's documented contract and predates tracing, `traceId` is framework behaviour that only
+appears once an activity is *recorded* — which is why the body carried `correlationId` alone before
+OpenTelemetry was registered, and why an earlier note claiming it "carries both today" was wrong at
+the time it was written. Dropping `correlationId` would be a breaking change to a documented response
+shape in exchange for removing a duplicate; if a collector is ever added and `traceId` becomes the
+useful one to grep, revisiting is cheap.
+
 **`DbUpdateConcurrencyException` logs the least useful line under contention.** *Resolved
 2026-10-04.* Each warning used to carry EF's full boilerplate including a documentation URL —
 roughly 230 characters, and **55 of 144 log lines** in one verified Stock run. `DescribeForLog` was

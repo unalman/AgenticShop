@@ -452,9 +452,12 @@ exemption stops being the mechanism that keeps it safe.
   than a drift.
 - **`OrderResponse` sorts its lines.** An `Include` carries no ordering guarantee, and a response
   whose lines shuffle between two reads of the same order is harder to test and harder to read.
-- **`CorrelationIdPropagatingHandler` checks before it adds.** `TryAddWithoutValidation` *appends* to
-  a header that already exists rather than leaving it alone, so without the check a request built with
-  its own value would go out with two. A `DelegatingHandler` sits in a pipeline it does not own.
+- **`CorrelationIdPropagatingHandler` was deleted rather than kept alongside tracing.** It forwarded
+  `X-Correlation-Id` outbound; once the correlation id became the trace id, the HttpClient
+  instrumentation injects `traceparent` and nothing reads the header it was sending. One lesson from it
+  survives the code: `TryAddWithoutValidation` *appends* to a header that already exists rather than
+  leaving it alone, so a `DelegatingHandler` — which sits in a pipeline it does not own — has to check
+  before it adds, or a request built with its own value goes out with two.
 - **Downstream base URLs are validated as absolute http/https at startup.** `Uri.TryCreate(...,
   UriKind.Absolute)` accepts `"localhost:5082"` — it reads `localhost` as the scheme — so the absolute
   check alone would pass a value that cannot reach anything. A test found this; the scheme check is the

@@ -1,5 +1,9 @@
 @host = http://localhost:5081
 
+# Every response carries an X-Correlation-Id: that request's W3C trace id, and the value its log
+# lines are written under. An inbound X-Correlation-Id is ignored, so the requests below send none —
+# to join a trace you already have, send `traceparent: 00-<32 hex>-<16 hex>-01` instead.
+
 ### Health
 GET {{host}}/health
 
@@ -7,7 +11,6 @@ GET {{host}}/health
 # @name createProduct
 POST {{host}}/api/v1/products
 Content-Type: application/json
-X-Correlation-Id: manual-smoke-test
 
 {
   "sku": "ESP-001",

@@ -19,6 +19,12 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
 {
     private const string CorrelationIdHeader = CorrelationIdMiddleware.HeaderName;
 
+    /// <summary>
+    /// A W3C trace id — the only form the correlation id takes now that an inbound value is ignored
+    /// rather than adopted.
+    /// </summary>
+    private const string TraceIdPattern = "^[0-9a-f]{32}$";
+
     [Fact]
     public async Task PlacingAnOrder_ReservesConfirmsAndReturns201WithALocation()
     {
@@ -132,19 +138,23 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
     }
 
     [Fact]
-    public async Task TheInboundCorrelationIdIsAdoptedAndEchoed()
+    public async Task AnInboundCorrelationIdIsIgnoredAndTheTraceIdReturned()
     {
+        // X-Correlation-Id is response-only now: the id is the ambient W3C trace id, so an inbound
+        // value has nothing to be adopted into. The header it used to travel on is still answered,
+        // which is what lets a caller join a response to the log lines and the span that explain it.
         var product = AddProduct();
 
         var response = await PlaceAsync(OrderWith((product, 1)), correlationId: "trace-1");
 
         response.Headers.GetValues(CorrelationIdHeader)
             .Should().ContainSingle()
-            .Which.Should().Be("trace-1");
+            .Which.Should().MatchRegex(TraceIdPattern)
+            .And.NotBe("trace-1");
     }
 
     [Fact]
-    public async Task ACorrelationIdIsMintedWhenTheCallerSendsNone()
+    public async Task TheCorrelationIdIsATraceId()
     {
         var product = AddProduct();
 
@@ -152,22 +162,25 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
 
         response.Headers.GetValues(CorrelationIdHeader)
             .Should().ContainSingle()
-            .Which.Should().MatchRegex("^[0-9a-f]{32}$", "a GUID with the dashes removed");
+            .Which.Should().MatchRegex(TraceIdPattern, "a W3C trace id, not a GUID");
     }
 
     [Fact]
     public async Task AProblemDetailsBodyCarriesTheSameCorrelationIdAsTheHeader()
     {
         // The id is what joins a response to the log line that explains it, so it has to survive the
-        // failure path too — and to survive it unchanged, not reminted.
-        var response = await PlaceAsync(OrderWith((Guid.NewGuid(), 1)), correlationId: "trace-2");
+        // failure path too — and to survive it unchanged, not reminted. Asserted header-against-body
+        // rather than against a value the caller sent, because the caller no longer chooses it.
+        var response = await PlaceAsync(OrderWith((Guid.NewGuid(), 1)));
 
         response.StatusCode.Should().Be(HttpStatusCode.Conflict);
-        response.Headers.GetValues(CorrelationIdHeader).Should().ContainSingle().Which.Should().Be("trace-2");
+
+        var correlationId = response.Headers.GetValues(CorrelationIdHeader).Single();
+        correlationId.Should().MatchRegex(TraceIdPattern);
 
         var problem = await ProblemAsync(response);
 
-        problem.Extensions["correlationId"]!.ToString().Should().Be("trace-2");
+        problem.Extensions["correlationId"]!.ToString().Should().Be(correlationId);
     }
 
     [Fact]
@@ -176,15 +189,17 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
         // Pinned rather than fixed. DataAnnotationValidationFilter builds its own
         // ValidationProblemDetails and does not add the extension the exception handler adds, so the
         // body carries no correlationId. The header always does, which is enough to join a response to
-        // a log line — though validation rejections are not logged at all today, a gap already
-        // recorded in docs/KNOWN-ISSUES.md.
+        // a log line — and since Serilog request logging landed, a validation rejection does produce
+        // one, so there is a line to join it to.
         //
-        // Changing the filter would mean changing it in all three services at once, which is Phase 1's
-        // shared-library extraction rather than something to do from here.
-        var response = await PlaceRawAsync("{\"lines\": []}", correlationId: "trace-3");
+        // Closing the body gap would mean changing the shared filter, which is deliberately left
+        // alone: it is specified once in AgenticShop.Shared and the header already carries the id.
+        var response = await PlaceRawAsync("{\"lines\": []}");
 
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
-        response.Headers.GetValues(CorrelationIdHeader).Should().ContainSingle().Which.Should().Be("trace-3");
+        response.Headers.GetValues(CorrelationIdHeader)
+            .Should().ContainSingle()
+            .Which.Should().MatchRegex(TraceIdPattern);
 
         var problem = await ProblemAsync(response);
 

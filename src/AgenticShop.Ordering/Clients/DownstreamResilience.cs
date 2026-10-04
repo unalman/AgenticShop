@@ -72,10 +72,14 @@ public static class DownstreamResilience
     public static readonly TimeSpan CircuitBreakerBreakDuration = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// Adds the timeout, retry and circuit-breaker strategies to a typed client. Call it
-    /// <b>after</b> <c>AddHttpMessageHandler&lt;CorrelationIdPropagatingHandler&gt;</c>: handlers run
-    /// outermost-first, so the correlation id is on the message before any retry re-sends it.
+    /// Adds the timeout, retry and circuit-breaker strategies to a typed client.
     /// </summary>
+    /// <remarks>
+    /// This used to have to be called after a <c>CorrelationIdPropagatingHandler</c>, because
+    /// handlers run outermost-first and the id had to be on the message before a retry re-sent it.
+    /// That handler is gone — trace context is propagated by the HttpClient instrumentation instead —
+    /// so the registration order no longer carries a correctness constraint.
+    /// </remarks>
     public static IHttpClientBuilder AddDownstreamResilience(this IHttpClientBuilder builder)
     {
         builder.AddResilienceHandler(PipelineName, static pipeline =>

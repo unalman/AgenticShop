@@ -2,6 +2,10 @@
 @productId = 11111111-1111-1111-1111-111111111111
 @orderId = 22222222-2222-2222-2222-222222222222
 
+# Every response carries an X-Correlation-Id: that request's W3C trace id, and the value its log
+# lines are written under. An inbound X-Correlation-Id is ignored, so the requests below send none —
+# to join a trace you already have, send `traceparent: 00-<32 hex>-<16 hex>-01` instead.
+
 ### Health
 GET {{host}}/health
 
@@ -10,7 +14,6 @@ GET {{host}}/health
 # @name setStock
 POST {{host}}/api/v1/stock
 Content-Type: application/json
-X-Correlation-Id: stock-smoke
 
 {
   "productId": "{{productId}}",
