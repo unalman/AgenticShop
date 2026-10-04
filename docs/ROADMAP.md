@@ -109,8 +109,12 @@ Now that a network hop exists, make its failure modes survivable and visible.
   services' logs, and Catalog's server span parented to Ordering's client span. The cost is a
   **removed public contract** — inbound `X-Correlation-Id` is no longer adopted, so a hand-run smoke
   request can no longer choose a greppable id and reads it off the response instead.
-- Dependency-aware health checks — `/health` currently registers no checks at all, so it reports
-  healthy with the database down
+- ~~Dependency-aware health checks.~~ **Done.** All three services now check their own database —
+  `/health` previously registered no checks at all and reported Healthy with PostgreSQL down. Ordering
+  additionally maps `/health/ready`, which probes Catalog and Stock; `/health` deliberately does not,
+  because a liveness endpoint that depends on another service turns one outage into two. Measured:
+  with Catalog stopped, Ordering's `/health` answered 200 in 7 ms while `/health/ready` answered 503
+  naming Catalog. `docs/ARCHITECTURE.md` §4.10.
 - Dockerfiles for all three services plus a `full` compose profile
 - CI: build, test, and `dotnet ef migrations has-pending-model-changes` as a drift gate
 

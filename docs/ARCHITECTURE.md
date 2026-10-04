@@ -181,6 +181,7 @@ src/AgenticShop.<Service>/
 ├── Endpoints/              one static class per resource
 ├── Errors/                 <Service>ExceptionHandler : ProblemDetailsExceptionHandler
 ├── Clients/                orchestrators only: an interface + typed HttpClient per downstream
+├── Health/                 Ordering only: the readiness probe for those same downstreams
 └── Properties/launchSettings.json
 ```
 
@@ -192,6 +193,7 @@ Two folders a service used to have are now gone from it. `Middleware/` and `Vali
 src/AgenticShop.Shared/
 ├── Contracts/IRequestContract.cs
 ├── Errors/ProblemDetailsExceptionHandler.cs, ExceptionClassification.cs
+├── Health/HealthEndpoint.cs
 ├── Logging/ServiceLogging.cs
 ├── Middleware/CorrelationIdMiddleware.cs
 ├── Tracing/ServiceTracing.cs
@@ -564,8 +566,77 @@ builder.Services.AddServiceTracing(
   infrastructure, and the compose file's `full` profile is a separate Phase 1 item. Nothing in the
   repository depends on a collector being up.
 - Not configured: `RecordException`, span enrichment, and a filter for `/health`. The first two add
-  detail nothing has asked for; the third belongs with the dependency-aware health check work, when
-  `/health` starts being called on a schedule.
+  detail nothing has asked for. The third is still deferred even though the health checks have landed,
+  because nothing calls `/health` on a schedule yet — there is no compose healthcheck for the services
+  (that needs the Dockerfiles) and no orchestrator. A `GET /health` does produce a full server span
+  today; it only becomes noise once something polls.
+
+### 4.10 Health checks
+
+`src/AgenticShop.Shared/Health/HealthEndpoint.cs` holds the paths, the response writer and the two
+selection predicates. Each service registers its checks in `Program.cs`.
+
+**Two endpoints, and the split is the whole design.**
+
+| | Path | Runs | Answering |
+|---|---|---|---|
+| Liveness | `/health` | every check *not* tagged `ready` | "can this process serve requests" |
+| Readiness | `/health/ready` | every check | "can this service do its job right now" |
+
+- **All three services check their own database** via `AddDbContextCheck`, named
+  `HealthEndpoint.DatabaseCheckName` so a consumer sees the same entry name everywhere rather than
+  `CatalogDbContext` in one response and `StockDbContext` in another. This is what closes the gap the
+  endpoint used to have: `AddHealthChecks()` with no check registered reported **Healthy with
+  PostgreSQL down**.
+- **Only Ordering maps `/health/ready`.** A leaf service has no downstream to be unready for, so a
+  second endpoint would return exactly what `/health` already returns. Revisit when an orchestrator
+  needs uniform probe paths across all three.
+- **A check that depends on another service must carry the `ready` tag**, which is what keeps it off
+  `/health`. `DownstreamHealthChecks.AddDownstreamCheck` applies it, so the rule cannot be forgotten by
+  a caller.
+
+**Why liveness must never depend on a downstream.** If it did, one outage would become two: Stock goes
+down, Ordering starts reporting Unhealthy, an orchestrator pulls Ordering out of rotation — and
+Ordering stops serving the reads it could still have answered, and stops refusing placements with an
+honest 502. Verified live: with Catalog stopped, Ordering's `/health` returned 200 in 7 ms while
+`/health/ready` returned 503 naming Catalog.
+
+**Ordering's probe** (`Health/DownstreamHealthCheck.cs`) `GET`s the downstream's own `/health`, using
+`HealthEndpoint.Path` rather than a second literal so it cannot drift onto a path the downstream does
+not expose. It reports `Unhealthy`, not `Degraded`: Degraded maps to HTTP 200, so a consumer would keep
+routing placements that cannot succeed.
+
+The probe uses **its own `HttpClient` with a 2-second timeout, deliberately outside the resilience
+pipeline**. Through `ICatalogClient` it would inherit a 35-second total timeout, and a *slow* Catalog
+would then look like a dead Ordering. `AddCheck` has no overload that resolves an `IHealthCheck` from
+DI, so one client instance is shared by both checks at registration; the alternative was injecting
+`IServiceProvider` into the check, which is a service locator to save one object.
+
+**The response** is JSON built by `HealthEndpoint`, not the framework default:
+
+```json
+{ "status": "Unhealthy", "totalDuration": "00:00:02.0297134",
+  "entries": {
+    "database": { "status": "Healthy", "duration": "00:00:00.0023781" },
+    "Catalog":  { "status": "Unhealthy", "duration": "00:00:02.0156681",
+                  "description": "Catalog timed out after 2s" } } }
+```
+
+The default writer answers `Unhealthy` as plain text and does not say *which* dependency failed, which
+is the only thing worth knowing. `HealthReportEntry.Exception` is **never** written, in any
+environment; `Description` is written only in Development. Both rules, and the measurement that
+corrected an earlier wrong justification for the second, are documented on `HealthEndpoint`.
+
+**Measured, not assumed.** Checks run **concurrently**: with Catalog timing out at 2.02 s and Stock
+answering in 93 ms, `totalDuration` was 2.03 s — the maximum, not the sum. So `/health/ready`'s worst
+case is one probe timeout, not one per downstream. A stopped downstream on Windows costs the *full*
+timeout rather than failing instantly, for the reason recorded in Ordering's decision O18: `localhost`
+tries `::1` first. The same behaviour means a 2 s probe exceeds Kubernetes' default 1 s
+`timeoutSeconds`, which is a revisit point rather than a problem today.
+
+**Known cost.** The framework's `DefaultHealthCheckService` logs an `Error` line per unhealthy check,
+so a polled endpoint during an outage produces one Error per poll. Recorded in `KNOWN-ISSUES.md`;
+nothing polls yet.
 
 ---
 

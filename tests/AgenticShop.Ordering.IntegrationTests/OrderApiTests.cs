@@ -1,8 +1,10 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 using AgenticShop.Ordering.Contracts;
 using AgenticShop.Ordering.Domain;
 using AgenticShop.Ordering.IntegrationTests.Fakes;
+using AgenticShop.Shared.Health;
 using AgenticShop.Shared.Middleware;
 using FluentAssertions;
 using Microsoft.AspNetCore.Http;
@@ -314,11 +316,56 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
     }
 
     [Fact]
-    public async Task Health_Returns200()
+    public async Task Health_StaysHealthyWhenBothDownstreamsAreUnreachable()
     {
-        var response = await Client.GetAsync("/health");
+        // The property the whole two-endpoint split exists for, and this host is an unusually direct
+        // way to test it: the factory points both downstreams at *.invalid, so neither can be reached.
+        // Liveness must not care. If /health reported Unhealthy here, an orchestrator would pull
+        // Ordering out of rotation because Stock was down — and Ordering can still answer every read
+        // it has, and would honestly refuse placements with a 502.
+        var response = await Client.GetAsync(HealthEndpoint.Path);
 
         response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var entries = await ReadHealthEntriesAsync(response);
+
+        entries.Should().ContainKey(HealthEndpoint.DatabaseCheckName);
+        entries[HealthEndpoint.DatabaseCheckName].Should().Be("Healthy");
+
+        entries.Should().NotContainKey("Catalog", "a downstream check is readiness-only");
+        entries.Should().NotContainKey("Stock");
+    }
+
+    [Fact]
+    public async Task HealthReady_ReportsEachUnreachableDownstreamByName()
+    {
+        // Readiness is the endpoint that is allowed to depend on other services, and it has to say
+        // *which* one — "Unhealthy" alone is what the framework's default writer gives and is the
+        // reason for the custom one.
+        var response = await Client.GetAsync(HealthEndpoint.ReadyPath);
+
+        response.StatusCode.Should().Be(HttpStatusCode.ServiceUnavailable);
+
+        var entries = await ReadHealthEntriesAsync(response);
+
+        entries.Should().ContainKey(HealthEndpoint.DatabaseCheckName);
+        entries[HealthEndpoint.DatabaseCheckName].Should().Be("Healthy", "the database is up");
+        entries["Catalog"].Should().Be("Unhealthy");
+        entries["Stock"].Should().Be("Unhealthy");
+    }
+
+    [Fact]
+    public async Task HealthReady_DoesNotLeakTheDownstreamAddress()
+    {
+        // The probe knows a base URL that came from configuration. Whatever it reports, the response
+        // must not become a way to read this service's configuration — the same rule the exception
+        // handler follows, and the reason descriptions are Development-only.
+        var body = await (await Client.GetAsync(HealthEndpoint.ReadyPath))
+            .Content.ReadAsStringAsync();
+
+        body.Should().NotContain("catalog.invalid");
+        body.Should().NotContain("stock.invalid");
+        body.Should().NotContain("Exception");
     }
 
     private static async Task<HttpValidationProblemDetails> ReadValidationProblemAsync(
@@ -331,5 +378,24 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
         problem!.Errors.Should().NotBeEmpty();
 
         return problem;
+    }
+
+    /// <summary>
+    /// The response shape is specified once, in <c>AgenticShop.Shared.UnitTests</c>; this reads only
+    /// what a wiring assertion needs, entry name to status. Duplicated in each service's integration
+    /// assembly on purpose — the three must not reference each other.
+    /// </summary>
+    private static async Task<Dictionary<string, string>> ReadHealthEntriesAsync(
+        HttpResponseMessage response)
+    {
+        response.Content.Headers.ContentType?.MediaType.Should().Be("application/json");
+
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        return json.RootElement.GetProperty("entries")
+            .EnumerateObject()
+            .ToDictionary(
+                entry => entry.Name,
+                entry => entry.Value.GetProperty("status").GetString()!);
     }
 }

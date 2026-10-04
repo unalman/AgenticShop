@@ -1,8 +1,10 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text;
+using System.Text.Json;
 using AgenticShop.Catalog.Contracts;
 using AgenticShop.Catalog.Domain;
+using AgenticShop.Shared.Health;
 using AgenticShop.Shared.Middleware;
 using FluentAssertions;
 using Microsoft.AspNetCore.Http;
@@ -266,6 +268,23 @@ public sealed class ProductApiTests(CatalogApiFixture fixture) : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Health_ReportsTheDatabaseAsHealthy()
+    {
+        // Catalog had no health assertion of its own at all — /health was only used as a convenient
+        // URL by the correlation tests below, which pass whatever it returns. It registered no checks
+        // either, so it reported Healthy with PostgreSQL down. Asserting the entry is what makes the
+        // check real, and this is the reference the other two services copy.
+        var response = await Client.GetAsync(HealthEndpoint.Path);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var entries = await ReadHealthEntriesAsync(response);
+
+        entries.Should().ContainKey(HealthEndpoint.DatabaseCheckName);
+        entries[HealthEndpoint.DatabaseCheckName].Should().Be("Healthy");
+    }
+
+    [Fact]
     public async Task Responses_CarryTheTraceIdAsTheCorrelationId()
     {
         var response = await Client.GetAsync("/health");
@@ -406,5 +425,24 @@ public sealed class ProductApiTests(CatalogApiFixture fixture) : IAsyncLifetime
         value.Should().NotBeNull("the response should carry a JSON body");
 
         return value!;
+    }
+
+    /// <summary>
+    /// The response shape is specified once, in <c>AgenticShop.Shared.UnitTests</c>; this reads only
+    /// what a wiring assertion needs, entry name to status. Duplicated in each service's integration
+    /// assembly on purpose — the three must not reference each other.
+    /// </summary>
+    private static async Task<Dictionary<string, string>> ReadHealthEntriesAsync(
+        HttpResponseMessage response)
+    {
+        response.Content.Headers.ContentType?.MediaType.Should().Be("application/json");
+
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        return json.RootElement.GetProperty("entries")
+            .EnumerateObject()
+            .ToDictionary(
+                entry => entry.Name,
+                entry => entry.Value.GetProperty("status").GetString()!);
     }
 }

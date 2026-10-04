@@ -283,8 +283,15 @@ fixture does not need to reset a sequence — which `ResetDatabaseAsync` cannot 
 ```
 POST /api/v1/orders            201 | 400 | 409 | 502
 GET  /api/v1/orders/{id}       200 | 404
-GET  /health                   200
+GET  /health                   200 | 503   liveness:  this service's database only
+GET  /health/ready             200 | 503   readiness: that database, plus Catalog and Stock
 ```
+
+Both health endpoints answer 503 when a check fails, and name the check that failed — `/health` used
+to register no checks at all and so reported Healthy with the database down. The split, and why a
+liveness endpoint must never probe a downstream, are in `docs/ARCHITECTURE.md` §4.10; Ordering's probe
+is `Health/DownstreamHealthCheck.cs`, on its own 2-second client rather than the typed clients, whose
+35-second resilience total would make a slow Catalog look like a dead Ordering.
 
 That is the whole surface. There is **no list endpoint**: a status-filtered list would be the
 operator's way into `PartiallyConfirmed` orders, but it would need paging to be safe, and Catalog's

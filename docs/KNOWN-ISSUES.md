@@ -87,6 +87,22 @@ the time it was written. Dropping `correlationId` would be a breaking change to 
 shape in exchange for removing a duplicate; if a collector is ever added and `traceId` becomes the
 useful one to grep, revisiting is cheap.
 
+**A polled health endpoint logs an Error per unhealthy check.** *Low · observed 2026-10-04.* The
+framework's `DefaultHealthCheckService` writes
+`Health check database with status Unhealthy completed after 78ms with message 'null'` at **Error**.
+Nothing polls `/health` yet, so today this only appears when a person curls it. Once a compose
+healthcheck or an orchestrator probe exists, a five-minute database outage at a five-second interval
+produces sixty Error lines saying one thing — the same shape as the EF `Database.Command` noise that
+was removed, arriving from a different category.
+
+Not silenced now, for two reasons: there is no poller, so there is no volume, and an unhealthy
+dependency *is* worth one Error when a human asks. The fix when a poller arrives is a Serilog override
+on `Microsoft.Extensions.Diagnostics.HealthChecks`, and the reason it was not done pre-emptively is
+that the right level depends on the poll interval, which does not exist yet.
+
+Note the `with message 'null'`: `AddDbContextCheck` leaves `Description` null and puts the exception in
+`Exception`, which is why the response body carries neither. See `ARCHITECTURE.md` §4.10.
+
 **`DbUpdateConcurrencyException` logs the least useful line under contention.** *Resolved
 2026-10-04.* Each warning used to carry EF's full boilerplate including a documentation URL —
 roughly 230 characters, and **55 of 144 log lines** in one verified Stock run. `DescribeForLog` was

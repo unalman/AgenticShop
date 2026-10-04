@@ -1,3 +1,4 @@
+using AgenticShop.Shared.Health;
 using AgenticShop.Shared.Logging;
 using AgenticShop.Shared.Middleware;
 using AgenticShop.Shared.Tracing;
@@ -35,7 +36,13 @@ builder.Services.AddDbContext<StockDbContext>(options => options
 
 builder.Services.AddProblemDetails();
 builder.Services.AddExceptionHandler<StockExceptionHandler>();
-builder.Services.AddHealthChecks();
+
+// Liveness, answered by the one dependency this service owns. Same shape as Catalog, which carries
+// the full reasoning; see docs/ARCHITECTURE.md §4.10.
+builder.Services
+    .AddHealthChecks()
+    .AddDbContextCheck<StockDbContext>(name: HealthEndpoint.DatabaseCheckName);
+
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
@@ -57,7 +64,9 @@ app.UseSerilogRequestLogging(options => options.GetLevel = ServiceLogging.Reques
 
 app.UseExceptionHandler();
 
-app.MapHealthChecks("/health");
+app.MapHealthChecks(
+    HealthEndpoint.Path,
+    HealthEndpoint.Liveness(app.Environment.IsDevelopment()));
 
 if (app.Environment.IsDevelopment())
 {

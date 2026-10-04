@@ -24,11 +24,12 @@ reference every convention originates from, **Stock** follows it with the delibe
 recorded in §10, **Ordering** is the orchestrator — the only service with outbound calls, and the
 one that forced the conventions to be re-derived rather than copied. **`AgenticShop.Shared`** was
 extracted in Phase 1 and is not a service: it holds the filter, the correlation middleware,
-`IRequestContract`, the logging and tracing configuration and the exception-handler skeleton.
+`IRequestContract`, the logging, tracing and health-response configuration and the exception-handler
+skeleton.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **483 pass**
-(Shared 30 unit; Catalog 67 unit + 38 integration; Stock 81 unit + 61 integration; Ordering 131 unit
-+ 75 integration). Database isolation verified 22/22.
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **503 pass**
+(Shared 38 unit; Catalog 67 unit + 39 integration; Stock 81 unit + 61 integration; Ordering 140 unit
++ 77 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
 
@@ -221,18 +222,20 @@ The ordering matters: retrying without idempotency keys double-reserves stock; a
 a broker is dead weight; CQRS without read pressure is ceremony.
 
 **Now permitted, because Phase 1 has started — but only the ones that are done:**
-the shared infrastructure library (`AgenticShop.Shared`, §2), **idempotency keys on
-`POST /orders`** (Ordering decision O17 — a required `Idempotency-Key` header, a claim committed
-before the first side effect, a completion written in the same transaction as the order),
-**resilience policies on Ordering's typed clients** (Ordering decision O18 — timeout, retry and a
-circuit breaker, with retry enabled per request and reserve exempt), **Serilog in all three
-services** (`docs/DECISIONS.md` → "Serilog, adopted in Catalog first", configured once in
-`AgenticShop.Shared/Logging`), and **OpenTelemetry tracing in all three** (`docs/DECISIONS.md` →
-"OpenTelemetry, and the correlation id became the trace id", configured once in
-`AgenticShop.Shared/Tracing`). Nothing else on the list above has been unblocked; dependency-aware
-health checks are still ahead. **Do not extend retry to another outbound call before reading O18** —
-the exemption on reserve is what stops a retry from stranding a hold and reporting it as
-out-of-stock.
+the shared infrastructure library (`AgenticShop.Shared`, §2) · **idempotency keys on `POST /orders`**
+(Ordering decision O17) · **resilience on Ordering's typed clients** (Ordering decision O18) ·
+**Serilog in all three services** (`docs/DECISIONS.md` → "Serilog, adopted in Catalog first",
+configured once in `AgenticShop.Shared/Logging`) · **OpenTelemetry tracing in all three** (→
+"OpenTelemetry, and the correlation id became the trace id", in `AgenticShop.Shared/Tracing`) ·
+**dependency-aware health checks** (`docs/ARCHITECTURE.md` §4.10, response writer in
+`AgenticShop.Shared/Health`). Nothing else on the list above has been unblocked.
+
+Two of those carry a rule that is easy to get wrong, and only one of them is fully test-guarded.
+**Do not extend retry to another outbound call before reading O18** — the exemption on reserve is what
+stops a retry from stranding a hold and reporting it as out-of-stock. **A health check that calls
+another service must carry the `ready` tag**, or it lands on `/health` and a liveness endpoint that
+depends on a downstream turns one outage into two; the existing test pins Catalog and Stock by name,
+so it will *not* catch a third check added without the tag.
 
 ## 9. Git rules
 

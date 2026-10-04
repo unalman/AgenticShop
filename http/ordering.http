@@ -27,8 +27,14 @@
 @catalog = http://localhost:5081
 @stock = http://localhost:5082
 
-### Health
+### Health — liveness: this service's database only, never a downstream
 GET {{ordering}}/health
+
+### Health — readiness: that database plus Catalog and Stock
+# Stop Catalog and re-run both: /health stays 200 while this one goes 503 and names Catalog. That is
+# the point of having two endpoints — a liveness probe that depended on a downstream would let one
+# outage take Ordering out of rotation too.
+GET {{ordering}}/health/ready
 
 ### 1. Create a product in Catalog
 # @name createProduct

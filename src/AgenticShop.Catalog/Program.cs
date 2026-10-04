@@ -1,6 +1,7 @@
 using AgenticShop.Catalog.Data;
 using AgenticShop.Catalog.Endpoints;
 using AgenticShop.Catalog.Errors;
+using AgenticShop.Shared.Health;
 using AgenticShop.Shared.Logging;
 using AgenticShop.Shared.Middleware;
 using AgenticShop.Shared.Tracing;
@@ -36,7 +37,15 @@ builder.Services.AddDbContext<CatalogDbContext>(options => options
 
 builder.Services.AddProblemDetails();
 builder.Services.AddExceptionHandler<CatalogExceptionHandler>();
-builder.Services.AddHealthChecks();
+
+// Liveness: can this process serve requests? Answered by the one dependency it owns, its database —
+// which is the gap this closes, since an empty AddHealthChecks() reported Healthy with PostgreSQL
+// down. A leaf service has no downstream to be unready for, so it maps /health and not /health/ready;
+// a second endpoint returning the same thing would be ceremony.
+builder.Services
+    .AddHealthChecks()
+    .AddDbContextCheck<CatalogDbContext>(name: HealthEndpoint.DatabaseCheckName);
+
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
@@ -58,7 +67,12 @@ app.UseSerilogRequestLogging(options => options.GetLevel = ServiceLogging.Reques
 
 app.UseExceptionHandler();
 
-app.MapHealthChecks("/health");
+// JSON, with per-check status and duration. Descriptions appear only in Development; the exception
+// object is never written in any environment. Both rules and the evidence behind them are on
+// HealthEndpoint.
+app.MapHealthChecks(
+    HealthEndpoint.Path,
+    HealthEndpoint.Liveness(app.Environment.IsDevelopment()));
 
 if (app.Environment.IsDevelopment())
 {

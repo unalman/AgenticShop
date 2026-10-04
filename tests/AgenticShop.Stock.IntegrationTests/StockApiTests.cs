@@ -1,6 +1,8 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text;
+using System.Text.Json;
+using AgenticShop.Shared.Health;
 using AgenticShop.Shared.Middleware;
 using AgenticShop.Stock.Contracts;
 using AgenticShop.Stock.Domain;
@@ -22,11 +24,18 @@ public sealed class StockApiTests(StockApiFixture fixture) : IAsyncLifetime
     public Task DisposeAsync() => Task.CompletedTask;
 
     [Fact]
-    public async Task Health_Returns200()
+    public async Task Health_ReportsTheDatabaseAsHealthy()
     {
-        var response = await Client.GetAsync("/health");
+        // Was `Health_Returns200`, which passed while the endpoint registered no checks at all and so
+        // reported Healthy with PostgreSQL down. Asserting the entry is what makes the check real.
+        var response = await Client.GetAsync(HealthEndpoint.Path);
 
         response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var entries = await ReadHealthEntriesAsync(response);
+
+        entries.Should().ContainKey(HealthEndpoint.DatabaseCheckName);
+        entries[HealthEndpoint.DatabaseCheckName].Should().Be("Healthy");
     }
 
     [Fact]
@@ -274,5 +283,24 @@ public sealed class StockApiTests(StockApiFixture fixture) : IAsyncLifetime
         response.StatusCode.Should().Be(HttpStatusCode.Created, "the reservation should have been created");
 
         return await ReadJsonAsync<ReservationResponse>(response);
+    }
+
+    /// <summary>
+    /// The response shape is specified once, in <c>AgenticShop.Shared.UnitTests</c>; this reads only
+    /// what a wiring assertion needs, entry name to status. Duplicated in each service's integration
+    /// assembly on purpose — the three must not reference each other.
+    /// </summary>
+    private static async Task<Dictionary<string, string>> ReadHealthEntriesAsync(
+        HttpResponseMessage response)
+    {
+        response.Content.Headers.ContentType?.MediaType.Should().Be("application/json");
+
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        return json.RootElement.GetProperty("entries")
+            .EnumerateObject()
+            .ToDictionary(
+                entry => entry.Name,
+                entry => entry.Value.GetProperty("status").GetString()!);
     }
 }

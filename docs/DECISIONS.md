@@ -526,6 +526,63 @@ it needs a collector or a failing dependency mid-trace. Recorded rather than gue
 **Deliberately not configured:** `RecordException`, span enrichment, and a `/health` span filter. See
 `ARCHITECTURE.md` §4.9.
 
+### Health checks, split into liveness and readiness
+
+**Context.** `/health` existed in all three services and registered **no checks at all**, so it
+answered `Healthy` with PostgreSQL down. That is worse than no endpoint: it is a signal that reads as
+verified and is not.
+
+**Decision.** `AddDbContextCheck` on each service's own context, named `database` in all three so a
+consumer sees one entry name everywhere. Ordering additionally maps `/health/ready`, which probes
+Catalog's and Stock's own `/health`. Catalog and Stock map `/health` only.
+
+**Why two endpoints rather than one.** A liveness endpoint that depends on another service turns one
+outage into two: Stock goes down, Ordering reports Unhealthy, an orchestrator pulls Ordering out of
+rotation — and Ordering stops answering the reads it could still have served, and stops refusing
+placements with an honest 502. Keeping the downstream probe behind a `ready` tag preserves the
+distinction without needing an orchestrator to exist yet. Verified live: with Catalog stopped,
+Ordering's `/health` answered 200 in 7 ms while `/health/ready` answered 503 and named Catalog.
+
+**Why leaf services get no `/health/ready`.** Their readiness is their database, which is exactly what
+`/health` already reports. Two endpoints returning the same thing is ceremony, and nothing consumes a
+readiness path separately until Kubernetes arrives. Revisit then, when uniform probe paths across the
+three become worth more than the duplication.
+
+**Why the probe does not use the typed clients.** `ICatalogClient` runs through the resilience pipeline
+whose total timeout is 35 s, so a *slow* Catalog would make `/health/ready` hang for 35 s and report a
+dead Ordering. The probe uses its own `HttpClient` at 2 s with no retry: a probe should fail fast and
+say so, not absorb the fault it exists to report.
+
+**Why `Unhealthy` and not `Degraded`.** Degraded maps to HTTP 200, so a consumer would keep routing
+placements that cannot succeed.
+
+**Rejected: resolving the probe's `HttpClient` from DI inside the check.** `AddCheck` has no overload
+that builds an `IHealthCheck` from the container, so the instance must exist at registration time. The
+alternatives were injecting `IServiceProvider` — a service locator, to save one object — or two
+subclasses of the same check. One shared client instance is smaller than either. The cost is that
+probe calls get no `IHttpClientFactory` handler pooling; for two requests per readiness poll that is
+nothing, and they also get no HttpClient instrumentation span, which for a probe is less noise rather
+than a loss.
+
+**Measurement that changed the documentation.** Checks run concurrently, not sequentially: Catalog
+timing out at 2.02 s and Stock answering in 93 ms produced a `totalDuration` of 2.03 s — the maximum,
+not the sum. So `/health/ready`'s worst case is one probe timeout. A stopped downstream on Windows
+costs the *full* timeout rather than failing instantly, for the reason O18 records (`localhost` tries
+`::1` first), which means the 2 s probe exceeds Kubernetes' default 1 s `timeoutSeconds` — a revisit
+point, not a problem today.
+
+**A justification I had to retract.** The response writer gates `Description` on Development, and the
+first draft of that rule claimed a failed database check's description exposes host, port and database
+name. Running it with the database stopped showed the body contains **no description at all**: EF puts
+the exception in `Exception` and leaves `Description` null. The gate stays, because the framework's own
+`UIResponseWriter` emits descriptions unconditionally and third-party checks commonly derive them from
+exception messages — so the first check added for a broker or a cache could leak through a writer that
+had not thought about it. But it is defence in depth, not a fix for a live leak, and the comment now
+says so. What does the real work is that `Exception` is never written in any environment.
+
+**Known cost, recorded not fixed.** The framework logs an Error line per unhealthy check, so a polled
+endpoint during an outage produces one Error per poll. See `KNOWN-ISSUES.md` → Observability.
+
 ---
 
 ## Testing

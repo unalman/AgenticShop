@@ -296,14 +296,14 @@ Each phase adds one capability, and only once the previous phase makes it necess
 Three hosts, synchronous HTTP, one database per service, Testcontainers. All three services
 are implemented and verified: at the close of Phase 0, 426 tests, a clean build under
 `TreatWarningsAsErrors`, database isolation 22/22, and the three-host path driven by hand
-through `http/ordering.http`. **The suite is now at 483.**
+through `http/ordering.http`. **The suite is now at 503.**
 
 **Phase 1 — Reliability and observability** *(in progress)*
 Shared infrastructure library — **done** · idempotency keys on `POST /orders` — **done** ·
 retry/circuit-breaker/timeout policies on Ordering's typed clients — **done** · Serilog structured
 logging — **done in all three services** · OpenTelemetry distributed tracing — **done in all three** ·
-dependency-aware health checks · Dockerfiles and a `full` compose profile · CI. Retry is driven by a
-measured problem:
+dependency-aware health checks — **done** · Dockerfiles and a `full` compose profile · CI. Retry is
+driven by a measured problem:
 a 40-way burst against 10 units of stock held only 4, because `xmin` conflicts are not retried.
 Idempotency keys came first, because retrying without them double-reserves stock — and they closed
 the largest residual the repository had, since a retried `POST /orders` used to create a second order

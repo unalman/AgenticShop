@@ -2,6 +2,8 @@ using AgenticShop.Ordering.Clients;
 using AgenticShop.Ordering.Data;
 using AgenticShop.Ordering.Endpoints;
 using AgenticShop.Ordering.Errors;
+using AgenticShop.Ordering.Health;
+using AgenticShop.Shared.Health;
 using AgenticShop.Shared.Logging;
 using AgenticShop.Shared.Middleware;
 using AgenticShop.Shared.Tracing;
@@ -65,7 +67,33 @@ builder.Services.AddScoped<OrderPlacer>();
 
 builder.Services.AddProblemDetails();
 builder.Services.AddExceptionHandler<OrderingExceptionHandler>();
-builder.Services.AddHealthChecks();
+
+// Two endpoints, deliberately, and the difference is the whole design.
+//
+// /health is liveness: the database this service owns and nothing else. A downstream outage must not
+// make Ordering report itself down, or one failure becomes two — Stock goes down, an orchestrator
+// pulls Ordering out of rotation, and Ordering stops serving the reads it could still have answered.
+//
+// /health/ready is readiness: the same database plus Catalog and Stock, because "can I place an order
+// right now" genuinely depends on both.
+//
+// The probe client is built apart from the typed clients so it stays outside the resilience
+// pipeline, whose 35-second total timeout would turn a *slow* Catalog into a dead Ordering. One
+// client shared by both checks; the reasoning is on DownstreamHealthChecks.AddDownstreamCheck.
+using var healthProbeClient = new HttpClient { Timeout = DownstreamHealthCheck.Timeout };
+
+builder.Services
+    .AddHealthChecks()
+    .AddDbContextCheck<OrderingDbContext>(name: HealthEndpoint.DatabaseCheckName)
+    .AddDownstreamCheck(
+        "Catalog",
+        new Uri(RequireServiceBaseUrl(builder.Configuration, "Catalog")),
+        healthProbeClient)
+    .AddDownstreamCheck(
+        "Stock",
+        new Uri(RequireServiceBaseUrl(builder.Configuration, "Stock")),
+        healthProbeClient);
+
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
@@ -96,7 +124,13 @@ app.UseSerilogRequestLogging(options => options.GetLevel = ServiceLogging.Reques
 
 app.UseExceptionHandler();
 
-app.MapHealthChecks("/health");
+app.MapHealthChecks(
+    HealthEndpoint.Path,
+    HealthEndpoint.Liveness(app.Environment.IsDevelopment()));
+
+app.MapHealthChecks(
+    HealthEndpoint.ReadyPath,
+    HealthEndpoint.Ready(app.Environment.IsDevelopment()));
 
 if (app.Environment.IsDevelopment())
 {
