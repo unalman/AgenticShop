@@ -1,0 +1,75 @@
+# One Dockerfile for all three services, parameterised by the project name.
+#
+# The build context MUST be the repository root, not the service directory. Directory.Build.props,
+# Directory.Build.targets, Directory.Packages.props and global.json sit there, every service
+# ProjectReferences AgenticShop.Shared, and .editorconfig drives the style diagnostics that
+# TreatWarningsAsErrors turns into build failures. Compose passes both the context and the arg:
+#
+#   docker compose --profile full build catalog
+#   docker build -f docker/Dockerfile.service --build-arg SERVICE=AgenticShop.Catalog .
+#
+# Tags float the minor, exactly like postgres:17-alpine in docker-compose.yml, so patch releases
+# arrive without a repository edit. The SDK is nevertheless constrained to the band global.json
+# pins, because global.json is copied into the build. The reasoning, and what floating costs, is
+# in docs/DECISIONS.md.
+ARG DOTNET_SDK_TAG=10.0
+ARG DOTNET_RUNTIME_TAG=10.0
+
+# -------------------------------------------------------------------------------------------
+# Build and publish, framework-dependent: the runtime itself comes from the base image below.
+# -------------------------------------------------------------------------------------------
+FROM mcr.microsoft.com/dotnet/sdk:${DOTNET_SDK_TAG} AS build
+ARG SERVICE
+WORKDIR /source
+
+# Restore first, from only the files restore reads, so that editing a source file does not
+# invalidate this layer and re-resolve every package. The Shared csproj is here because it is a
+# ProjectReference of the service being built, and MSBuild needs the file to exist to restore.
+COPY global.json .editorconfig Directory.Build.props Directory.Build.targets Directory.Packages.props ./
+COPY src/AgenticShop.Shared/AgenticShop.Shared.csproj src/AgenticShop.Shared/
+COPY src/${SERVICE}/${SERVICE}.csproj src/${SERVICE}/
+RUN dotnet restore src/${SERVICE}/${SERVICE}.csproj
+
+# Only this service and Shared, not the whole of src/: the boundary guard in
+# Directory.Build.targets inspects the building project's own references rather than walking the
+# repository, so the other two services are not needed here and copying them would invalidate
+# this layer whenever an unrelated service changed.
+COPY src/AgenticShop.Shared/ src/AgenticShop.Shared/
+COPY src/${SERVICE}/ src/${SERVICE}/
+RUN dotnet publish src/${SERVICE}/${SERVICE}.csproj -c Release -o /app/publish /p:UseAppHost=false
+
+# -------------------------------------------------------------------------------------------
+# Runtime.
+# -------------------------------------------------------------------------------------------
+FROM mcr.microsoft.com/dotnet/aspnet:${DOTNET_RUNTIME_TAG} AS final
+ARG SERVICE
+WORKDIR /app
+
+# The runtime image ships no HTTP client — neither curl nor wget — and a healthcheck needs one.
+# Compose reads it for `condition: service_healthy`, for `depends_on` ordering and for the status
+# column of `docker compose ps`. Without recommends, and the apt lists go in the same layer.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /app/publish ./
+
+# The base image defines a non-root `app` account (UID 1654) but leaves USER unset, so its default
+# is root. Declared explicitly rather than inherited, for the reason AGENTS.md §7 gives for
+# declaring the test environment: a default owned by something else is not a decision this
+# repository has made, and it can change underneath us. Port 8080 is above the privileged range,
+# so binding it needs nothing from root.
+USER app
+
+# Also set by the base image. Repeated so the port the container listens on is stated where the
+# ENTRYPOINT and the compose port mapping refer to it, instead of being something to look up.
+ENV ASPNETCORE_HTTP_PORTS=8080
+EXPOSE 8080
+
+# The assembly name comes from the build arg, which the JSON array form of ENTRYPOINT cannot
+# interpolate — hence `sh -c`. The `exec` is the part that matters: it replaces the shell with
+# dotnet, so dotnet is PID 1 and receives SIGTERM directly. Without it the shell is PID 1,
+# forwards nothing, and `docker stop` waits out its grace period and then SIGKILLs the process,
+# which is how a graceful shutdown becomes a hard kill.
+ENV SERVICE_ASSEMBLY=${SERVICE}.dll
+ENTRYPOINT ["sh", "-c", "exec dotnet \"$SERVICE_ASSEMBLY\""]

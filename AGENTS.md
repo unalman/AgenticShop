@@ -27,9 +27,9 @@ extracted in Phase 1 and is not a service: it holds the filter, the correlation 
 `IRequestContract`, the logging, tracing and health-response configuration and the exception-handler
 skeleton.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **503 pass**
-(Shared 38 unit; Catalog 67 unit + 39 integration; Stock 81 unit + 61 integration; Ordering 140 unit
-+ 77 integration). Database isolation verified 22/22.
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **517 pass**
+(Shared 45 unit; Catalog 68 unit + 40 integration; Stock 82 unit + 62 integration; Ordering 142 unit
++ 78 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
 
@@ -212,8 +212,8 @@ each deferral, including the few with no assigned phase: `docs/DECISIONS.md`.
 **Still deferred — do not add:**
 
 **RabbitMQ or any broker · Outbox / Inbox · Redis · authentication / authorization ·
-Kubernetes / Helm · API gateway (YARP) · CQRS · DDD tactical patterns · event sourcing · service
-Dockerfiles · CI pipeline.**
+Kubernetes / Helm · API gateway (YARP) · CQRS · DDD tactical patterns · event sourcing ·
+CI pipeline.**
 
 Also do not add at this size: repository or service layers, an `Application` layer, a mediator,
 `Result<T>` monads, a mapping framework, domain-event plumbing, or a `Money` value object.
@@ -228,14 +228,20 @@ the shared infrastructure library (`AgenticShop.Shared`, §2) · **idempotency k
 configured once in `AgenticShop.Shared/Logging`) · **OpenTelemetry tracing in all three** (→
 "OpenTelemetry, and the correlation id became the trace id", in `AgenticShop.Shared/Tracing`) ·
 **dependency-aware health checks** (`docs/ARCHITECTURE.md` §4.10, response writer in
-`AgenticShop.Shared/Health`). Nothing else on the list above has been unblocked.
+`AgenticShop.Shared/Health`) · **service containers** — one shared `docker/Dockerfile.service` behind
+compose's opt-in `full` profile (→ "One Dockerfile for three services"). Nothing else on the list
+above has been unblocked.
 
-Two of those carry a rule that is easy to get wrong, and only one of them is fully test-guarded.
+Three of those carry a rule that is easy to get wrong, and only one of them is fully test-guarded.
 **Do not extend retry to another outbound call before reading O18** — the exemption on reserve is what
 stops a retry from stranding a hold and reporting it as out-of-stock. **A health check that calls
 another service must carry the `ready` tag**, or it lands on `/health` and a liveness endpoint that
 depends on a downstream turns one outage into two; the existing test pins Catalog and Stock by name,
-so it will *not* catch a third check added without the tag.
+so it will *not* catch a third check added without the tag. **`--profile full` publishes the services
+on the host's own 5081–5083**, so never run it while `dotnet watch` holds those ports — a bind
+failure, not a merge. Relatedly, do not "simplify" Ordering's readiness probe back to a `Uri` built at
+registration: it resolves its target per call precisely so a test host can override it, and reverting
+it turns the suite red only while something happens to occupy those ports (§5.4).
 
 ## 9. Git rules
 

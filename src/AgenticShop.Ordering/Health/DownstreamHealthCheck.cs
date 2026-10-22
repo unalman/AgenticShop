@@ -39,7 +39,23 @@ namespace AgenticShop.Ordering.Health;
 /// is the one thing a bare "Unhealthy" cannot tell a caller.
 /// </para>
 /// </remarks>
-public sealed class DownstreamHealthCheck(HttpClient http, Uri healthUri, string downstream) : IHealthCheck
+/// <param name="http">The shared probe client; see <see cref="DownstreamHealthChecks"/>.</param>
+/// <param name="healthUri">
+/// Resolves the downstream's full <c>/health</c> address, and deliberately a factory rather than a
+/// <see cref="Uri"/>: the target has to be read from configuration at probe time, not captured at
+/// registration. <c>WebApplicationFactory</c> applies its configuration override only once
+/// <c>Program.cs</c> reaches <c>Build()</c>, so a <c>Uri</c> built during registration freezes
+/// <c>appsettings.Development.json</c> — the same trap <c>ARCHITECTURE.md</c> §5.4 records for the
+/// connection string. This is measured, not theorised: with the containerised services running, an
+/// eagerly built target made the test host probe the developer's own <c>localhost:5081</c> and
+/// <c>localhost:5082</c>, both answered 200, and <c>/health/ready</c> reported Healthy instead of
+/// Unhealthy. A missing or malformed value still fails fast in a real deployment, because
+/// <c>Program.cs</c> validates both keys after <c>Build()</c>.
+/// </param>
+/// <param name="downstream">
+/// The downstream's name, used as the subject of every description this check writes.
+/// </param>
+public sealed class DownstreamHealthCheck(HttpClient http, Func<Uri> healthUri, string downstream) : IHealthCheck
 {
     /// <summary>
     /// Bounds one probe. Two seconds is far above a loopback round trip and far below the 35-second
@@ -52,9 +68,14 @@ public sealed class DownstreamHealthCheck(HttpClient http, Uri healthUri, string
         HealthCheckContext context,
         CancellationToken cancellationToken = default)
     {
+        // Resolved outside the try: a configuration failure is not a probe outcome, and letting it
+        // propagate reports the check as Unhealthy with the exception attached rather than as
+        // "Catalog did not respond".
+        var target = healthUri();
+
         try
         {
-            using var response = await http.GetAsync(healthUri, cancellationToken);
+            using var response = await http.GetAsync(target, cancellationToken);
 
             return response.IsSuccessStatusCode
                 ? HealthCheckResult.Healthy()
@@ -89,9 +110,12 @@ public static class DownstreamHealthChecks
     /// service's name as the rest of this service refers to it.
     /// </param>
     /// <param name="baseUrl">
-    /// The downstream's configured base address. <see cref="HealthEndpoint.Path"/> is appended to it —
-    /// and that constant is shared precisely so this probe hits the path the downstream actually
-    /// exposes, rather than a second string that could drift from it.
+    /// Resolves the downstream's configured base address. A factory for the reason
+    /// <see cref="DownstreamHealthCheck"/> gives: registration runs before a test host's
+    /// configuration override exists, so reading the value here would freeze it.
+    /// <see cref="HealthEndpoint.Path"/> is appended to it — and that constant is shared precisely so
+    /// this probe hits the path the downstream actually exposes, rather than a second string that
+    /// could drift from it.
     /// </param>
     /// <param name="probeClient">
     /// Shared by every downstream check, and deliberately not an <c>IHttpClientFactory</c> named
@@ -102,10 +126,13 @@ public static class DownstreamHealthChecks
     public static IHealthChecksBuilder AddDownstreamCheck(
         this IHealthChecksBuilder builder,
         string downstream,
-        Uri baseUrl,
+        Func<Uri> baseUrl,
         HttpClient probeClient)
         => builder.AddCheck(
             downstream,
-            new DownstreamHealthCheck(probeClient, new Uri(baseUrl, HealthEndpoint.Path), downstream),
+            new DownstreamHealthCheck(
+                probeClient,
+                () => new Uri(baseUrl(), HealthEndpoint.Path),
+                downstream),
             tags: [HealthEndpoint.ReadyTag]);
 }

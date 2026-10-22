@@ -1,3 +1,4 @@
+using AgenticShop.Shared.Health;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 
@@ -22,10 +23,17 @@ namespace AgenticShop.Shared.Tracing;
 /// was never captured anywhere.
 /// </para>
 /// <para>
-/// Deliberately not configured: <c>RecordException</c>, span enrichment, and a filter for
-/// <c>/health</c>. The first two add detail nothing has asked for yet, and the third belongs with the
-/// dependency-aware health check work, when <c>/health</c> starts being called on a schedule and its
-/// spans become noise worth excluding.
+/// Deliberately not configured: <c>RecordException</c> and span enrichment. Both add detail nothing
+/// has asked for yet.
+/// </para>
+/// <para>
+/// A filter for the health endpoints <i>is</i> configured, and this is the moment the remarks on
+/// this class originally deferred it to: <c>/health</c> is now called on a schedule, by the compose
+/// healthcheck, so its spans are noise rather than signal. Measured in a containerised Catalog, one
+/// probe produced a single access-log line and a 26-line span dump — at a ten-second interval that is
+/// roughly 160 lines a minute of nothing, and it buries the requests worth reading. The access-log
+/// line survives, so a probe is still recorded with its status and duration; what goes is the span.
+/// See <see cref="IsTracedRequest"/>.
 /// </para>
 /// </remarks>
 public static class ServiceTracing
@@ -63,7 +71,7 @@ public static class ServiceTracing
         {
             tracing.ConfigureResource(resource => resource.AddService(serviceName));
 
-            tracing.AddAspNetCoreInstrumentation();
+            tracing.AddAspNetCoreInstrumentation(options => options.Filter = IsTracedRequest);
 
             if (instrumentHttpClient)
             {
@@ -86,4 +94,20 @@ public static class ServiceTracing
 
         return services;
     }
+
+    /// <summary>
+    /// The instrumentation filter: false suppresses the span for that request. Excludes both health
+    /// endpoints, because a scheduled probe produces a span nobody reads — <see cref="HealthEndpoint.ReadyPath"/>
+    /// is covered by the same test, since <c>StartsWithSegments</c> matches on whole path segments
+    /// and so takes in everything beneath <see cref="HealthEndpoint.Path"/>.
+    /// </summary>
+    /// <remarks>
+    /// Segment matching is what makes this safe to widen later and precise now: <c>/health</c> and
+    /// <c>/health/ready</c> are excluded while <c>/healthz</c>, or any future endpoint that merely
+    /// begins with those characters, is not. Public rather than private so that the decision — which
+    /// paths are worth a span — is asserted directly in <c>AgenticShop.Shared.UnitTests</c> instead of
+    /// only through the instrumentation's options.
+    /// </remarks>
+    public static bool IsTracedRequest(HttpContext context)
+        => !context.Request.Path.StartsWithSegments(HealthEndpoint.Path);
 }

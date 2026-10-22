@@ -64,12 +64,41 @@ public class DownstreamHealthCheckTests
 
         var check = new DownstreamHealthCheck(
             Client(_ => throw new TaskCanceledException()),
-            new Uri("http://catalog.invalid/health"),
+            () => new Uri("http://catalog.invalid/health"),
             "Catalog");
 
         var act = () => check.CheckHealthAsync(Context(), cancelled.Token);
 
         await act.Should().ThrowAsync<TaskCanceledException>();
+    }
+
+    [Fact]
+    public async Task TheTargetIsResolvedPerProbeAndNotCapturedAtConstruction()
+    {
+        // Why the check takes a Func<Uri> rather than a Uri, pinned so a refactor back to an eager
+        // target is a test failure instead of an environment-dependent one. WebApplicationFactory
+        // applies its configuration override only once Program.cs reaches Build(), so a Uri built
+        // during registration freezes appsettings.Development.json. That was measured, not theorised:
+        // with the containerised stack up, the test host probed the real Catalog and Stock on
+        // localhost:5081 and localhost:5082, both answered 200, and /health/ready reported Healthy
+        // instead of Unhealthy. It also explains why this guard exists as a unit test — the
+        // integration assertion only fails while something happens to be listening on those ports.
+        var resolutions = 0;
+        var check = new DownstreamHealthCheck(
+            Client(_ => Respond(HttpStatusCode.OK)),
+            () =>
+            {
+                resolutions++;
+                return new Uri("http://catalog.invalid/health");
+            },
+            "Catalog");
+
+        resolutions.Should().Be(0, "constructing the check must not resolve its target");
+
+        await check.CheckHealthAsync(Context());
+        await check.CheckHealthAsync(Context());
+
+        resolutions.Should().Be(2, "every probe resolves the target from live configuration");
     }
 
     [Fact]
@@ -108,7 +137,7 @@ public class DownstreamHealthCheckTests
     {
         var check = new DownstreamHealthCheck(
             Client(respond),
-            new Uri("http://catalog.invalid/health"),
+            () => new Uri("http://catalog.invalid/health"),
             downstream);
 
         return await check.CheckHealthAsync(Context());

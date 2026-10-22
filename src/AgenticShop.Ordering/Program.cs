@@ -85,13 +85,18 @@ using var healthProbeClient = new HttpClient { Timeout = DownstreamHealthCheck.T
 builder.Services
     .AddHealthChecks()
     .AddDbContextCheck<OrderingDbContext>(name: HealthEndpoint.DatabaseCheckName)
+    // Both base URLs are resolved by a lambda rather than read into a Uri here, for the reason
+    // ARCHITECTURE.md §5.4 gives for the connection string: a test host's configuration override
+    // does not exist yet, so a value read now freezes appsettings.Development.json and the probe
+    // dials whatever is listening on the developer's own 5081 and 5082. Startup still fails fast on
+    // a missing or malformed key — RequireServiceBaseUrl runs again on app.Configuration below.
     .AddDownstreamCheck(
         "Catalog",
-        new Uri(RequireServiceBaseUrl(builder.Configuration, "Catalog")),
+        () => new Uri(RequireServiceBaseUrl(builder.Configuration, "Catalog")),
         healthProbeClient)
     .AddDownstreamCheck(
         "Stock",
-        new Uri(RequireServiceBaseUrl(builder.Configuration, "Stock")),
+        () => new Uri(RequireServiceBaseUrl(builder.Configuration, "Stock")),
         healthProbeClient);
 
 builder.Services.AddOpenApi();

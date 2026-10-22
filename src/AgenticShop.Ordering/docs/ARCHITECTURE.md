@@ -293,6 +293,15 @@ liveness endpoint must never probe a downstream, are in `docs/ARCHITECTURE.md` �
 is `Health/DownstreamHealthCheck.cs`, on its own 2-second client rather than the typed clients, whose
 35-second resilience total would make a slow Catalog look like a dead Ordering.
 
+The probe takes a `Func<Uri>` and resolves its target **per call**, not once at registration. That is
+not stylistic: `WebApplicationFactory` applies its configuration override only when `Program.cs`
+reaches `Build()`, so a `Uri` built during registration freezes `appsettings.Development.json` and the
+test host probes the developer's own `localhost:5081` and `5082`. Measured with the containerised
+services running — `/health/ready` answered 200 instead of 503, because both answered. It is the same
+trap §5.4 records for the connection string, and it stayed invisible for as long as those ports were
+empty. `TheTargetIsResolvedPerProbeAndNotCapturedAtConstruction` pins it, because the integration
+assertion only fails while something happens to be listening.
+
 That is the whole surface. There is **no list endpoint**: a status-filtered list would be the
 operator's way into `PartiallyConfirmed` orders, but it would need paging to be safe, and Catalog's
 paging is explicitly not house style. Phase 0 does not need one — the 409 and 502 bodies carry the

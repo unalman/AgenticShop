@@ -28,7 +28,8 @@ Everything here describes the verified current state.
 | Logging | `Serilog.AspNetCore` — all three services, configured once in `AgenticShop.Shared` | 10.0.0 |
 | Tracing | `OpenTelemetry.Extensions.Hosting` + AspNetCore/Http instrumentation + Console/OTLP exporters, configured once in `AgenticShop.Shared` | 1.19.1 / 1.19.0 |
 | Health | ASP.NET Core health checks (framework) + `…HealthChecks.EntityFrameworkCore` for the database check | 10.0.12 |
-| Containers | Docker / Compose | 29.8.0 / 5.5.1 |
+| Containers | Docker / Compose | 29.9.2 / 5.6.1 |
+| Service images | `mcr.microsoft.com/dotnet/sdk` (build) → `…/aspnet` (runtime). One Dockerfile for all three services, parameterised by project name; tags float the minor | 10.0 |
 | Test DB / host | `Testcontainers.PostgreSql` / `Mvc.Testing` | 4.15.0 / 10.0.12 |
 | Tests | xunit + FluentAssertions | 2.9.3 / 8.11.0 |
 | Solution | `.slnx` | — |
@@ -45,6 +46,7 @@ file; when the two disagree, the build file is right and this document is stale.
 | `Directory.Packages.props` | every `PackageReference` version, centrally — a project must omit `Version` |
 | `dotnet-tools.json` | `dotnet-ef` |
 | `docker-compose.yml` | the `postgres:17-alpine` image |
+| `docker/Dockerfile.service` | the `DOTNET_SDK_TAG` / `DOTNET_RUNTIME_TAG` defaults, the `curl` a healthcheck needs, and the explicit `USER app` |
 
 Change a version in its pinning file and update §1 in the same commit.
 

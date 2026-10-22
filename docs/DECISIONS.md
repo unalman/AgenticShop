@@ -93,6 +93,58 @@ dropped. Also add `dotnet list package --vulnerable` once CI exists.
 cross-service base URLs are stable configuration rather than runtime discovery. **Revisit:**
 if two developers must share one machine, which `container_name` also blocks.
 
+### One Dockerfile for three services, behind an opt-in compose profile
+
+**Context.** Phase 0 containerised PostgreSQL alone and ran the APIs on the host. Phase 1's health
+checks and tracing made the *shape* of the system worth checking as containers — does Ordering still
+resolve Catalog over DNS, does a scheduled probe behave, does a graceful stop actually arrive — but
+the host inner loop is faster and is where debugging happens, so it could not be replaced.
+
+**Decision.** One `docker/Dockerfile.service`, parameterised by a `SERVICE` build arg, plus a compose
+`full` profile that opts the three services in. `docker compose up -d` still starts PostgreSQL alone.
+
+**Why one Dockerfile rather than three.** The services differ in exactly one token, the project name.
+Three files would be three copies of every base-image tag, layer-ordering choice and `USER`
+declaration, and the drift would stay invisible until one image behaved differently. Compose supplies
+the arg per service, so the difference lives in `docker-compose.yml` — where the ports and connection
+strings already differ.
+
+**Why the build context is the repository root.** `Directory.Build.props`, `Directory.Build.targets`,
+`Directory.Packages.props`, `global.json` and `.editorconfig` all sit there, and every service
+`ProjectReference`s `AgenticShop.Shared`. A service-scoped context would build without central package
+versions, without the boundary guard, and without the style diagnostics `TreatWarningsAsErrors` turns
+into failures. `.dockerignore` pays for the larger context, and it excludes `bin/` and `obj/` for
+correctness rather than speed: an `obj/project.assets.json` written by a restore on Windows records
+host paths that do not describe a Linux build layer.
+
+**Why the profile is opt-in.** Publishing a container on 5081 while `dotnet watch` holds 5081 is a bind
+failure, not a merge. Making `full` the default would break the inner loop for anyone who did not know
+to stop it first.
+
+**Why the containers run as `Development`.** §4.4 confines `MigrateAsync()` to Development, so it is
+the only environment in which a service can create its own schema. That is load-bearing rather than
+convenient, and two consequences are accepted rather than fixed: `/openapi/v1.json` and `/scalar/v1`
+are exposed on loopback, and the console span exporter writes span dumps into the container logs. Both
+are part of why `full` is a shape check and not a deployment.
+
+**Floating tags.** `DOTNET_SDK_TAG` and `DOTNET_RUNTIME_TAG` default to `10.0`, so patch releases
+arrive without a repository edit — the trade `postgres:17-alpine` already makes. The SDK stays inside
+the band `global.json` pins, because `global.json` is copied into the build.
+
+**Two things the measurement changed.** A healthy probe answers in 1.4 ms, but with PostgreSQL stopped
+`AddDbContextCheck` blocked for 4.0 s on every probe — which is why the healthcheck carries its own
+`--max-time 8` under the 10 s timeout, so a probe ends with a real exit code instead of being
+SIGKILLed. And `docker stop` took **0.63 s**, which is the evidence that `exec` in the `ENTRYPOINT`
+does its job: dotnet is PID 1 and takes SIGTERM directly, rather than a shell forwarding nothing and
+Docker SIGKILLing after the grace period.
+
+**What it exposed.** Bringing the services up on the host's own ports turned a latent test-isolation
+defect into a red suite: Ordering's readiness probe had frozen its target URL at registration, so it
+dialled `localhost:5081` instead of the factory's unresolvable `.invalid` override, and
+`/health/ready` answered 200 rather than 503. Fixed by resolving the target per probe, and pinned by
+a guard; see `ARCHITECTURE.md` §5.4. The profile did not cause that defect, but it made it
+unavoidable — which is the argument for having the profile.
+
 ---
 
 ## Topology and boundaries
@@ -523,8 +575,9 @@ created were deleted.
 handler's retries appear as one span or several. The smoke run had no failures to retry, and answering
 it needs a collector or a failing dependency mid-trace. Recorded rather than guessed.
 
-**Deliberately not configured:** `RecordException`, span enrichment, and a `/health` span filter. See
-`ARCHITECTURE.md` §4.9.
+**Deliberately not configured:** `RecordException` and span enrichment. A `/health` span filter was on
+that list too, until the compose healthcheck started calling the endpoint every ten seconds and its
+spans became noise rather than signal; see `ARCHITECTURE.md` §4.9.
 
 ### Health checks, split into liveness and readiness
 
@@ -580,8 +633,20 @@ exception messages — so the first check added for a broker or a cache could le
 had not thought about it. But it is defence in depth, not a fix for a live leak, and the comment now
 says so. What does the real work is that `Exception` is never written in any environment.
 
-**Known cost, recorded not fixed.** The framework logs an Error line per unhealthy check, so a polled
-endpoint during an outage produces one Error per poll. See `KNOWN-ISSUES.md` → Observability.
+**Known cost, closed by the compose healthcheck.** The framework logs an Error line per unhealthy
+check, so a polled endpoint during an outage produces one Error per poll. That was recorded as a
+residual while nothing polled; the `full` profile's ten-second healthcheck made it real, and
+`Microsoft.Extensions.Diagnostics.HealthChecks` is now silenced in all three services — the same
+resolution the two EF categories got. Verified with PostgreSQL stopped: three failed probes, three
+503s in the access log carrying their durations, and no framework Error line. See `KNOWN-ISSUES.md`.
+
+**One justification that measurement retracted.** The first draft of that silencing claimed Docker
+retains the probe output, so `docker inspect` names the failing check. It does not. The healthcheck
+runs `curl -fsS`, and the `-f` that makes a 503 fail the probe at all also discards the body, so what
+Docker retains is `curl: (22) The requested URL returned error: 503` and nothing else. Dropping `-f`
+would keep the body and break the exit code — the worse trade, since Docker would then count a 503 as
+a successful probe. The check's name is still one request away, in the body of `/health`; what the
+access log preserves is the status and the duration, which is what the interval-based reader needs.
 
 ---
 
@@ -692,7 +757,6 @@ Each was considered and declined, with the phase that would justify it:
 | Reservation expiry / `ExpiresAtUtc` | Phase 3. Release is an explicit call only; no background worker. The cost became concrete with Ordering: a release that fails during compensation strands the hold, and nothing lifts it. Since Phase 1 the same worker would also lift a stranded idempotency claim |
 | Payment / any money movement | Not in scope at any phase. It is also what keeps the confirm-phase residual survivable — a `PartiallyConfirmed` order strands *inventory*, not money. Adding a payment step would turn it into a financial inconsistency and would need the outbox and the saga first |
 | Compensating return-to-stock for a confirmed reservation | Stock's `Confirmed` is terminal by decision D3 and confirm decrements `quantity_on_hand`, so undoing one needs a new inventory-adjustment transition with its own audit trail. Ordering records a terminal `PartiallyConfirmed` order instead — see `src/AgenticShop.Ordering/docs/DECISIONS.md` → O14 |
-| Service Dockerfiles | Phase 0 runs APIs on the host for a fast inner loop |
 | CI pipeline | Phase 1 |
 | CORS policy | No browser client |
 | Rate limiting, HTTPS, HSTS, tightened `AllowedHosts` | No non-local deployment |
@@ -716,3 +780,11 @@ id lives in shared middleware and ASP.NET Core populates `Activity.Current` rega
 "OpenTelemetry, and the correlation id became the trace id" above. It is the only item on this list
 whose adoption **removed** a documented public contract: inbound `X-Correlation-Id` is no longer
 adopted, and the sanitisation that existed to make adoption safe was deleted with it.
+
+**Service Dockerfiles were on this list until Phase 1 closed them.** Added 2026-10-22 as one shared
+`docker/Dockerfile.service` behind an opt-in `full` compose profile. The deferral's reasoning held
+right up to the point it stopped being true: the APIs did run on the host for a fast inner loop, and
+they still do unless `--profile full` is asked for. What closed it was not a change of preference but
+Phase 1 itself — health checks and tracing are properties of a *running* system, and until now there
+was no way to observe the three as containers rather than as three processes sharing one machine. See
+"One Dockerfile for three services" above.

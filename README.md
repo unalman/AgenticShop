@@ -141,6 +141,21 @@ dotnet run --project src/AgenticShop.Stock
 dotnet run --project src/AgenticShop.Ordering
 ```
 
+That is the default, and the fast inner loop: PostgreSQL in a container, the APIs on the host.
+To run the services in containers as well — a shape check on the system, not a deployment:
+
+```powershell
+docker compose --profile full build
+docker compose --profile full up -d      # PostgreSQL plus all three APIs
+docker compose --profile full ps         # wait until all four report healthy
+```
+
+The containerised services publish the same `127.0.0.1:5081`–`5083`, so `http/*.http` works
+unchanged against either — but **never run both at once**: a container binding 5081 while
+`dotnet watch` holds it is a bind failure, not a merge. They run as `Development`, because
+that is the only environment in which a service applies its own migrations at startup.
+`docs/DECISIONS.md` → "One Dockerfile for three services".
+
 PostgreSQL is published on `127.0.0.1:5432` only. Binding it to `0.0.0.0` would expose
 the bootstrap superuser to everything else on the local network.
 
@@ -296,14 +311,14 @@ Each phase adds one capability, and only once the previous phase makes it necess
 Three hosts, synchronous HTTP, one database per service, Testcontainers. All three services
 are implemented and verified: at the close of Phase 0, 426 tests, a clean build under
 `TreatWarningsAsErrors`, database isolation 22/22, and the three-host path driven by hand
-through `http/ordering.http`. **The suite is now at 503.**
+through `http/ordering.http`. **The suite is now at 517.**
 
 **Phase 1 — Reliability and observability** *(in progress)*
 Shared infrastructure library — **done** · idempotency keys on `POST /orders` — **done** ·
 retry/circuit-breaker/timeout policies on Ordering's typed clients — **done** · Serilog structured
 logging — **done in all three services** · OpenTelemetry distributed tracing — **done in all three** ·
-dependency-aware health checks — **done** · Dockerfiles and a `full` compose profile · CI. Retry is
-driven by a measured problem:
+dependency-aware health checks — **done** · Dockerfiles and a `full` compose profile — **done** · CI.
+Retry is driven by a measured problem:
 a 40-way burst against 10 units of stock held only 4, because `xmin` conflicts are not retried.
 Idempotency keys came first, because retrying without them double-reserves stock — and they closed
 the largest residual the repository had, since a retried `POST /orders` used to create a second order

@@ -29,6 +29,7 @@ public class LoggingConfigurationTests
     private const string EfMigrations = "Microsoft.EntityFrameworkCore.Migrations";
     private const string HttpClient = "System.Net.Http.HttpClient";
     private const string Resilience = "Microsoft.Extensions.Http.Resilience";
+    private const string HealthChecks = "Microsoft.Extensions.Diagnostics.HealthChecks";
 
     private static readonly string HandlerCategory = typeof(OrderingExceptionHandler).FullName!;
 
@@ -57,6 +58,32 @@ public class LoggingConfigurationTests
         Run(EfMigrations, logger => logger.Information("Applying migrations."))
             .Events.Should().ContainSingle()
             .Which.Level.Should().Be(LogEventLevel.Information);
+    }
+
+    [Fact]
+    public void ThePolledHealthCheckCategoryIsSilenced()
+    {
+        // DefaultHealthCheckService writes one Error per unhealthy check per probe, and Ordering
+        // registers three checks rather than one, so it is where the multiplication would be worst.
+        // The compose healthcheck polls /health every ten seconds; leaving this category open would
+        // turn an outage into a stream of identical Errors saying one thing — the shape the EF
+        // overrides above exist to prevent. The status survives in the access log; the failing
+        // check's name survives in the body of /health but not in Docker's record of the probe,
+        // because the `curl -f` that makes a 503 fail the healthcheck also discards that body.
+        //
+        // Both shapes are asserted, because the two endpoints reach different checks: the database
+        // check is what compose polls, and a downstream check only fails on /health/ready.
+        var sink = Run(HealthChecks, logger =>
+        {
+            logger.Error(
+                "Health check {HealthCheckName} with status {Status} completed after {ElapsedMilliseconds}ms with message '{Message}'.",
+                "database", "Unhealthy", 78, null);
+            logger.Error(
+                "Health check {HealthCheckName} with status {Status} completed after {ElapsedMilliseconds}ms with message '{Message}'.",
+                "Catalog", "Unhealthy", 2004, "Catalog did not respond");
+        });
+
+        sink.Events.Should().BeEmpty();
     }
 
     [Fact]

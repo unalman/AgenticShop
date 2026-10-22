@@ -1,7 +1,19 @@
-name: agenticshop
-
-# Phase 0 runs only PostgreSQL here. The three APIs run on the host via `dotnet watch`
-# for a fast inner loop; they get Dockerfiles and a `full` profile in Phase 1.
+# Two profiles, and the default one is deliberately the smaller.
+#
+#   docker compose up -d                     PostgreSQL only — the APIs run on the host via
+#                                            `dotnet watch`, which stays the fast inner loop
+#   docker compose --profile full up -d      PostgreSQL plus the containerised APIs
+#
+# The services are opt-in behind `full` so that the host inner loop is unaffected: publishing a
+# container on 5081 while `dotnet watch` holds the same port is a bind failure, not a merge.
+# Never run both at once.
+#
+# `full` is a local shape check — does the system work when the services are containers rather
+# than host processes — and not a deployment. The containers run as Development, which is
+# load-bearing rather than convenient: AGENTS.md §4.4 confines MigrateAsync() to Development, so
+# it is the only environment in which a service can create its own schema. The consequences are
+# that /openapi/v1.json and /scalar/v1 are exposed and that the OpenTelemetry console exporter
+# writes span dumps into the container logs. See docs/DECISIONS.md.
 #
 # POSTGRES_USER is a superuser used only to bootstrap databases and roles. The services
 # themselves connect with the per-service non-superuser roles created by init-dbs.sh, so
@@ -31,6 +43,129 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+
+  catalog:
+    profiles: ["full"]
+    build:
+      # The context is the repository root, not the service directory, and the Dockerfile is
+      # shared by all three services. Both are explained at the top of docker/Dockerfile.service.
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: AgenticShop.Catalog
+    container_name: agenticshop-catalog
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+
+      # Host=db, not localhost: inside the container localhost is the container itself. This value
+      # overrides the Host=localhost string in appsettings.Development.json, which is published
+      # into the image and read first — environment variables sit later in the configuration chain,
+      # which is the mechanism AGENTS.md §7 expects a real environment to use.
+      #
+      # DEVELOPMENT ONLY placeholder password, the same published value as .env.example. Not a
+      # secret, and substituted rather than written literally so ComposeConfigurationTests keeps
+      # holding for every line in this file.
+      ConnectionStrings__Catalog: "Host=db;Port=5432;Database=agenticshop_catalog;Username=catalog_svc;Password=${CATALOG_DB_PASSWORD:?create a .env file from .env.example}"
+    ports:
+      # The same host port as the launchSettings profile, so http/catalog.http works unchanged
+      # against either a host process or this container. The port is not parameterised: AGENTS.md
+      # §2 fixes it, and a variable here would be a second source of truth for the same number.
+      #
+      # Loopback only. Publishing on every interface would expose an unauthenticated write API to
+      # the local network — there is no authentication anywhere in this repository yet.
+      - "127.0.0.1:5081:8080"
+    healthcheck:
+      # -f makes curl exit non-zero on any HTTP status >= 400, so an Unhealthy 503 fails the probe
+      # rather than counting as a successful request that returned an error document.
+      #
+      # The three timings are ordered on purpose: --max-time (8s) < timeout (10s) <= interval (10s).
+      # Measured, a healthy probe answers in 1.4 ms, but with PostgreSQL down AddDbContextCheck
+      # blocks for ~4 s and was seen once at 7.8 s. Giving curl its own deadline means the probe
+      # ends with a real exit code instead of Docker SIGKILLing it at the timeout, and keeping that
+      # deadline under the interval means a slow probe can never overlap the next one.
+      test: ["CMD", "curl", "-fsS", "--max-time", "8", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      # Migrations run at startup and take a few seconds on an empty database. Without a start
+      # period those first probes fail and count against retries, so a healthy service can be
+      # marked unhealthy for having been slow to boot.
+      start_period: 40s
+
+  stock:
+    profiles: ["full"]
+    # Same shape as catalog above, which is where the build context, the loopback-only mapping, the
+    # healthcheck timings and the choice of Development are all argued. Only the connection string,
+    # the role and the port differ.
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: AgenticShop.Stock
+    container_name: agenticshop-stock
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      # DEVELOPMENT ONLY placeholder password, the same published value as .env.example.
+      ConnectionStrings__Stock: "Host=db;Port=5432;Database=agenticshop_stock;Username=stock_svc;Password=${STOCK_DB_PASSWORD:?create a .env file from .env.example}"
+    ports:
+      - "127.0.0.1:5082:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "8", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 40s
+
+  ordering:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: AgenticShop.Ordering
+    container_name: agenticshop-ordering
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      # Healthy, not started. Ordering resolves products against Catalog and reserves against Stock
+      # in the middle of a placement, so starting before either can answer produces a 502 that the
+      # caller sees as a failure of the order rather than of the boot sequence. Waiting on health is
+      # what makes `docker compose --profile full up -d` usable as one command.
+      catalog:
+        condition: service_healthy
+      stock:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      # DEVELOPMENT ONLY placeholder password, the same published value as .env.example.
+      ConnectionStrings__Ordering: "Host=db;Port=5432;Database=agenticshop_ordering;Username=ordering_svc;Password=${ORDERING_DB_PASSWORD:?create a .env file from .env.example}"
+
+      # Compose DNS names and port 8080 — the port inside the downstream container, not the 5081 and
+      # 5082 published on the host, which are unreachable from here. These are the two keys
+      # Program.cs validates at startup, so a typo fails the boot instead of failing mid-placement
+      # after stock has been reserved.
+      Services__Catalog__BaseUrl: "http://catalog:8080"
+      Services__Stock__BaseUrl: "http://stock:8080"
+    ports:
+      - "127.0.0.1:5083:8080"
+    healthcheck:
+      # /health and not /health/ready. Docker has a single health state, so wiring it to readiness
+      # would mark Ordering unhealthy whenever a downstream is down — precisely the conflation the
+      # two endpoints exist to prevent, and the thing that would turn one outage into two.
+      test: ["CMD", "curl", "-fsS", "--max-time", "8", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 40s
 
 volumes:
   agenticshop-db-data:

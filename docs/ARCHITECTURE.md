@@ -40,9 +40,11 @@ Ordering §10. The tables are the count; do not restate a number here. §4 below
 three genuinely share.
 
 Ports are fixed in each service's `Properties/launchSettings.json` so cross-service
-configuration never drifts. In Phase 0 only PostgreSQL is containerised; the APIs run on the
-host via `dotnet watch` for a fast inner loop and easy debugging. Service Dockerfiles and a
-`full` compose profile arrive in Phase 1.
+configuration never drifts. The containerised services publish the same three ports, so
+`http/*.http` works unchanged against either. Two ways to run therefore coexist: PostgreSQL
+alone with the APIs on the host under `dotnet watch` — the fast inner loop, and the default —
+or everything in containers behind compose's opt-in `full` profile, which is a shape check
+rather than a deployment. See §3.
 
 Two invariants are designed to survive every later change, because they are what make the
 eventual distribution real rather than cosmetic:
@@ -152,6 +154,31 @@ Run it after any change to `init-dbs.sh` or `docker-compose.yml`.
 obsolete becomes a build break on upgrade. That is intended — it is how the obsolete
 `PostgreSqlBuilder()` constructor was caught — but it means package bumps occasionally require
 code changes.
+
+### The service image and the two compose profiles
+
+`docker/Dockerfile.service` builds all three services; compose passes the project name as the `SERVICE`
+build arg. Two consequences shape everything else:
+
+- **The build context is the repository root**, not the service directory. `Directory.Build.props`,
+  `Directory.Build.targets`, `Directory.Packages.props`, `global.json` and `.editorconfig` all live
+  there, and every service `ProjectReference`s `AgenticShop.Shared`. `.dockerignore` keeps the context
+  small and — the part that is correctness rather than speed — excludes `bin/` and `obj/`, because an
+  `obj/project.assets.json` written by a restore on Windows records host paths that do not describe a
+  Linux build layer.
+- **The default profile starts PostgreSQL only.** The services sit behind `full`, so
+  `docker compose up -d` leaves the host inner loop untouched. Publishing a container on 5081 while
+  `dotnet watch` holds the same port is a bind failure, not a merge: never run both at once.
+
+`full` is a local shape check rather than a deployment. The containers run as `Development`, which is
+load-bearing rather than convenient, because §4.4 confines `MigrateAsync()` to Development and that is
+the only environment in which a service can create its own schema. Two consequences follow and are
+accepted: `/openapi/v1.json` and `/scalar/v1` are exposed on loopback, and the console span exporter
+writes into the container logs. Reasoning and measurements: `DECISIONS.md` → "One Dockerfile for three
+services".
+
+Running the suite with `full` up is a legitimate way to work, but it occupies 5081–5083 on the host,
+which is exactly what exposed the second configuration-timing trap in §5.4.
 
 ### Local CLI
 
@@ -563,13 +590,21 @@ builder.Services.AddServiceTracing(
   deployment sets it the standard way. Added unconditionally it would default to `localhost:4317` and
   log a failed export per batch on any machine without a collector, which reads like an outage.
 - There is **no collector in `docker-compose.yml`** and deliberately so: adding one is new
-  infrastructure, and the compose file's `full` profile is a separate Phase 1 item. Nothing in the
-  repository depends on a collector being up.
-- Not configured: `RecordException`, span enrichment, and a filter for `/health`. The first two add
-  detail nothing has asked for. The third is still deferred even though the health checks have landed,
-  because nothing calls `/health` on a schedule yet — there is no compose healthcheck for the services
-  (that needs the Dockerfiles) and no orchestrator. A `GET /health` does produce a full server span
-  today; it only becomes noise once something polls.
+  infrastructure, and the `full` profile that now exists is a shape check rather than a deployment.
+  Nothing in the repository depends on a collector being up, so a containerised service exports to its
+  own console — which is why the `/health` span filter below matters more in a container than on the
+  host, the probe volume being identical but the log being the only place anyone reads.
+- Not configured: `RecordException` and span enrichment. Both add detail nothing has asked for.
+- A **`/health` span filter is configured**, and this is the moment the remark that used to sit here
+  deferred it to: the compose healthcheck now calls `/health` every ten seconds. Measured in a
+  containerised Catalog, one probe produced a single access-log line and a 26-line span dump — at that
+  interval, roughly 160 lines a minute of nothing, burying the requests worth reading. The predicate is
+  `ServiceTracing.IsTracedRequest`, public so the decision itself is asserted in
+  `AgenticShop.Shared.UnitTests` rather than only through the instrumentation's options, and it matches
+  whole path segments, so `/health` and `/health/ready` are excluded while a future `/healthz` is not.
+  The access-log line survives, so a probe is still recorded with its status and duration. Verified in
+  both directions inside a container: nineteen consecutive probes produced nineteen access-log lines
+  and no span, while a placement still produced a server span plus one client span per outbound call.
 
 ### 4.10 Health checks
 
@@ -634,9 +669,22 @@ timeout rather than failing instantly, for the reason recorded in Ordering's dec
 tries `::1` first. The same behaviour means a 2 s probe exceeds Kubernetes' default 1 s
 `timeoutSeconds`, which is a revisit point rather than a problem today.
 
-**Known cost.** The framework's `DefaultHealthCheckService` logs an `Error` line per unhealthy check,
-so a polled endpoint during an outage produces one Error per poll. Recorded in `KNOWN-ISSUES.md`;
-nothing polls yet.
+**The poller arrived, and closed two deferrals.** The compose `full` profile probes `/health` every ten
+seconds, so:
+
+- `Microsoft.Extensions.Diagnostics.HealthChecks` is silenced in all three services. The framework logs
+  an `Error` per unhealthy check per probe, which at that interval turns an outage into a stream of
+  identical lines saying one thing. Verified with PostgreSQL stopped: three failed probes, three 503s
+  in the access log carrying their durations, and no framework `Error`. `KNOWN-ISSUES.md` records what
+  the silence costs — including a justification that measurement retracted, since the healthcheck's
+  `curl -f` discards the body, so `docker inspect` retains the 503 but not which check failed.
+- `/health` spans are filtered out; see §4.9.
+
+Two healthcheck choices in `docker-compose.yml` are worth repeating here, because both look simplifiable
+and neither is. `curl -f` is what makes a 503 fail the probe rather than count as a successful request
+that happened to return an error document. And `--max-time 8` sits below the 10 s timeout because with
+PostgreSQL down `AddDbContextCheck` blocked for 4.0 s on every probe measured, so a slow probe should
+end with its own exit code rather than be SIGKILLed by Docker.
 
 ---
 
@@ -763,6 +811,17 @@ Catalog has no equivalent, and deliberately so: `Product` has no contended numer
   happened. `TestHostIsolationTests` now fails the suite if it recurs; it can also be proven by
   running the integration tests with `docker compose stop db`. All three services were verified
   this way — Stock's 61 and Ordering's 57 integration tests pass with port 5432 closed.
+- **The same trap applies to every configuration value read during registration, and it bit a second
+  time.** Ordering's readiness probe built its target `Uri` at registration, so it froze
+  `appsettings.Development.json`'s `localhost:5081` and never saw the factory's unresolvable
+  `.invalid` override. Nothing showed while those ports were empty: the probe failed, the test passed,
+  and the override was simply never used. Running the suite with the `full` compose profile up turned
+  it red — `/health/ready` answered 200 instead of 503, because the real Catalog and Stock were
+  listening. The check now takes a `Func<Uri>` resolved per probe, and
+  `TheTargetIsResolvedPerProbeAndNotCapturedAtConstruction` pins it, because the integration assertion
+  alone only fails while something happens to occupy those ports. The generalisation is the part worth
+  remembering: **a value read from configuration during registration is a value the test host cannot
+  override.**
 - `ProblemHttpResult.ExecuteAsync` resolves `ILoggerFactory` and `JsonOptions` from
   `HttpContext.RequestServices`, so a bare `DefaultHttpContext` throws. Build one with
   `.AddOptions().AddLogging()`.
@@ -791,10 +850,12 @@ A convention enforced only by prose will be violated. These fail the build or th
 | `Directory.Build.targets` | no cross-service `ProjectReference` (build time); exempts `AgenticShop.Shared` by name only | repo root |
 | `RequestContractCoverageTests` | every `*Request` implements `IRequestContract`, and the check does not pass vacuously | all three |
 | `ContractSchemaAlignmentTests` | schema and contracts agree — see below | all three, differently |
-| `ComposeConfigurationTests` | compose image matches `TestPostgreSql.Image`; port is loopback-only; no literal credentials; isolation script mounted | all three |
+| `ComposeConfigurationTests` | compose image matches `TestPostgreSql.Image`; **every** published port is loopback-pinned, not merely free of a literal `0.0.0.0`; no literal credentials; isolation script mounted | all three |
 | `TestHostIsolationTests` | the app under test really uses the Testcontainers database | all three |
 | `LeafServiceBoundaryTests` | a service that makes no outbound calls registers no `HttpClient`, and references no `AgenticShop.*` assembly but the shared one | Stock |
 | `ServiceBoundaryTests` | the orchestrator references no other service assembly, and *does* register its clients | Ordering |
+| `ServiceTracingTests` | the `/health` span filter matches whole path segments, and is actually wired into the instrumentation rather than only written down | Shared |
+| `DownstreamHealthCheckTests` | the readiness probe resolves its target per call, so a test host's override reaches it | Ordering |
 | `scripts/verify-db-isolation.sh` | PostgreSQL role isolation, 22 checks | repo root |
 
 `ContractSchemaAlignmentTests` reads limits from the EF model rather than restating them, so it

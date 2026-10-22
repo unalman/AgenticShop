@@ -7,3 +7,11 @@
 *.bat text eol=crlf
 *.sln text eol=crlf
 *.slnx text eol=lf
+
+# docker/Dockerfile.service and .dockerignore are deliberately absent from the list above, and
+# that was tested rather than assumed: built with CRLF line endings, BuildKit folded the
+# `RUN apt-get update \<CR><LF>` continuation into one command and still honoured the
+# `**/bin/`, `**/obj/` and `**/*.md` ignore patterns — verified against a control build with
+# .dockerignore removed, where all three leaked into the context. Unlike a *.sh script, which
+# the container's shell executes byte for byte, these two are parsed by BuildKit, which
+# normalises. Do not add a rule here without re-running that check.

@@ -87,18 +87,22 @@ the time it was written. Dropping `correlationId` would be a breaking change to 
 shape in exchange for removing a duplicate; if a collector is ever added and `traceId` becomes the
 useful one to grep, revisiting is cheap.
 
-**A polled health endpoint logs an Error per unhealthy check.** *Low · observed 2026-10-04.* The
+**A polled health endpoint logs an Error per unhealthy check.** *Resolved 2026-10-22.* The
 framework's `DefaultHealthCheckService` writes
 `Health check database with status Unhealthy completed after 78ms with message 'null'` at **Error**.
-Nothing polls `/health` yet, so today this only appears when a person curls it. Once a compose
-healthcheck or an orchestrator probe exists, a five-minute database outage at a five-second interval
-produces sixty Error lines saying one thing — the same shape as the EF `Database.Command` noise that
-was removed, arriving from a different category.
+While nothing polled, that appeared only when a person curled the endpoint, and the deferral was
+explicit: the right level depends on a poll interval that did not exist yet. The `full` compose
+profile supplied one — ten seconds — so `Microsoft.Extensions.Diagnostics.HealthChecks` is now
+silenced in all three services, the same resolution the two EF categories got. Verified with
+PostgreSQL stopped: three failed probes, three 503s in the access log with their durations, and no
+framework Error line.
 
-Not silenced now, for two reasons: there is no poller, so there is no volume, and an unhealthy
-dependency *is* worth one Error when a human asks. The fix when a poller arrives is a Serilog override
-on `Microsoft.Extensions.Diagnostics.HealthChecks`, and the reason it was not done pre-emptively is
-that the right level depends on the poll interval, which does not exist yet.
+What the silence costs is narrower than the first draft of the justification claimed. It said Docker
+retains the probe output, so `docker inspect` names the failing check; in fact the healthcheck runs
+`curl -fsS`, and the `-f` that makes a 503 fail the probe also discards the body, so what is retained
+is `curl: (22) The requested URL returned error: 503`. Which check failed is still one request away,
+in the body of `/health`. Keeping `-f` is the right trade either way: without it a 503 exits 0 and
+Docker counts an unhealthy service as a successful probe.
 
 Note the `with message 'null'`: `AddDbContextCheck` leaves `Description` null and puts the exception in
 `Exception`, which is why the response body carries neither. See `ARCHITECTURE.md` §4.10.

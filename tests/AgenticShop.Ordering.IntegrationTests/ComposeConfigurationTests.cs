@@ -41,6 +41,22 @@ public class ComposeConfigurationTests
     }
 
     [Fact]
+    public void EveryPublishedPortIsPinnedToTheLoopbackInterface()
+    {
+        // The test above rejects the literal 0.0.0.0, but that is not the only way to publish on
+        // every interface: "5083:8080" binds all of them and contains no such literal. Compose now
+        // publishes the service ports as well as PostgreSQL's, and nothing in this repository
+        // authenticates a request, so the gap is worth closing rather than leaving to review.
+        var mappings = PublishedPorts();
+
+        mappings.Should().NotBeEmpty(
+            "compose publishes PostgreSQL, plus the services behind the full profile");
+        mappings.Should().OnlyContain(
+            mapping => mapping.StartsWith("127.0.0.1:", StringComparison.Ordinal),
+            "a mapping with no explicit host address publishes on every interface");
+    }
+
+    [Fact]
     public void EveryCredentialComesFromTheEnvironment()
     {
         var credentialLines = Lines()
@@ -74,6 +90,52 @@ public class ComposeConfigurationTests
             .Split('\n')
             .Select(line => line.Trim())
             .Where(line => line.Length > 0 && !line.StartsWith('#'));
+
+    /// <summary>
+    /// Every mapping under a <c>ports:</c> key, located by indentation rather than with a YAML
+    /// parser — the same trade-off the rest of this class makes, and recorded in
+    /// <c>docs/DECISIONS.md</c> under "Structural guards as tests".
+    /// </summary>
+    /// <remarks>
+    /// Indentation is what distinguishes a port mapping from the similarly shaped entries under
+    /// <c>volumes:</c>, which also start with <c>- </c> and also contain colons. A block stays open
+    /// while its entries are indented further than the key that opened it, and the first line at or
+    /// beyond that key's indent closes it.
+    /// </remarks>
+    private static List<string> PublishedPorts()
+    {
+        var mappings = new List<string>();
+        var blockIndent = -1;
+
+        foreach (var line in Compose.Value.Replace("\r", string.Empty).Split('\n'))
+        {
+            var trimmed = line.TrimStart();
+            if (trimmed.Length == 0 || trimmed.StartsWith('#'))
+            {
+                continue;
+            }
+
+            var indent = line.Length - trimmed.Length;
+
+            if (blockIndent >= 0)
+            {
+                if (indent > blockIndent && trimmed.StartsWith("- "))
+                {
+                    mappings.Add(trimmed["- ".Length..].Trim().Trim('"', '\''));
+                    continue;
+                }
+
+                blockIndent = -1;
+            }
+
+            if (trimmed == "ports:")
+            {
+                blockIndent = indent;
+            }
+        }
+
+        return mappings;
+    }
 
     private static List<string> DeclaredImages()
         => Lines()

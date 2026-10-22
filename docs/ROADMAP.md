@@ -115,7 +115,15 @@ Now that a network hop exists, make its failure modes survivable and visible.
   because a liveness endpoint that depends on another service turns one outage into two. Measured:
   with Catalog stopped, Ordering's `/health` answered 200 in 7 ms while `/health/ready` answered 503
   naming Catalog. `docs/ARCHITECTURE.md` §4.10.
-- Dockerfiles for all three services plus a `full` compose profile
+- ~~Dockerfiles for all three services plus a `full` compose profile.~~ **Done.** One shared
+  `docker/Dockerfile.service`, parameterised by project name and built against the repository root,
+  behind an opt-in profile so the default `docker compose up -d` still starts PostgreSQL alone and
+  the host inner loop keeps working. Verified with all four containers healthy, an end-to-end
+  placement driven across them, and one trace id in all three logs.
+  `docs/DECISIONS.md` → "One Dockerfile for three services". Bringing the services up on the host's
+  own ports also exposed a latent test-isolation defect — the readiness probe froze its target URL at
+  registration, so it dialled `localhost:5081` instead of the factory's unresolvable override — now
+  fixed and pinned by a guard.
 - CI: build, test, and `dotnet ef migrations has-pending-model-changes` as a drift gate
 
 The extraction came first on purpose: Serilog and OpenTelemetry both touch the logging arms, so

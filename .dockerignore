@@ -1,0 +1,35 @@
+# The build context for every service image is the repository root, because
+# Directory.Build.props, Directory.Build.targets, Directory.Packages.props, global.json,
+# .editorconfig and the AgenticShop.Shared ProjectReference all live there. Without this file
+# the daemon is sent the whole repository on every build.
+#
+# bin/ and obj/ are excluded for correctness, not only for speed: an obj/project.assets.json
+# written by a restore on Windows records host paths, and copying it into a Linux build layer
+# hands the in-container restore assets that do not describe it.
+**/bin/
+**/obj/
+
+.git/
+.gitignore
+.gitattributes
+.github/
+.vs/
+.vscode/
+.idea/
+.qwen/
+
+# Not read by the Dockerfile. Excluded so the context stays small and the build cache stays
+# usable — a documentation edit should not invalidate a layer.
+docs/
+tests/
+http/
+scripts/
+docker/postgres/
+docker-compose.yml
+**/*.md
+.env
+.env.example
+
+# Kept, and load-bearing: .editorconfig drives the style diagnostics that TreatWarningsAsErrors
+# turns into build failures, so a build without it enforces a different rule set than the host.
+!.editorconfig
