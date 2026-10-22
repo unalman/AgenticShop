@@ -219,8 +219,12 @@ Consumer-driven contract tests are Phase 3.
 Restructuring the repository silently disables the boundary guard. An alternative is a marker
 property in each service `.csproj`, or a guard test asserting the target still exists.
 
-**`ComposeConfigurationTests` matches compose text by substring.** *Low.* Reformatting
-`docker-compose.yml` can break it. Chosen over taking a YAML parser dependency.
+**`ComposeConfigurationTests` matches compose text rather than parsing it.** *Low.* Reformatting
+`docker-compose.yml` can break it. Chosen over taking a YAML parser dependency. Two styles are in use
+and they break differently: most assertions are substring matches, but the loopback-port guard walks
+each `ports:` block by **indentation**, because indentation is what separates a port mapping from the
+similarly shaped `- ` entries under `volumes:`. Re-indenting a block therefore breaks that guard even
+when every substring still matches, so a compose reformat needs the suite run rather than a diff read.
 
 **`container_name: agenticshop-db` is hardcoded.** *Low.* Prevents running two stacks on one
 machine — a second worktree, or a CI job alongside local development.

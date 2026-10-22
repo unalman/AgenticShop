@@ -119,7 +119,14 @@ host paths that do not describe a Linux build layer.
 
 **Why the profile is opt-in.** Publishing a container on 5081 while `dotnet watch` holds 5081 is a bind
 failure, not a merge. Making `full` the default would break the inner loop for anyone who did not know
-to stop it first.
+to stop it first. Observed rather than assumed, and uglier than "a bind failure" suggests: starting host
+Catalog with the container up ran migrations, logged `No migrations were applied`, and *then* died on
+`System.IO.IOException: Failed to bind to address http://127.0.0.1:5081: address already in use`
+(`SocketException 10048`) — as an unhandled exception, exit code `0xE0434352`, not a clean shutdown.
+Two consequences are worth knowing before hitting it. The last successful line in the log is about the
+database, so the real cause is a stack frame away from where a reader is looking. And because
+`MigrateAsync()` runs before Kestrel binds, a port collision still executes migrations — idempotent
+here, but it is why the failure reads as a database event that then crashes.
 
 **Why the containers run as `Development`.** §4.4 confines `MigrateAsync()` to Development, so it is
 the only environment in which a service can create its own schema. That is load-bearing rather than
@@ -144,6 +151,15 @@ dialled `localhost:5081` instead of the factory's unresolvable `.invalid` overri
 `/health/ready` answered 200 rather than 503. Fixed by resolving the target per probe, and pinned by
 a guard; see `ARCHITECTURE.md` §5.4. The profile did not cause that defect, but it made it
 unavoidable — which is the argument for having the profile.
+
+**Not verified.** No Production-shaped container was ever started, so four behaviours rest on unit tests
+and on reading code rather than on observation: that startup fails when `ConnectionStrings__<Service>`
+is absent, that `/openapi/v1.json` and `/scalar/v1` are absent, that `MigrateAsync()` is skipped, and
+that the health writer omits `description`. The OTLP export path is likewise unexercised end to end —
+compose has no collector, so spans have only ever reached the console exporter. And no image was pushed
+to a registry or built for a second architecture; everything measured here is local amd64. None of the
+three is a gap this profile was meant to close, but "verified in a container" could otherwise be read
+as covering them.
 
 ---
 
@@ -669,8 +685,13 @@ PostgreSQL containers concurrently.
 Conventions enforced only by prose get violated. Guards exist for the marker interface, DTO-to-column
 limit alignment, compose image drift, loopback binding, literal credentials, test-host isolation
 and the service boundary. **Trade-off accepted:** `ComposeConfigurationTests` matches compose
-text by substring, so reformatting `docker-compose.yml` can break it — chosen over taking a YAML
-parser dependency.
+text rather than parsing it, so reformatting `docker-compose.yml` can break it — chosen over taking a
+YAML parser dependency. Two matching styles are in use and they break differently: most assertions are
+substring matches, which a reformat that preserves the text survives, while the loopback-port guard
+walks each `ports:` block by **indentation**, because indentation is what separates a port mapping from
+the similarly shaped `- ` entries under `volumes:`. That second style is the more brittle of the two —
+re-indenting a block breaks it even when every substring still matches — and it is why a compose
+reformat needs the suite run rather than a diff read.
 
 ### `FrameworkReference` in the unit test project
 
