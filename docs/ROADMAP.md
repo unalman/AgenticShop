@@ -217,11 +217,24 @@ Verified at closure: `dotnet build` clean under `TreatWarningsAsErrors`; **519 t
   each side. `src/AgenticShop.Stock/docs/DECISIONS.md` → **D16**,
   `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O20**.
 
-  **Two things this did not do, deliberately.** Stock's HTTP reservation endpoints and Ordering's
-  `IStockClient` still exist and now have no caller; deleting them, with the ~30 tests that cover
-  them, is a separate cleanup commit so the behavioural flip stays reviewable on its own. And the
-  contention measurement in Stock's `ARCHITECTURE.md` §7 still describes a live endpoint — it becomes
-  historical when that endpoint goes.
+  **The cleanup this deferred is done (2026-10-23).** Stock's HTTP reservation endpoints and
+  Ordering's `IStockClient` are deleted along with the code only they exercised — Ordering's
+  `StockReservationSnapshot`, the two exceptions nothing threw (`StockUnavailableException`,
+  `OrderPlacementIncompleteException`) and their handler arms, the `DownstreamResilience.NotRetryable`
+  marker, the `Services:Stock:BaseUrl` key, and Stock's `ReserveStockRequest` / `ReservationResponse`
+  contracts. 40 tests went with them (34 Stock integration, 6 Ordering unit) and one replaced them, so
+  the suite is 494 rather than 533. The contention measurement in Stock's `ARCHITECTURE.md` §7 is
+  marked historical.
+
+  The one replacement is worth naming, because §6 requires a parallel test for anything with a
+  mutable counter and the eight deleted ones no longer had a subject: they raced the HTTP reserve
+  endpoint against itself, and the consumer that replaced it holds serially (`prefetchCount: 1`,
+  `consumerDispatchConcurrency: 1`), so it cannot race itself. `ConsumerStockContentionTests` races
+  the consumer against `PUT /api/v1/stock/{productId}` instead — the only cross-writer contention
+  left on `stock_items`. It asserts inequalities rather than counts, because a message that loses
+  the `xmin` race twice is dropped without an inbox row, so how many orders commit is the
+  scheduler's business: no 5xx, `reserved` never leaks, the counter agrees with the reservation
+  rows, and nothing is oversold.
 - ~~**Outbox pattern.**~~ **Done on the producer side (2026-10-23).** An `outbox_messages` table, an
   `OutboxPublisher` hosted service and an `OrderPlaced` contract — carrying the stable message id
   this bullet called cheap to decide now and expensive to retrofit. The row joins the order's own

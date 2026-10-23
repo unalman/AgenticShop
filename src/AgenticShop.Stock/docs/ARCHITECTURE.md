@@ -145,20 +145,18 @@ database: `information_schema.columns` returns **0 rows for `xmin`** on both tab
 GET    /api/v1/stock/{productId}                       200 | 404
 POST   /api/v1/stock                                   201 | 409 record exists | 400
 PUT    /api/v1/stock/{productId}                       200 | 404 | 409 xmin | 400
-POST   /api/v1/stock/{productId}/reservations          201 | 404 | 409 insufficient|duplicate | 400
-POST   /api/v1/reservations/{id}/confirm               200 | 404 | 409 wrong state|xmin
-POST   /api/v1/reservations/{id}/release               200 | 404 | 409 wrong state|xmin
-GET    /api/v1/reservations?orderId=                   200 | 400 when orderId missing
 GET    /health                                         200
 ```
 
+Four reservation endpoints used to sit here — `POST /stock/{productId}/reservations`, the confirm
+and release settles, and `GET /reservations?orderId=`. They are gone, because the consumer is the
+only writer that holds stock and nothing called them; a hold no one can request over HTTP is not an
+API. The reservation *rows* stay — the consumer writes them and they remain the audit trail of
+intent — but reading one now needs `psql` rather than a request.
+
 There is **no list or paging endpoint for stock**. Catalog's paging convention is deliberately
 unexercised here; adding it "for symmetry" would be exactly the speculative generality the project
-avoids. `GET /reservations?orderId=` exists because it is cheap, indexed, and is the reconciliation
-path for a half-failed order.
-
-`orderId` is a required parameter, so omitting it is a `BadHttpRequestException` binding failure
-→ 400 from the handler, not a 500 and not an unbounded scan.
+avoids.
 
 ## 7. Concurrency design
 
@@ -173,12 +171,21 @@ reserve 5. The first commits (`xmin` → 6). The second's `UPDATE ... WHERE id=@
 matches zero rows → `DbUpdateConcurrencyException` → **409**. Without the token both would succeed
 and stock would go negative.
 
-**There is no server-side retry on conflict.** Resilience libraries are Phase 1, and the 409 is the
-honest signal that Ordering must learn to handle. It is also largely dissolved by Phase 2 — a queue
-with a single consumer serialises reservations, so contention disappears rather than being retried
-away.
+**There is no server-side retry on conflict.** The 409 is the honest signal — and since Phase 2
+there is almost nothing left to receive it. A queue with one serial consumer means reservations no
+longer race each other at all, so contention is dissolved rather than retried away. The only writer
+that can still conflict with the consumer is `PUT /api/v1/stock/{productId}`, and it answers 409.
 
-The measured cost, from a live 40-way burst against 10 units:
+### Both measurements below are historical
+
+They drove endpoints that no longer exist — `POST /stock/{productId}/reservations` and the confirm
+settle. They are kept verbatim because this is the **canonical record** the rest of the repository
+cites rather than restates, and because it was the single most important input to the Ordering
+design, which decided to **fail fast** — see
+`../../AgenticShop.Ordering/docs/DECISIONS.md` → **O16**. Do not read them as current behaviour:
+nothing can issue 40 concurrent holds now, because holds arrive one message at a time.
+
+From a live 40-way burst against 10 units:
 
 ```
 201=4   409=36   5xx=0   other=0   total=40
@@ -190,9 +197,8 @@ pending reservation rows=4   sum(quantity)=4
 requests lost the `xmin` race and were told 409 despite stock being available. A 20-way parallel
 confirm of one reservation produced `200=1, 409=19, 5xx=0` and shipped exactly once.
 
-**This is the canonical record of both measurements.** Everything else in the repository cites it
-rather than restating it. It was the single most important input to the Ordering design, which
-decided to **fail fast** — see `../../AgenticShop.Ordering/docs/DECISIONS.md` → **O16**.
+What outlives them is the invariant, and that is still measured — by
+`ConsumerStockContentionTests`, which races the consumer against the one HTTP writer that remains.
 
 ### The token is only as strong as the read that feeds it
 
@@ -209,7 +215,14 @@ it reads one row and its rejection is already a classified 409.
 
 Fixed by reading both rows in one LEFT JOIN: one statement, one snapshot, so the loser now gets the
 state machine's 409 or the token's 409 and there is no third outcome. Re-measured at **0 × 500
-across 45,000 requests**. Decision **D15**; guarded by `SettleReadAtomicityTests`.
+across 45,000 requests**. Decision **D15**.
+
+The endpoint that carried the fix is gone; the rule was not gone with it, it moved.
+`OrderPlacedConsumer.ReserveAsync` reads every stock item an order names in **one statement** for
+exactly this reason and says so in its own remarks. What was lost is the *guard*: the structural
+test that counted the statements a settle issued (`SettleReadAtomicityTests`, via a SQL capture
+wired into `StockApiFactory`) was deleted along with its subject, so the consumer's single read is
+now enforced by prose alone. Recorded in `KNOWN-ISSUES.md`.
 
 The transferable rule: a guard that mixes a stale entity with a fresh one does not detect the
 conflict, it *becomes* one.
@@ -223,9 +236,8 @@ Each was the right call for this service, and each is the evidence that the conv
 | soft delete + `HasQueryFilter` | **none** | a filtered stock row reads as "no stock", which is more dangerous than a deleted product |
 | offset paging + `ProductPage` | **no list endpoint** | nothing needed it |
 | `decimal` money + currency | **`int` counters only** | stock is not money |
-| light concurrency test | **parallel overselling tests** | on `Product` a missed token loses a price edit; on `StockItem` it oversells |
+| light concurrency test | **a parallel contention test** | on `Product` a missed token loses a price edit; on `StockItem` it oversells. `ConsumerStockContentionTests` races the consumer against `PUT /stock/{productId}` — the eight HTTP-vs-HTTP bursts went with the endpoint they drove |
 | DTO-limit vs column-limit guard | **enum/CHECK and bound guards** | copying the original verbatim would have matched nothing and passed vacuously |
-| test harness copied verbatim | **harness plus a SQL capture** | `SettleReadAtomicityTests` must count the statements a settle actually issues, which is observable only from inside the host's `DbContext`; neither other service has a two-row read whose atomicity is load-bearing. `StockApiFactory` wires it through `IDbContextOptionsConfiguration<StockDbContext>` — see D15 |
 | test harness copied verbatim | **harness plus a second fixture with a broker** | `StockMessagingFixture` starts PostgreSQL *and* RabbitMQ and registers the two hosted services `Program.cs` deliberately does not. Separate from `StockApiFixture` rather than extra containers on it: a background consumer mutating `stock_items` while 68 tests assert on counters is a race, not a suite — see D16 |
 | no messaging | **a consumer, an inbox and a copied outbox** | Stock was the first service to *consume*, which is what forced the inbox, the durable-queue and prefetch decisions, and the poison-message policy. Ordering has since grown a consumer of its own for Stock's outcomes, so the two now have siblings rather than one being unique — see D16 |
 

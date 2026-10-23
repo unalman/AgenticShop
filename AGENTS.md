@@ -19,16 +19,16 @@ evolved gradually into a distributed e-commerce backend. **The deferrals in §8 
 do not "improve" the project by adding infrastructure it has declined, and see `docs/ROADMAP.md`
 for what each phase unblocks.
 
-**Phase 0 and Phase 1 complete; Phase 2 is next.** All three services are implemented: **Catalog**
-is the reference every convention originates from, **Stock** follows it with the deliberate
-divergences recorded in §10, **Ordering** is the orchestrator — the only service with outbound
-calls, and the one that forced the conventions to be re-derived rather than copied.
+**Phase 0 and Phase 1 complete; Phase 2 is in progress.** All three services are implemented:
+**Catalog** is the reference every convention originates from, **Stock** follows it with the
+deliberate divergences recorded in §10, **Ordering** is the orchestrator — the only service with
+outbound calls, and the one that forced the conventions to be re-derived rather than copied.
 **`AgenticShop.Shared`** was extracted in Phase 1 and is not a service: it holds the filter, the
 correlation middleware, `IRequestContract`, the logging, tracing and health-response configuration
 and the exception-handler skeleton.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **533 pass**
-(Shared 45 unit; Catalog 68 unit + 44 integration; Stock 82 unit + 77 integration; Ordering 142 unit
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **494 pass**
+(Shared 45 unit; Catalog 68 unit + 44 integration; Stock 82 unit + 44 integration; Ordering 136 unit
 + 75 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
@@ -258,9 +258,10 @@ the services on the host's own 5081–5083**, so never run it while `dotnet watc
 bind failure, not a merge. Relatedly, do not "simplify" Ordering's readiness probe back to a `Uri`
 built at registration: it resolves its target per call precisely so a test host can override it, and
 reverting it turns the suite red only while something happens to occupy those ports (§5.4). **O18's
-retry exemption is historical** — it existed for the reserve call, which is gone. Its reasoning still
-binds any future outbound write: retrying a non-idempotent call is how a hold gets stranded and then
-reported as out-of-stock.
+retry exemption is deleted, not merely historical** — it existed for the reserve call, and the marker
+that expressed it went with it, so the pipeline now retries every transient failure. Its reasoning
+still binds a future outbound write: retrying a non-idempotent call is how a hold gets stranded and
+then reported as out-of-stock. Re-earn the exemption; do not assume it.
 
 ## 9. Git rules
 

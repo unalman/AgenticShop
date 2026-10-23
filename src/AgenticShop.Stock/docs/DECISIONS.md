@@ -85,6 +85,10 @@ duplicate-provisioning bug. The unique index on `product_id` makes the race safe
 
 Resource-oriented, matching `POST /api/v1/products`.
 
+**Superseded 2026-10-23.** The endpoint is deleted — holds are created by the consumer, which has no
+URL. Kept because the reasoning shaped the routes that remain, and because the D2 unique index it sat
+beside is still what enforces one hold per product per order.
+
 ## D9 · No server-side retry on `xmin` conflict — deferred to Phase 1
 
 **Why.** Resilience libraries are Phase 1, and the 409 is the honest signal Ordering must learn to
@@ -92,14 +96,24 @@ handle. Phase 2 largely dissolves the problem: a queue with a single consumer se
 reservations, so contention disappears rather than being retried away.
 
 **Measured cost.** Poor liveness under burst, quantified in `ARCHITECTURE.md` §7 — the canonical
-record. This was the most important input to the Ordering design, which decided to **fail fast**
-with no server-side retry in Phase 0: `../../AgenticShop.Ordering/docs/DECISIONS.md` → **O16**.
+record, now historical along with the endpoints it measured. This was the most important input to the
+Ordering design, which decided to **fail fast** with no server-side retry in Phase 0:
+`../../AgenticShop.Ordering/docs/DECISIONS.md` → **O16**.
+
+**Revised 2026-10-23.** Phase 2 dissolved the problem rather than solving it, as predicted: a single
+serial consumer means holds no longer race each other, so there is no burst to survive. The one
+conflict left is with `PUT /api/v1/stock/{productId}`, and the consumer does retry that one — it nacks
+and requeues once, then drops. The cost of dropping is tracked in `KNOWN-ISSUES.md`.
 
 ## D10 · `GET /api/v1/reservations?orderId=` is included
 
 Cheap, supported by the `order_id` index, and needed for Phase 2 reconciliation and for debugging a
 half-failed order. `orderId` is required, so omitting it is a binding failure → 400, not an
 unbounded scan.
+
+**Superseded 2026-10-23.** Deleted with the rest of the reservation surface. The reconciliation it
+was included for belonged to the synchronous confirm phase, and that phase is gone; inspecting a hold
+is a `psql` query now.
 
 ## D11 · A test asserts Stock registers no `HttpClient`
 
@@ -155,22 +169,35 @@ capture recorded nothing and would otherwise have asserted on an empty list.
 
 Full account: `../../../docs/KNOWN-ISSUES.md` → "The 'unexplained 5xx' was a read-skew race".
 
-## D16 · The consumer, the inbox, and why neither is registered yet
+**Revised 2026-10-23 — the subject moved and the guard went.** `SettleAsync` was deleted with the rest
+of the HTTP reservation surface, so the LEFT JOIN it carried no longer exists. The rule survives and
+is load-bearing in exactly one place now: `OrderPlacedConsumer.ReserveAsync` reads every stock item an
+order names in one statement, for the reason above, and cites this decision in its remarks.
 
-**Added 2026-10-23, Phase 2b-i.**
+What did not survive is the guard. `SettleReadAtomicityTests` and the `SettleSqlCapture` it drove were
+deleted with the endpoint they measured — a statement-count assertion needs a request to count against,
+and the consumer has none. The reasoning above about why a statement count beats a bigger burst is
+unchanged and still applies; there is simply nothing running it. Tracked in `KNOWN-ISSUES.md` →
+"The consumer's single-statement read has no structural guard".
+
+## D16 · The consumer, the inbox, and the staged wiring
+
+**Added 2026-10-23, Phase 2b-i. Revised the same day: both are registered now, and the synchronous
+path they were staged against is deleted.**
 
 **Decision.** `OrderPlacedConsumer` reads `OrderPlaced` from a durable queue Stock owns, holds every
 line of the order or none of them, and publishes `StockCommitted` or `StockReservationRejected` through
 an outbox of its own. An `InboxMessage` row keyed on the producer's message id makes redelivery a
-no-op. **Neither this consumer nor Stock's publisher is registered in `Program.cs`.** The test host
-registers both; production does not.
+no-op.
 
-**Why built but not wired.** The synchronous `POST /api/v1/stock/{productId}/reservations` path is
-still the only one Ordering uses. Registering the consumer now would put two reservation paths live at
-once and double-hold every order. Building it unwired is what lets it be tested against a real broker
-without changing a single shipped behaviour — all 68 pre-existing Stock integration tests pass
-untouched, and `POST /orders` still answers exactly as it did. The increment that registers this also
-deletes the synchronous reserve and moves Ordering's emission point, in one commit.
+**Why it was built unwired, and what changed.** The consumer was added before it was registered, while
+the synchronous `POST /api/v1/stock/{productId}/reservations` path was still the one Ordering used.
+Registering both at once would have put two reservation paths live and double-held every order, so the
+test host registered the consumer and production did not — which is what let it be proven against a
+real broker without changing a single shipped behaviour. The increment that registered it also deleted
+the synchronous reserve and moved Ordering's emission point, in one commit, so there was no state in
+between where both were wired. `Program.cs` now registers both the consumer and the publisher, and the
+consumer is the only way stock moves.
 
 **Why the inbox, when `UNIQUE(order_id, stock_item_id)` already looks like deduplication.** It covers
 a different case, and the gap is not hypothetical — `ARejectedMessageStaysRejectedAfterStockArrives`
@@ -179,8 +206,8 @@ with; if stock arrived in between, the redelivery succeeds and publishes `StockC
 already answered with `StockReservationRejected`. Two contradictory outcomes for one message id. The
 unique index also cannot say whether the outcome event was published, only that a hold exists. The
 inbox row is written in the same transaction as the hold and the outbox row, which makes "processed"
-and "answered" one fact instead of two. The unique index stays and stays load-bearing for the HTTP
-path's 409.
+and "answered" one fact instead of two. The unique index stays — it still catches a duplicated line
+within one order — but it is no longer what produces a client-visible 409, because no client asks.
 
 **Why all-or-nothing per order.** The synchronous path reserves line by line and releases the earlier
 holds when a later one fails. Here the whole order is one unit of work, so there is no intermediate

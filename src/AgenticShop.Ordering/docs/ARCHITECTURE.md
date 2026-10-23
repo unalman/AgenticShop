@@ -62,11 +62,21 @@ derives from a *collection*, so a computed version would silently read as zero w
 were not loaded — a wrong answer rather than an absent one. Storing it is safe because an order is
 write-once: there is no path that changes a line after construction, so nothing can drift.
 
-Four domain exceptions carry **typed properties rather than relying on `Message`**, so a reworded
-exception cannot silently change the public contract: `ProductUnavailableException(ProductId)`,
-`MixedCurrencyException(Currencies)`, `StockUnavailableException(ProductId, OrderId)`,
-`OrderPlacementIncompleteException(OrderId, Status)`. A fifth, `DownstreamServiceException(Service,
-Operation, StatusCode)`, lives in `Clients/` because it is a transport fact rather than a domain one.
+Two domain exceptions carry **typed properties rather than relying on `Message`**, so a reworded
+exception cannot silently change the public contract: `ProductUnavailableException(ProductId)` and
+`MixedCurrencyException(Currencies)`. A third, `DownstreamServiceException(Service, Operation,
+StatusCode)`, lives in `Clients/` because it is a transport fact rather than a domain one.
+
+Two more were deleted rather than left unwired, and in both cases the reason is the same: nothing threw
+them after the flip, and a handler arm nothing can reach is not a feature.
+
+- `StockUnavailableException(ProductId, OrderId)` mapped a refused line to 409. A stock refusal is no
+  longer raised inside a request at all — it arrives as a `StockReservationRejected` outcome that
+  `StockOutcomeConsumer` settles the order with.
+- `OrderPlacementIncompleteException(OrderId, Status)` mapped an incomplete placement to 502 and was
+  the only thing that could report `PartiallyConfirmed`. The confirm phase that produced that state is
+  gone. The 502 bucket survives through `DownstreamServiceException`, which is what a placement can
+  still fail with.
 
 An illegal order transition throws plain `InvalidOperationException` — no typed exception, and no
 handler arm. Nothing a caller can do reaches it, so it can only mean this assembly transitioned
@@ -122,17 +132,36 @@ confirmed reservations for an order that was never written anywhere.
 ## 4. Cancellation stops at the first side effect
 
 Resolving against Catalog honours the caller's `CancellationToken`: nothing has happened yet, so
-abandoning is free. From the first reserve onward every call — reserve, confirm, release, the
-reconciliation read and the final `SaveChangesAsync` — uses `CancellationToken.None`.
+abandoning is free. From the idempotency claim onward every call uses `CancellationToken.None`.
 
-A client that hangs up mid-placement must not leave stock held against an order nobody recorded. The
-calls are still bounded — by the resilience pipeline's timeouts (10s per attempt, 35s total, in
-`Clients/DownstreamResilience.cs`) and by EF's command timeout — so this cannot hang a request. The
-per-attempt timeout is the same ten seconds this section used to set through `HttpClient.Timeout`,
-kept for the same reason: with no bound at all, "timed out" would never happen and the confirm-phase
-policy would be unreachable in practice. Why `HttpClient.Timeout` is no longer set: decision O18.
+The reason changed when the synchronous reserve went, and the new one is narrower. It used to be that
+a client hanging up mid-placement must not leave stock held against an order nobody recorded. There is
+no hold to strand now — a placement writes an order row and an outbox row and stops. What must not be
+stranded is the **key**: a claim committed with no order behind it refuses every later request under
+that key for good, so a caller who hangs up at the wrong moment loses the key rather than the order.
+Running the write to completion regardless of cancellation is what prevents that.
 
-## 5. Confirm-phase failure
+Those calls are still bounded, but by EF's command timeout rather than by the resilience pipeline — the
+pipeline only wraps the Catalog read, which happens before the claim. The per-attempt timeout it
+carries is the same ten seconds this section used to set through `HttpClient.Timeout`; why
+`HttpClient.Timeout` is no longer set: decision O18.
+
+## 5. Confirm-phase failure — historical
+
+**This entire section describes a phase that no longer exists.** There is no confirm phase: a placement
+writes a `Pending` order plus an outbox row and answers 202, Stock holds all of an order's lines or
+none of them in one transaction, and `StockOutcomeConsumer` settles the order from a single outcome.
+There is no partial outcome to classify, so the reconciliation matrix below has no input that can
+produce it. The exception that reported one, `OrderPlacementIncompleteException`, is deleted along with
+its 502 arm and the two unit tests that constructed it directly: nothing threw it, and a handler arm
+nothing can reach is not a feature. The 502 bucket survives through `DownstreamServiceException`, which
+is what a placement can still fail with.
+
+It is kept rather than deleted for two reasons. It is the reasoning behind **O14** and **O16**, which
+other documents cite. And `PartiallyConfirmed` survives in `OrderStatus` and in the
+`ck_orders_status_known` CHECK constraint — deliberately, because rows written before the flip carry it
+and a migration to remove a status from the vocabulary would have to rewrite them. Nothing can write it
+any more.
 
 Stock's `Confirmed` is terminal (decision D3) and confirm decrements `quantity_on_hand`. There is
 therefore **no compensating action** for a confirm that succeeded: release is refused, and even if it
@@ -177,14 +206,16 @@ outbox closes it. Tracked with its blast radius in `../../../docs/KNOWN-ISSUES.m
 ```
 Clients/
   ICatalogClient / CatalogClient          GET  /api/v1/products/{id}
-  IStockClient   / StockClient            POST /api/v1/stock/{productId}/reservations
-                                          POST /api/v1/reservations/{id}/confirm
-                                          POST /api/v1/reservations/{id}/release
-                                          GET  /api/v1/reservations?orderId=
-  CatalogProduct, StockReservationSnapshot    consumer-owned contracts
-  DownstreamClient                            shared send + classify plumbing
+  CatalogProduct                            consumer-owned contract
+  DownstreamClient                          shared send + classify plumbing
+  DownstreamResilience                      timeout, retry and circuit-breaker pipeline
   DownstreamServiceException
 ```
+
+There is one client, not two. `IStockClient` and its four endpoints were deleted with the synchronous
+placement path: Ordering reaches Stock by publishing `OrderPlaced` and consuming its outcomes, so
+there is no HTTP seam left to declare. Catalog remains the only downstream this service calls, and
+`Services:Stock:BaseUrl` went with the client — nothing reads it and startup no longer requires it.
 
 Three rules govern it:
 
@@ -192,7 +223,7 @@ Three rules govern it:
   5xx, a timeout or a transport failure throws `DownstreamServiceException`. That split is what lets
   the placement path distinguish "the caller's order cannot be fulfilled" from "we were let down",
   without either becoming a 500.
-- **An unexpected 4xx is our bug.** A 400 from Stock means Ordering sent something Stock's contract
+- **An unexpected 4xx is our bug.** A 400 from a downstream means Ordering sent something its contract
   does not allow, so it becomes an `InvalidOperationException` → 500. Answering 502 would blame the
   other service for our defect.
 - **Timeouts and circuit breaks are caught explicitly.** `HttpClient` reports its own timeout as
@@ -213,7 +244,10 @@ no integration test can observe anything on the wire. It is also no longer code 
 landed — the header it sent is not read by anything now that the id is the trace id.
 
 Proven end to end by running all three hosts and sending Ordering a caller-supplied `traceparent`. The
-same trace id appeared in all three logs, including Stock's reserve call made *by* Ordering:
+same trace id appeared in all three logs, including the reserve call Ordering made *to* Stock — a call
+that no longer exists, so this evidence is historical. It is kept because the property it established
+is the one a faked suite cannot test, and propagation across the broker hop that replaced it is proven
+separately: `OrderPlacedConsumerTests` asserts the `traceparent` survives two AMQP hops unchanged.
 
 ```
 [04:20:32 INF] abcdef0123456789abcdef0123456789 Serilog.AspNetCore.RequestLoggingMiddleware:
@@ -330,10 +364,8 @@ Conflating them is what makes a retried placement ship twice.
 |---|---|---|
 | `ProductUnavailableException` | 409 | covers absent and soft-deleted alike; Catalog's query filter answers 404 for both |
 | `MixedCurrencyException` | 400 | `detail: null`, like every other domain 400; the clashing codes reach the log only |
-| `StockUnavailableException` | 409 | `orderId` extension; the row was written as `Failed` |
-| `OrderPlacementIncompleteException` | 502 | detail varies by status; `orderId` extension |
 | `DownstreamServiceException` | 502 | no `orderId`: nothing was written. The service name stays in the log |
-| `DbUpdateConcurrencyException` | 409 | arm present but **unreachable in Phase 0** — there is no update path |
+| `DbUpdateConcurrencyException` | 409 | arm present but **unreachable over HTTP** — no endpoint updates a row. The consumer does update orders, and handles its own conflicts inside the hosted service |
 | `23505` on `ix_orders_order_number` | 409 | "That order number already exists." |
 | `23505` on `ix_order_lines_order_id_product_id` | 409 | "That order already has a line for this product." |
 | `InvalidOperationException` | **500** | an illegal order transition; no arm, by design |
@@ -365,37 +397,44 @@ transfer rather than merely copy:
 | soft delete + `HasQueryFilter` | none | **none** | an order must never vanish from a list |
 | offset paging + `ProductPage` | no list endpoint | **no list endpoint** | nothing needed one; Phase 2 needs a queue, not a page |
 | `decimal` money + currency | `int` counters only | **`decimal` money + one currency per order** | it prices an order, so it needs Catalog's money rule and Stock's counting rule at once |
-| `CreatedAtUtc` + `UpdatedAtUtc` | both | **`PlacedAtUtc` only** | write-once; an `UpdatedAtUtc` that could only equal it would imply an update path that does not exist |
-| `xmin` guards a live update path | `xmin` prevents overselling | **`xmin` declared but inert** | mandatory on every entity, and Phase 2's saga will need it; added then would mean a migration and a window without protection |
+| `CreatedAtUtc` + `UpdatedAtUtc` | both | **`PlacedAtUtc` plus a nullable `UpdatedAtUtc`** | the row is written once as `Pending` and settled once by the outcome consumer. Nullable on purpose: `NULL` means "never settled", which is what makes a stranded order findable by query rather than only by absence |
+| `xmin` guards a live update path | `xmin` prevents overselling | **`xmin` guards the consumer's settle** | declared inert until the outcome consumer began updating orders. Nothing over HTTP updates a row, so the handler's conflict arm is still unreachable and the real one is inside the hosted service |
 | handlers call the `DbContext` directly | same | **`OrderPlacer` collaborator** | the revisit `docs/DECISIONS.md` pre-authorised for "a use case that needs to coordinate an external call inside one transaction" |
 | no navigation properties | none, flat graph | **`Order.Lines` is a real collection** | lines are inside the aggregate; Stock's reservation → stock item key crosses between two |
 | 4xx/5xx only | 4xx/5xx only | **502 exists** | the first service with a dependency, so "we were let down" is a distinct fact from "we have a bug" |
-| no outbound calls | leaf, asserted by test | **two typed clients**, asserted by test | the boundary guard inverts rather than disappears |
+| no outbound calls | leaf, asserted by test | **one typed client**, asserted by test | the boundary guard inverts rather than disappears. Stock is reached through the broker, so Catalog is the only HTTP seam |
 | structural guards re-derived | re-derived again | **re-derived again** | a copied guard that matches nothing passes vacuously |
 
 Referenced from `AgenticShop.Shared`, not copied: `DataAnnotationValidationFilter`,
 `CorrelationIdMiddleware`, `IRequestContract` and the `ProblemDetailsExceptionHandler` base class.
 Only the test harness is still copied per service, because the integration assemblies must not
-reference each other. Ordering's two divergences from the other services — the 502 arm and the
-`orderId` extension — are reconciled into the shared surface rather than forked; see §9.
+reference each other. Ordering's divergence from the other services — the 502 arm — is reconciled into
+the shared surface rather than forked; see §9. The `orderId` extension was the second and is now
+emitted by nothing, but the mechanism stays in `ExceptionClassification` for the reason §9 gives.
 
 ## 11. What Ordering still does not exercise
 
 Ordering closed every gap Stock left open: the typed `HttpClient` seam, outbound correlation-id
-propagation, real nested request DTOs, order-line snapshotting, and compensation across services.
+propagation, real nested request DTOs and order-line snapshotting. It also gave up one it had: it no
+longer compensates across services, because a placement no longer holds anything.
 
 Still unexercised, and named so nobody assumes otherwise:
 
 - **A sequence-generated business number.** `OrderNumber` is derived, so the fixture's inability to
   reset sequences is still untested territory.
-- **Real cross-service integration.** Every automated test fakes both clients. The three-host path is
-  covered by `http/ordering.http` run by hand, not by CI. Consumer-driven contract tests are Phase 3.
-- **Reconciliation as a process.** `PartiallyConfirmed` is recorded and queryable by id, but nothing
-  drives it forward. Discovering one whose id was lost needs `psql`. Phase 2's saga.
+- **Real cross-service integration.** Every automated test fakes the Catalog client, and the two
+  messaging suites stop at the broker — each publishes what the other service's consumer would, rather
+  than running it. The three-host path is covered by `http/ordering.http` run by hand, not by CI.
+  Consumer-driven contract tests are Phase 3.
+- **Reconciliation as a process.** Nothing drives a settled order forward or notices one that never
+  settled. The residual is not `PartiallyConfirmed` — no path can write that status any more — but an
+  order left `Pending` because its outcome never arrived, which `status = 'Pending' AND
+  updated_at_utc IS NULL` finds. A saga or an expiry worker is what would close it. Phase 3.
 
 Idempotent placement was on this list until Phase 1 closed it; a stranded claim is the smaller
 residual that replaced it, and it is in `KNOWN-ISSUES.md`. Resilience was on it too, and Phase 1
-closed it as well — timeout, retry and a circuit breaker, with reserve exempt from retry; see
-decision O18. **Distributed tracing** was the third, and Phase 1 closed it last: there is now a span
-tree, the correlation id *is* the trace id, and "which call was slow" is a span question rather than a
-reading exercise across three logs. See `docs/ARCHITECTURE.md` §4.9 and §6 above.
+closed it as well — timeout, retry and a circuit breaker. It shipped with a per-request exemption for
+the reserve call, and that exemption is gone with the call; see decision O18 for why a future outbound
+write has to re-earn it. **Distributed tracing** was the third, and Phase 1 closed it last: there is now
+a span tree, the correlation id *is* the trace id, and "which call was slow" is a span question rather
+than a reading exercise across three logs. See `docs/ARCHITECTURE.md` §4.9 and §6 above.

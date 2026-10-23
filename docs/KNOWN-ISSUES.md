@@ -424,6 +424,15 @@ Also note what the harness itself got wrong first: the capture was wired by regi
 Only the test's own non-vacuity assertion turned that into a red build instead of a guard that passes
 having matched nothing — the same failure mode `AGENTS.md` §10 warns about for reflection-based guards.
 
+**What became of the fix, 2026-10-23.** `SettleAsync` was deleted with the rest of Stock's HTTP
+reservation surface, so the LEFT JOIN above no longer exists and neither does `SettleReadAtomicityTests`
+— a statement-count guard needs a request to count against, and the consumer has none. The rule is not
+gone with them: `OrderPlacedConsumer.ReserveAsync` reads every stock item an order names in one
+statement for exactly this reason. What was lost is the *automated* enforcement, so the rule is prose
+again — the condition this entry was written to warn about. Tracked in
+`src/AgenticShop.Stock/docs/KNOWN-ISSUES.md`. The stack trace above is kept unedited as the record of
+what was diagnosed, including the file and line that no longer resolve.
+
 ### The rest, as an index
 
 Each of these is fixed and its *mechanism* is documented where the code now lives. What is recorded

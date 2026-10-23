@@ -477,7 +477,7 @@ Classification, in switch order:
 | `OperationCanceledException` **and** `RequestAborted` | *not handled* | `LogDebug`, `return false` |
 | `BadHttpRequestException` | **`badRequest.StatusCode`** | `null` |
 | service-specific domain conflicts | 409 | built from typed properties |
-| a dependency failed — **Ordering only** | 502 | `DownstreamServiceException`, `OrderPlacementIncompleteException` |
+| a dependency failed — **Ordering only** | 502 | `DownstreamServiceException` |
 | `DbUpdateConcurrencyException` | 409 | reload hint |
 | `DbUpdateException` + `23505` | 409 | keyed on constraint name |
 | `DbUpdateException` + `22001` / `22003` | 400 | too long / out of range |

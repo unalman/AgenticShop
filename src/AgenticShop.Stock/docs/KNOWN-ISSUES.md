@@ -13,18 +13,23 @@ worth knowing.
 
 ### Concurrency
 
-**Contention throughput is poor by design.** *Medium · Phase 2 (serialisation).*
-A live burst held only 4 of 10 units — the numbers and the log are in `ARCHITECTURE.md` §7.
-Nothing is oversold and nothing is a 5xx, so this is correct optimistic-concurrency behaviour with
-no server-side retry (decision D9), not a defect.
+**The consumer's single-statement read has no structural guard.** *Low.*
+`OrderPlacedConsumer.ReserveAsync` reads every stock item an order names in **one statement**, and
+that is load-bearing rather than tidy: two statements would take two READ COMMITTED snapshots, and a
+decision computed from rows of mixed vintage is the bug recorded as **D15** and in `ARCHITECTURE.md`
+§7. The test that counted the statements a settle actually issued was deleted along with the endpoint
+it measured, so the rule is now enforced by a code comment alone — and the repository-root
+`AGENTS.md` §6 is explicit that a convention enforced only by prose will be violated. Restoring a
+guard means capturing SQL from inside the consumer's scope, which is what the deleted
+`SettleSqlCapture` did for the HTTP path.
 
-It matters because Ordering's synchronous placement reserves line by line and will fail often under
-load. **Phase 1 closed without touching it, deliberately.** The retry that landed on Ordering's typed
-clients cannot help here: Stock's `xmin`-conflict 409 is a normal 4xx and is not retried, so the
-burst still holds 4 of 10 — see `../../../docs/ROADMAP.md` → Phase 1 and Ordering's **O18**. What
-remains is Phase 2's, where a single-consumer queue dissolves the contention instead of retrying it.
-**Ordering's policy is decided: fail fast** — see
-`../../AgenticShop.Ordering/docs/DECISIONS.md` → **O16**.
+**A message that loses the `xmin` race twice is dropped.** *Medium · Phase 3.*
+The consumer requeues once and then acknowledges without writing an inbox row, because with no
+dead-letter queue a nack either discards the message anyway or loops forever filling the log. The
+consequence is that `OrderPlacedConsumerTests` cannot assert every published message was processed,
+and an order can stay `Pending` in Ordering with no outcome ever arriving — the stranded-`Pending`
+residual in `../../../docs/KNOWN-ISSUES.md`. Only contention with `PUT /api/v1/stock/{productId}`
+can provoke it now, so it is rare; a DLQ plus a reservation-expiry worker is what closes it.
 
 ### API
 
@@ -35,24 +40,27 @@ admin path to Stock is ever exposed, this becomes a real gap.
 
 ### Deliberate, not defects
 
-**Reservation transitions are strict, not idempotent.** A retried confirm returns 409 rather than
-succeeding quietly. Deliberate (decision D3): a silent no-op would hide a double-settle from the
-caller. **Ordering must treat that specific 409 as success** until Phase 1/2 adds real
-idempotency.
+**Reservation transitions are strict, not idempotent.** A second `Confirm()` on one row throws rather
+than succeeding quietly. Deliberate (decision D3): a silent no-op would hide a double-settle. Nothing
+outside this process can provoke it now that the confirm endpoint is gone — the consumer confirms
+each line once, inside the transaction that reserves it — so the strictness is what makes a redelivered
+message loud instead of quietly double-shipping. Redelivery safety itself is the inbox's job, not
+this.
 
-**`Confirmed` is non-compensable.** Deliberate, and a consequence of the item above plus confirm
-decrementing `quantity_on_hand`. There is no transition that undoes a confirm, so an order whose
-confirms fail part-way through cannot be rolled back — only its still-`Pending` reservations can be
-released. Stock is not where this is handled; how Ordering records such an order is decision
-**O14** in `../../AgenticShop.Ordering/docs/DECISIONS.md`, and the stranded-hold residual is tracked
-in `../../../docs/KNOWN-ISSUES.md` → "Cross-service consistency".
+**`Confirmed` is non-compensable, and every hold now reaches it.** Deliberate, and sharper since the
+consumer began reserving and confirming in one transaction: there is no `Pending` hold to release, so
+if cancellation ever arrives there is nothing to undo. `StockItem.ReleaseReservation` and the
+`Released` status are kept for that conversation rather than deleted as unreachable — see
+`Messaging/OrderPlacedConsumer.cs` remarks and decision **D16**.
 
-**No server-side retry on `xmin` conflict.** Deliberate (decision D9); see the contention item
-above.
+**One bounded retry on `xmin` conflict, in the consumer.** Decision D9's "no server-side retry" was
+about the HTTP reserve endpoint, which is gone. The consumer does retry: it nacks and requeues once,
+then drops. Bounded because a requeue loop with no dead-letter queue is a spin, and one attempt is
+enough for a conflict with `PUT /api/v1/stock/{productId}`, which is a single short transaction.
 
 **No list or paging endpoint.** Deliberate; nothing needed it and symmetry with Catalog is not a
-reason. `GET /api/v1/reservations?orderId=` exists because it is the reconciliation and
-compensation path, not because listing is generally useful.
+reason. The one list endpoint Stock had — `GET /api/v1/reservations?orderId=` — was deleted with the
+rest of the reservation surface, so inspecting holds is a `psql` query now.
 
 **`UNIQUE(order_id, stock_item_id)` forces one hold per product per order.** Deliberate (decision
 D2) — it is what makes reserve naturally idempotent. The consequence is that **Ordering must

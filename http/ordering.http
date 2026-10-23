@@ -105,17 +105,12 @@ Idempotency-Key: smoke-place-1
 # Pending first, then Confirmed once the round trip through Stock completes.
 GET {{ordering}}/api/v1/orders/{{orderId}}
 
-### 5. Stock after the order: on-hand 8, reserved 0, and one Confirmed reservation
+### 5. Stock after the order: on-hand 8, reserved 0
 # `reserved` is 0 rather than 2 because Stock's consumer reserves and confirms in one transaction:
-# the units left inventory rather than being held against it.
+# the units left inventory rather than being held against it. The Confirmed reservation row behind
+# that is in Stock's database, but it is no longer readable over HTTP — the reservation endpoints
+# went with the synchronous path, so a cross-check now needs psql rather than a request.
 GET {{stock}}/api/v1/stock/{{productId}}
-
-### 6. Stock's reservation view for this order — a manual cross-check, no longer a code path
-# Ordering does not read this any more. It existed so the synchronous confirm phase could reconcile an
-# ambiguous failure by reading the authoritative state back, and that phase is gone. It is still useful
-# here to confirm by hand that exactly one Confirmed reservation of 2 units exists, and it is scheduled
-# for deletion along with the rest of the un-called HTTP reservation endpoints.
-GET {{stock}}/api/v1/reservations?orderId={{orderId}}
 
 ### Duplicate lines for one product are combined into a single hold
 # Stock's UNIQUE(order_id, stock_item_id) allows one hold per product per order, so this places one

@@ -17,63 +17,72 @@ open and resolved issues: `docs/KNOWN-ISSUES.md`.
 | Role | `ordering_svc` (least privilege; never the `agenticshop` superuser) |
 | Entities | `Order`, `OrderLine` |
 | Connection string key | `ConnectionStrings:Ordering` |
-| Downstream base URLs | `Services:Catalog:BaseUrl`, `Services:Stock:BaseUrl` |
+| Downstream base URLs | `Services:Catalog:BaseUrl` |
 
 ## Rules specific to this service
 
 - **Ordering is the orchestrator and the only service that makes outbound calls.** It calls Catalog
-  to resolve and snapshot products and Stock to hold and settle them. It never joins, never shares a
-  table, and never references either assembly — `Directory.Build.targets` and
-  `ServiceBoundaryTests` both enforce that.
-- **A consumer owns its own contract.** `CatalogProduct` and `StockReservationSnapshot` are declared
-  here, with only the fields this service reads. Do not "complete" them to match the other service's
-  response, and do not create a shared contracts project.
+  over HTTP to resolve and snapshot products, and reaches Stock **only through the broker** —
+  publishing `OrderPlaced` and consuming its outcomes. It never joins, never shares a table, and never
+  references either assembly — `Directory.Build.targets` and `ServiceBoundaryTests` both enforce that.
+  Do not re-add an `IStockClient`: there was one, and it was deleted with the synchronous path.
+- **A consumer owns its own contract.** `CatalogProduct` and the records in `Messaging/` are declared
+  here, with only the fields this service reads or writes. Do not "complete" them to match the other
+  service's shape, and do not create a shared contracts project. The wire format is pinned from both
+  sides independently — `StockEventContractTests` here, Stock's serializer test there.
+- **The order row is written FIRST, as `Pending`, and settled later by a consumer.** This reverses the
+  Phase 0 rule, which said the row was written last and already terminal. The row exists before the
+  work does, so a crash after the save still leaves something to settle. Do not "fix" it back: an
+  insert-then-update path is the design, not a smell.
+- **The outbox row commits in the SAME `SaveChangesAsync` as the order and its lines.** Never split
+  them. The single transaction is the whole point of the outbox — a row written after the order can be
+  lost with the order already accepted, and a row written before can be published for an order that
+  rolled back. Needing one transaction across several saves is a design smell to raise first.
+- **`POST /orders` answers 202, not 201, and the body says `Pending`.** A client that treats 202 as
+  success-and-done will believe an order shipped when it was only accepted. The `Location` header is
+  the poll target.
+- **The message id is the outbox row's id, not the order id.** Both sides' inboxes key on it. Reusing
+  the order id would collide across an order's lifetime the moment anything republishes.
 - **Never parse a downstream `detail`.** The shared error contract says a caller builds its own
-  vocabulary from typed properties. Stock's 409 on confirm means either "already confirmed" (success,
-  per decision D3) or "xmin conflict" (failure); the only way to tell them apart is
-  `GET /api/v1/reservations?orderId=`, not the response text.
-- **The order row is written exactly once, at the end, already terminal.** Never persist a `Pending`
-  order before the downstream calls, and never add an "insert then update" path. `Pending` is the
-  aggregate's construction state and stays in the enum for Phase 2's saga.
-- **Never release a `Confirmed` reservation.** Stock refuses it, and even if it did not, release
-  returns the hold without returning stock that has already left.
-- **A reserve that fails after earlier lines were held → release every hold for that order and fail
-  it.** No server-side retry in Phase 0, and no partial fill. Stock does not retry on `xmin`
-  conflict, so a reserve can fail even when stock was available. See `docs/DECISIONS.md` → **O16**.
-- **The typed clients retry, and reserve is the one call that must not.** `ReserveAsync` marks its
-  request with `DownstreamResilience.NotRetryable`; do not remove that line, and do not add retry to
-  a new outbound call without checking it is safe. A retried reserve whose first attempt committed is
-  answered 409 by Stock's unique index, and the client reads 409 as a refusal — so the hold is
-  stranded and the order is reported out of stock for stock that was taken. Reads and settles *are*
-  retried, because their 409 is resolved by the reconciliation read instead of being interpreted.
-  See `docs/DECISIONS.md` → **O18**.
+  vocabulary from typed properties. Catalog answers 404 for an absent *and* a soft-deleted product, and
+  `CatalogClient` turns that into `null` — which the placement path raises as
+  `ProductUnavailableException`, not as a guess about why.
+- **The typed client retries, and nothing is exempt.** The pipeline wraps the Catalog read, which is
+  safe to retry because a read has no side effect. There *was* a per-request exemption for the
+  synchronous reserve, and it is deleted with the call. **Do not add retry to a new outbound call
+  without checking it is safe first** — a retried non-idempotent write is how a hold gets stranded and
+  then reported as unavailable. Re-earn the exemption; do not assume it. See `docs/DECISIONS.md` →
+  **O18**.
 - **`POST /orders` requires an `Idempotency-Key` header, and a repeated key replays.** The claim is
-  written **after** resolve and **before** reserve — resolve is pure reads, so a bad basket must not
-  burn the caller's key; reserve is the first side effect, so the claim must be committed first. The
-  completion commits in the **same** `SaveChangesAsync` as the order. Keep it that way: moving the
-  claim earlier wastes keys, moving it later reopens double-placement. See `docs/DECISIONS.md` → **O17**.
-- **A confirm-phase failure ends as `PartiallyConfirmed`, not `Failed`.** `Failed` says nothing
-  shipped, so a client that believes it re-orders — and the lines that were already confirmed ship a
-  second time. The idempotency key stops an *accidental* retry; it cannot stop a client that
-  deliberately chooses a new key because it was told nothing shipped. See `docs/DECISIONS.md` →
-  **O14** and `docs/ARCHITECTURE.md` §5.
-- **`PartiallyConfirmed` is reachable only from the confirm phase.** A reserve-phase fault cannot
-  have shipped anything, so its order is `Failed` even when the reconciliation read also failed.
-- **A 502 or 409 that wrote a row must echo the order id.** The handler puts it in a ProblemDetails
-  extension; without it a client cannot tell "nothing was created" from "something was created and
-  is broken".
+  written **after** resolve and **before** the order — resolve is pure reads, so a bad basket must not
+  burn the caller's key; the order write is the first side effect, so the claim must be committed
+  first. The completion commits in the **same** `SaveChangesAsync` as the order and the outbox row.
+  Keep it that way: moving the claim earlier wastes keys, moving it later reopens double-placement.
+  See `docs/DECISIONS.md` → **O17**.
+- **A replay derives its status from the order, it does not repeat a stored one.** 202 while the order
+  is `Pending`, 200 once it has settled. Replaying the recorded code would answer 202 forever for an
+  order that was confirmed minutes ago, and the client would keep polling finished work. What the key
+  still guarantees exactly is the part that matters: a retry never places a second order.
+- **`PartiallyConfirmed` cannot be written.** It stays in the enum and in the `CHECK` constraint
+  because rows from before the flip carry it, and narrowing the vocabulary would mean rewriting them.
+  Nothing produces a partial outcome now — Stock takes every line of an order or none. Do not restore
+  a path to it. See `docs/ARCHITECTURE.md` §5.
+- **No failure inside a request writes a row.** Catalog resolution is the only thing that can fail
+  during a placement and it happens before the claim, so a 409 or 502 from `POST /orders` means
+  nothing was created. That is why no response carries an `orderId` extension any more — there is no row
+  to name. The mechanism stays in `ExceptionClassification`; a future path that writes a row and then
+  fails must put the id back.
 - **502 for a dependency, 500 for ourselves.** An unexpected 4xx from a downstream service means this
   assembly sent something its contract does not allow, so it becomes an `InvalidOperationException`
   and a 500 — reporting it as a 502 would blame the other service for our bug.
 - **Cancellation stops at the first side effect.** Resolving against Catalog honours the caller's
-  token; from the first reserve onward everything uses `CancellationToken.None`, because a client
-  that hangs up must not leave stock held against an order nobody recorded.
-- **Reservation ids are never persisted.** Stock owns them. Reconciliation after the fact goes
-  through `GET /api/v1/reservations?orderId=`, which reports the product id every line matches on.
+  token; from the claim onward everything uses `CancellationToken.None`. The reason is the key, not
+  stock: a claim committed with no order behind it refuses every later request under that key for good,
+  so a caller who hangs up at the wrong moment loses the key rather than the order.
 - **Duplicate product lines are combined, not rejected.** Stock's `UNIQUE(order_id, stock_item_id)`
   allows one hold per product per order. Combining happens before resolution, so a repeated product
   costs one Catalog call.
-- **One currency per order.** Enforced during resolution, before anything is reserved. A total summed
+- **One currency per order.** Enforced during resolution, before anything is written. A total summed
   across currencies is a meaningless number written into permanent order history.
 - **`ProductName` and `UnitPrice` are snapshots, not references.** A later catalog edit must not
   rewrite order history. `ALineSnapshotsTheCatalogSoALaterEditCannotRewriteOrderHistory` pins it.
@@ -82,11 +91,12 @@ open and resolved issues: `docs/KNOWN-ISSUES.md`.
   `InvalidOperationException`; the default arm is the correct answer, and a test pins it.
 - **Money is `decimal` with a separate `Currency` string, rounded 2dp `AwayFromZero`** — the same
   rule Catalog applies to a price, so a snapshot cannot disagree with its source by a cent.
-  `LineTotal` is computed and `builder.Ignore`d; `TotalAmount` is stored, because an order is
-  write-once and the headline number must be readable without materialising the collection.
+  `LineTotal` is computed and `builder.Ignore`d; `TotalAmount` is stored, because the headline number
+  must be readable without materialising the collection.
 - **No list endpoint and no mutation endpoint.** `POST /api/v1/orders` and `GET /api/v1/orders/{id}`
   are the whole surface. Do not add paging "for symmetry with Catalog" or a cancel route "because
-  orders have one"; neither has a Phase 0 caller.
+  orders have one". A cancel would need a compensation path for stock that has already shipped, and
+  `Confirmed` is non-compensable on Stock's side.
 
 ## Commands
 
@@ -101,8 +111,11 @@ dotnet test tests/AgenticShop.Ordering.IntegrationTests   # needs Docker
 `--output-dir Data/Migrations` is not optional: the default is `Migrations/`, and the house
 convention is per service under `Data/`.
 
-**Ordering does not run alone.** A real placement needs Catalog on 5081 and Stock on 5082, plus the
-compose database. The integration tests need neither, because both clients are faked at the seam.
+**Ordering does not run alone.** A real placement needs Catalog on 5081, the compose database and a
+reachable broker — but *not* Stock, because a placement no longer calls it: with the broker down the
+order is still accepted as `Pending` and the outbox drains later. Stock on 5082 is what settles it. The
+integration tests need none of them, because the Catalog client is faked at the seam and the two
+messaging suites run their own broker container.
 
 Manual requests: `../../http/ordering.http`, which drives all three services in order.
 Scalar UI: <http://localhost:5083/scalar/v1> (Development only).
@@ -119,7 +132,8 @@ class live in `src/AgenticShop.Shared/` — extracted at the start of Phase 1, s
 reaches all three services at once. Only the test harness is still per service. Which conventions are
 shared: `../../docs/ARCHITECTURE.md` §4.
 
-Ordering's two deliberate divergences from the other services were reconciled into the shared
-surface rather than forked: the `orderId` extension is data on `ExceptionClassification`, and the
-502 arm lives in `ClassifyDomain` because "a dependency failed" is only expressible where a
-dependency exists. Neither belongs in the other two services — do not back-port them.
+Ordering's divergence from the other services was reconciled into the shared surface rather than
+forked: the 502 arm lives in `ClassifyDomain` because "a dependency failed" is only expressible where
+a dependency exists. It belongs in no other service — do not back-port it. There was a second, the
+`orderId` extension on a failure that wrote a row; nothing emits it now, because no failure inside a
+request writes one. The mechanism stays on `ExceptionClassification` for the next path that does.

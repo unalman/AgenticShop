@@ -23,19 +23,20 @@ notice, and no endpoint can clear it.
 This is deliberate rather than an oversight. Treating an old claim as abandoned would need a clock
 threshold, and two requests could both decide the claim was abandoned and both place — the exact
 failure the key exists to prevent. Refusing blocks one key and can never double-place, so the client
-recovers by choosing a new key. Phase 3's reservation-expiry worker is the mechanism that lifts it,
-and it is the same shape of problem as a stranded hold.
+recovers by choosing a new key. Phase 3's expiry worker is the mechanism that lifts it, and it is the
+same shape of problem as an order stuck `Pending`.
 
-The `orderId` extension on 409 and 502 bodies still does its separate job: a client that *reads* a
-failure can query the order rather than guessing.
+The `orderId` extension this item used to point at as a partial comfort is no longer emitted at all —
+nothing writes a row and then fails inside the request, so there is no id to echo. See
+`ARCHITECTURE.md` §9.
 
-**A `PartiallyConfirmed` order whose id was never received is undiscoverable through the API.**
-*Medium · Phase 2.* There is no list endpoint (decision O12), so the only handle on an order is its
-id. If the 502 response was lost, the order exists in the database and cannot be reached over HTTP;
-finding it needs `psql`, and reconciling it needs Stock's
-`GET /api/v1/reservations?orderId=` with an id that is, by hypothesis, unknown. The cross-database
-query that would find it is the same one the orphan residual in
-`../../../docs/KNOWN-ISSUES.md` needs.
+**An order that never settled is undiscoverable through the API.** *Medium · Phase 3.* There is no list
+endpoint (decision O12), so the only handle on an order is its id — and `POST /orders` returns that id
+in a 202 `Location` header, so an order whose 202 was lost exists in the database and cannot be reached
+over HTTP. Finding it needs `psql`, via `status = 'Pending' AND updated_at_utc IS NULL`. The status that
+used to be the residual here, `PartiallyConfirmed`, cannot be written any more: Stock takes every line
+of an order or none, so an outcome is never partial. The cross-database query that would find either is
+the same one the orphan residual in `../../../docs/KNOWN-ISSUES.md` needs.
 
 ### Resilience
 
@@ -73,24 +74,31 @@ does attach a result to its events. Worth doing if an outage ever makes the volu
 the access log is already excluded from this: `ServiceLogging.RequestLogLevel` keeps it at
 Information, so a 502 does not add a third Error.
 
-**Reserve is exempt from retry, and that exemption is load-bearing.** *Info.* A retried reserve whose
-first attempt committed would be answered 409 by Stock's unique index, and the client reads 409 as a
-refusal — stranding the first hold and reporting stock as unavailable when it was taken. See O18.
-`ReserveMarksItsRequestAsNotRetryable` is the guard; if it ever fails, the fix is not to delete it.
+**Nothing is exempt from retry, and that is only safe because nothing writes.** *Info.* The
+`NotRetryable` marker, the predicate that read it and the `ReserveMarksItsRequestAsNotRetryable` guard
+were all deleted with `StockClient`. What remains is one client that only reads Catalog, so a retry
+cannot duplicate a side effect. The hazard the exemption existed for is unchanged and is recorded in
+O18: **if an outbound write is ever added, it must re-earn the exemption.** There is no marker left to
+set, so reintroducing one is part of that work rather than a reason to skip it.
 
-**Compensation is best effort and can strand a hold.** *Medium · Phase 3.* A release that fails is
-logged and does not change the order's classification, because the classification describes what
-shipped and a stranded hold ships nothing. The hold then stays in Stock's `reserved` until something
-lifts it, and in Phase 0 nothing does: there is no `ExpiresAtUtc` and no expiry worker. The exposure
-is inventory *under*-availability, never negative stock, so it is lossy rather than unsafe.
+**There is no compensation, and the residual changed shape.** *Medium · Phase 3.* Ordering releases
+nothing, because Stock's consumer holds all of an order's lines or none of them in one transaction — a
+refused hold rolls back and leaves no `reserved` behind, so there is no stranded hold to compensate
+for. What replaced it is milder and findable: an order accepted as `Pending` whose outcome never
+arrives stays `Pending` forever, because there is no `ExpiresAtUtc` and no expiry worker. The query
+that finds those rows is `status = 'Pending' AND updated_at_utc IS NULL`, since the outcome consumer
+stamps `updated_at_utc` when it settles one. Tracked with its blast radius in
+`../../../docs/KNOWN-ISSUES.md` → "Cross-service consistency".
 
 ### Testing
 
 **Outbound trace propagation is proven by hand, not by the suite.** *Low.* Every integration test
-replaces `ICatalogClient` and `IStockClient` at the seam, which is the right thing for scripting
-failures and the reason no automated test can observe what actually goes on the wire. It was verified
-live instead — a caller-supplied `traceparent` produced the same trace id in all three services' logs,
-with Catalog's server span parented to Ordering's client span (recorded in `docs/ARCHITECTURE.md` §6).
+replaces `ICatalogClient` at the seam, which is the right thing for scripting failures and the reason
+no automated test can observe what actually goes on the wire. It was verified live instead — a
+caller-supplied `traceparent` produced the same trace id in all three services' logs, with Catalog's
+server span parented to Ordering's client span (recorded in `docs/ARCHITECTURE.md` §6). The broker hop
+is covered where the HTTP one cannot be: `StockOutcomeConsumerTests` and Stock's
+`OrderPlacedConsumerTests` both assert a `traceparent` survives the round trip.
 
 The exposure changed shape when `CorrelationIdPropagatingHandler` was deleted. It used to be one
 `AddHttpMessageHandler` registration line that no test covered; it is now the `instrumentHttpClient:
@@ -103,23 +111,33 @@ green. Same risk, different line.
 produces one, because producing it needs a real HTTP server returning a bad body — the fakes cannot
 malform a response they never serialise.
 
-**Contract drift with Catalog and Stock is invisible.** *Medium · Phase 3.* `CatalogProduct` and
-`StockReservationSnapshot` are declared here, deliberately, and deserialisation ignores unknown
-fields. So Catalog adding a field is safe, and Catalog *renaming* one silently yields a default value
-— a product with no name, a reservation with no status. The status case is guarded
-(`ListByOrderAsync` refuses a read with a blank status, because it would classify as neither confirmed
-nor pending); the name case is not. Consumer-driven contract tests are Phase 3.
+**Contract drift with Catalog is invisible.** *Medium · Phase 3.* `CatalogProduct` is declared here,
+deliberately, and deserialisation ignores unknown fields. So Catalog adding a field is safe, and
+Catalog *renaming* one silently yields a default value — a product with no name, which then reaches an
+order line and is written to the database. Nothing on Catalog's side asserts the shape it must send.
+
+`StockReservationSnapshot` went with the client that read it, so Stock's HTTP contract is no longer a
+drift surface at all. The event contracts replaced it as the bigger one, and those *are* guarded in
+both directions: `StockEventContractTests` asserts this service's copy of `StockCommitted` and
+`StockReservationRejected` reads the exact field names Stock's `TheOutcomesSerialiseAsCamelCaseWithNamedEnums`
+pins, and `OrderPlacedContractTests` does the same for `OrderPlaced` against a payload captured from a
+live compose run. Two independent assertions on one wire format, so a rename on either side fails one
+of them naming the field. Consumer-driven contract tests are still Phase 3; Catalog is what they would
+add.
 
 ### Deliberate, not defects
 
-**`xmin` is declared on both entities and never fires.** Phase 0 has no update path: the row is
-written once, already terminal. The token is mandatory on every entity and Phase 2's saga will need
-it, so it is declared now rather than added by a migration later. The consequence is that the
-handler's `DbUpdateConcurrencyException` arm is unreachable and no test can exercise a real conflict.
+**`xmin` no longer fires over HTTP, but it does fire in the consumer.** The handler's
+`DbUpdateConcurrencyException` arm is still unreachable, because no endpoint updates a row — an order
+is written once, as `Pending`. `StockOutcomeConsumer` updates one, settling `Pending` → `Confirmed` or
+`Failed`, and handles the conflict the way Stock's consumer does: nack and requeue once, then drop and
+log an error rather than spin. So the token is load-bearing on the messaging path and decorative on the
+HTTP one, and the two are worth keeping straight — a test that provokes a real conflict now belongs in a
+messaging collection, not the API one.
 
-**No list endpoint, no cancel, no mutation of a persisted order.** Decision O12. Symmetry with Catalog
-is not a reason, and a cancel route would need a status, a compensation path for confirmed lines that
-does not exist, and an update path that would make `xmin` and `UpdatedAtUtc` load-bearing.
+**No list endpoint, no cancel, no mutation of a persisted order over HTTP.** Decision O12. Symmetry with
+Catalog is not a reason, and a cancel route would need a status and a compensation path for confirmed
+lines that does not exist. The consumer's settle is the one mutation, and it is not a route.
 
 **Duplicate product lines are combined silently.** Decision O6. A client that sends the same product
 twice gets one line back with the summed quantity. That is a visible change to what was submitted, and

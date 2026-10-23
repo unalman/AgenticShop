@@ -30,7 +30,8 @@ open and resolved issues: `docs/KNOWN-ISSUES.md`.
   as "no stock", which is more dangerous than a deleted product. Catalog's soft delete is *not*
   house style.
 - **No list or paging endpoint.** Nothing needs one; symmetry with Catalog is not a reason.
-  `GET /api/v1/reservations?orderId=` exists as the reconciliation and compensation path.
+  The reservation endpoints that used to sit beside these are deleted — holds are written by the
+  consumer and inspected with `psql`, not requested over HTTP.
 - **Quantities are `int`, never money.** Do not add `decimal`, currency or precision here.
 - `Available` is a **computed property** (`QuantityOnHand - Reserved`), `builder.Ignore`d. Never
   store it — a second copy of the truth will drift.

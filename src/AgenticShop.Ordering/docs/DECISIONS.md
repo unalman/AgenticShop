@@ -155,6 +155,12 @@ operator through the log line.
 
 ## O9 · Ambiguous failures are resolved by a read, never by a status code or response text
 
+**Superseded 2026-10-23.** There is no ambiguous confirm left to resolve: the confirm call is gone, and
+Stock answers an order with exactly one outcome event, so nothing has to be read back to interpret it.
+The *principle* survives and is load-bearing — decide from authoritative state, not from a status code
+— which is what the replay path does when it derives its answer from the order's current status rather
+than from a stored response code.
+
 **Why.** Stock answers 409 on confirm both for "already confirmed" — which decision D3 says must be
 treated as success — and for an xmin conflict, which must not. The shared error contract forbids
 parsing another service's `detail` to tell them apart, and guessing wrong in either direction is
@@ -173,6 +179,11 @@ does *not* read: it knows exactly which holds it took and that they are still `P
 releases them directly.
 
 ## O10 · Never release a `Confirmed` reservation
+
+**Superseded 2026-10-23.** Ordering releases nothing. The release call is deleted, and Stock's consumer
+confirms every line inside the transaction that reserves it, so a `Pending` hold never exists for
+anyone to release. `StockItem.ReleaseReservation` and the `Released` status are kept in Stock for a
+future cancellation path — see Stock's **D16** — not because anything here calls them.
 
 Stock refuses it (`InvalidReservationStateException` → 409). More importantly it would be *wrong*
 even if allowed: release decrements `reserved` without incrementing `quantity_on_hand`, so it would
@@ -259,6 +270,13 @@ cannot be removed while that path exists.
 
 ## O14 · Confirm-phase policy — **added 2026-09-24**
 
+**Superseded 2026-10-23.** There is no confirm phase, so there is no partial outcome to classify: Stock
+takes every line of an order or none of them and answers with a single event. `PartiallyConfirmed`
+stays in `OrderStatus` and in the `ck_orders_status_known` CHECK constraint, because rows written
+before the flip carry it and narrowing the vocabulary would mean rewriting them — but nothing can
+write it now. `ARCHITECTURE.md` §5 is marked historical and keeps the classification table as the
+record of this reasoning.
+
 A failure or timeout during the confirm phase ends the order in terminal `PartiallyConfirmed` and
 answers 502. The classification is decided by the reconciliation read in O9, never by a status code
 or response text. The step sequence and the classification table are in `ARCHITECTURE.md` §5 — that
@@ -301,6 +319,13 @@ is now the resilience pipeline's per-attempt timeout, still ten seconds — see 
 `HttpClient.Timeout` had to stop being set.
 
 ## O16 · Reserve-phase failure — fail fast, compensate, never retry — **added 2026-09-24**
+
+**Superseded 2026-10-23.** There is no reserve phase and nothing to compensate: a placement does not
+call Stock, and Stock's consumer holds every line of an order or none of them in one transaction, so
+the "later line fails after earlier lines were held" state this policy classified cannot arise. A
+refusal is now an asynchronous outcome that settles the order `Failed`. The measurement below is still
+the canonical record of *why* the synchronous design was abandoned rather than retried into shape —
+Phase 2 dissolved the contention instead of surviving it.
 
 O14 covers a *confirm* that fails. This is the *reserve* counterpart, and it is the cleaner case:
 nothing has shipped and every hold is still `Pending`, so releasing them all is a complete undo.
@@ -403,9 +428,16 @@ by the reconciliation read (O9). **What that turned out to mean in practice is O
 
 ## O18 · Retry is per request, and reserve is exempt — **added 2026-10-04, Phase 1**
 
-`Microsoft.Extensions.Http.Resilience` on both typed clients: a per-attempt timeout, a total
-timeout, retry, and a circuit breaker. Retry is enabled **per request**, not per client and not per
-HTTP method, and `StockClient.ReserveAsync` opts its request out.
+**Revised 2026-10-23 — the exemption is deleted, not merely unused.** `StockClient` is gone, and with
+it the `DownstreamResilience.NotRetryable` marker and the predicate that read it. There is one typed
+client now, it only reads, and the pipeline retries every transient failure with no per-request opt-out.
+**The reasoning below is retained deliberately and still binds**: it is the argument for why a future
+outbound *write* must re-earn an exemption rather than inherit this pipeline's retry. Deleting the
+mechanism does not delete the hazard it was built for.
+
+`Microsoft.Extensions.Http.Resilience` on the typed clients: a per-attempt timeout, a total
+timeout, retry, and a circuit breaker. Retry was enabled **per request**, not per client and not per
+HTTP method, and `StockClient.ReserveAsync` opted its request out.
 
 **Why reserve is exempt.** This is the part O17's closing note left to find out. D2 does make Stock's
 reserve idempotent — a repeated `(order_id, stock_item_id)` cannot double-hold — but idempotence on
@@ -647,10 +679,11 @@ commit:
   reservation) — Ordering releases nothing; **O14** (confirm-phase policy) — there is no confirm phase,
   and `PartiallyConfirmed` is unreachable from the event path; **O16** (fail fast and compensate) —
   there is nothing to compensate, because Stock takes every line or none; **O18**'s reserve-retry
-  exemption — there is no reserve call. Each still describes code that exists in the repository,
-  because Stock's HTTP reservation endpoints and Ordering's `IStockClient` were deliberately left for
-  the cleanup commit rather than deleted inside the behavioural flip. They get their own markers when
-  that code goes.
+  exemption — there is no reserve call. Each still described code that existed at the time, because
+  Stock's HTTP reservation endpoints and Ordering's `IStockClient` were deliberately left for the
+  cleanup commit rather than deleted inside the behavioural flip. **That code is now deleted and each
+  of the five carries its own superseded marker**, so the list here is the summary and the entries are
+  the authority.
 - **Verified end to end through compose**, which is the only place all three services and the broker
   meet and no test covers: 202 with `status: Pending`, then `Confirmed` on a poll, `quantity_on_hand`
   10 → 7 with `reserved` back to 0, one inbox row and one drained outbox row on each side, and a
