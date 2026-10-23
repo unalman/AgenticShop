@@ -268,9 +268,11 @@ evidence. What follows is the shape of it, so the code reads consistently across
 
 **Service boundaries are enforced at build time.** `Directory.Build.targets` fails the
 build if any project under `src/` holds a `ProjectReference` to another project under
-`src/`. Services communicate over HTTP only; a compile-time reference would make the
-solution a distributed monolith in all but name and remove the failure modes the later
-phases exist to teach. All three services inherit the rule, and each also has a runtime
+`src/`. Every channel between two services is a runtime one — HTTP today, AMQP from
+Phase 2 — and neither needs a compile-time reference, which is why a message contract is
+duplicated per service rather than shared. A `ProjectReference` would make the solution a
+distributed monolith in all but name and remove the failure modes the later phases exist
+to teach. All three services inherit the rule, and each also has a runtime
 guard for the dependency a `ProjectReference` is not — Stock's `LeafServiceBoundaryTests`
 asserts it registers no `HttpClient` at all, Ordering's `ServiceBoundaryTests` asserts the
 inverse and that no other `AgenticShop.*` assembly is even loaded. Test projects are exempt.
@@ -321,7 +323,7 @@ Each phase adds one capability, and only once the previous phase makes it necess
 Three hosts, synchronous HTTP, one database per service, Testcontainers. All three services
 are implemented and verified: at the close of Phase 0, 426 tests, a clean build under
 `TreatWarningsAsErrors`, database isolation 22/22, and the three-host path driven by hand
-through `http/ordering.http`. **The suite is now at 545.**
+through `http/ordering.http`. **The suite is now at 552.**
 
 **Phase 1 — Reliability and observability** *(complete)*
 Shared infrastructure library · idempotency keys on `POST /orders` · retry/circuit-breaker/timeout
@@ -369,6 +371,21 @@ temporary and are recorded in `docs/KNOWN-ISSUES.md` rather than left in code co
 `mandatory: false` because no queue is bound yet, and only `Confirmed` orders publish because stock is
 already held by the time the row is written.
 `src/AgenticShop.Ordering/docs/DECISIONS.md` → O19.
+
+**Both consumers now exist and neither is registered.** Stock consumes `OrderPlaced`, holds an order's
+lines or none of them, and answers with `StockReserved` or `StockReservationRejected` through an outbox
+of its own; Ordering consumes those outcomes and settles the order, `Pending → Confirmed` or
+`Pending → Failed`. Both are tested end to end against a real broker — the test host registers them,
+`Program.cs` does not — so the synchronous reserve is still the only path live and nothing can
+double-hold. That is also why the flip has to be one commit: registering a consumer while the
+synchronous path still runs would reserve every order twice.
+
+Two consequences worth knowing before reading the code. Stock's all-or-nothing hold makes the outcome
+binary, so `PartiallyConfirmed` is unreachable from the event path and O14's confirm-phase policy has
+no equivalent there. And an order whose outcome never arrives stays `Pending` forever — there is no
+timeout or poller, because the reservation-expiry worker is Phase 3; the residual and the query that
+finds such an order are in `docs/KNOWN-ISSUES.md`.
+`src/AgenticShop.Stock/docs/DECISIONS.md` → D16 · `src/AgenticShop.Ordering/docs/DECISIONS.md` → O20.
 
 **Phase 3 — Data and scale**
 Redis caching and idempotency store · reservation-expiry worker · read models ·

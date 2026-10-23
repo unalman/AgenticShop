@@ -82,6 +82,19 @@ public class Order
 
     public DateTimeOffset PlacedAtUtc { get; private set; }
 
+    /// <summary>
+    /// When the order last changed state, or null while it is still exactly as it was written.
+    /// </summary>
+    /// <remarks>
+    /// Added in Phase 2 because an order stopped being write-once: the outcome consumer drives
+    /// <c>Pending</c> to <c>Confirmed</c> or <c>Failed</c>, and an UPDATE carrying no timestamp is
+    /// unauditable — there would be no way to tell when an order settled, or whether it settled at
+    /// all. O13 anticipated exactly this column. It is nullable rather than defaulted to
+    /// <see cref="PlacedAtUtc"/> so that "never updated" stays distinguishable from "updated at the
+    /// instant it was placed", which is a difference that matters when reading a stranded order.
+    /// </remarks>
+    public DateTimeOffset? UpdatedAtUtc { get; private set; }
+
     public IReadOnlyCollection<OrderLine> Lines => _lines;
 
     /// <summary>Derived from <see cref="Status"/>; not a column.</summary>
@@ -177,13 +190,22 @@ public class Order
            $"-{id.ToString("N")[..OrderNumberSuffixLength]}";
 
     /// <summary>
-    /// Strict, and only from <see cref="OrderStatus.Pending"/>. Reaching the throw means this
-    /// assembly transitioned the same order twice: no caller input can do it, because Phase 0
-    /// exposes no endpoint that mutates a persisted order. It is therefore an
-    /// <see cref="InvalidOperationException"/> — a 500 — rather than a domain 409. Reporting our
-    /// own double-transition as the caller's conflict would hide the bug inside their error budget,
-    /// which is the same reasoning Stock applies to a CHECK violation.
+    /// Strict, and only from <see cref="OrderStatus.Pending"/>.
     /// </summary>
+    /// <remarks>
+    /// Reaching the throw used to mean this assembly had a bug, because nothing mutated a persisted
+    /// order and no endpoint exposed a way to. Phase 2 changed the first half: the outcome consumer
+    /// transitions orders, so a late or contradictory event can now arrive for an order that has
+    /// already settled. That is still not caller input, but it is no longer necessarily our fault,
+    /// and there is no HTTP request to answer — so the consumer checks <see cref="IsTerminal"/> before
+    /// calling and logs an already-settled order at Warning rather than letting this throw surface as
+    /// an Error.
+    /// <para>
+    /// What the strictness still buys is the original guarantee: an order settles once. A second
+    /// attempt is refused rather than silently overwriting the first outcome, which is the difference
+    /// between a saga that can be reasoned about and one that cannot.
+    /// </para>
+    /// </remarks>
     private void TransitionTo(OrderStatus target)
     {
         if (Status != OrderStatus.Pending)
@@ -193,5 +215,6 @@ public class Order
         }
 
         Status = target;
+        UpdatedAtUtc = DateTimeOffset.UtcNow;
     }
 }

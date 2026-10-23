@@ -27,9 +27,9 @@ calls, and the one that forced the conventions to be re-derived rather than copi
 correlation middleware, `IRequestContract`, the logging, tracing and health-response configuration
 and the exception-handler skeleton.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **545 pass**
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **552 pass**
 (Shared 45 unit; Catalog 68 unit + 44 integration; Stock 82 unit + 77 integration; Ordering 142 unit
-+ 87 integration). Database isolation verified 22/22.
++ 94 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
 

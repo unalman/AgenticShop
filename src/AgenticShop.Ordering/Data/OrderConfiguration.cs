@@ -70,6 +70,10 @@ public sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
         builder.Property(o => o.PlacedAtUtc)
             .IsRequired();
 
+        // Nullable, and deliberately not defaulted to placed_at_utc: null means the row has never
+        // been updated, which is a fact worth being able to read off a stranded Pending order.
+        builder.Property(o => o.UpdatedAtUtc);
+
         // Derived from Status; not a column.
         builder.Ignore(o => o.IsTerminal);
 
@@ -87,9 +91,11 @@ public sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
         builder.Navigation(o => o.Lines)
             .UsePropertyAccessMode(PropertyAccessMode.Field);
 
-        // Mandatory on every entity. On Order it is currently inert — Phase 0 has no update path,
-        // because the row is written once and already terminal — but Phase 2's saga will drive an
-        // order through several states and will need it.
+        // Mandatory on every entity, and no longer inert. Phase 0 wrote an order once and already
+        // terminal, so nothing could conflict on it; Phase 2's outcome consumer updates the row it
+        // transitions, which makes a concurrent write reachable for the first time. The inbox catches
+        // the ordinary case — a redelivery of the same message — but the token is the last line of
+        // defence against two deliveries racing, and it costs nothing to keep.
         builder.Property<uint>("xmin")
             .IsConcurrencyToken()
             .ValueGeneratedOnAddOrUpdate();

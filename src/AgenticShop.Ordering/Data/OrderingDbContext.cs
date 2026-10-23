@@ -13,6 +13,13 @@ public class OrderingDbContext(DbContextOptions<OrderingDbContext> options) : Db
 
     public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
 
+    /// <summary>
+    /// Inbound deduplication. See <see cref="InboxMessage"/>'s remarks for why this one exists when
+    /// the domain's strict transition would already make a redelivery harmless — it is the difference
+    /// between logging a redelivery and logging a producer bug.
+    /// </summary>
+    public DbSet<InboxMessage> InboxMessages => Set<InboxMessage>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
         => modelBuilder.ApplyConfigurationsFromAssembly(typeof(OrderingDbContext).Assembly);
 }

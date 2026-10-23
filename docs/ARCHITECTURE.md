@@ -24,7 +24,9 @@ AgenticShop is an educational backend whose purpose is to reach a distributed ar
 the previous phase creates the problem that justifies them, not because they are best practice
 in the abstract.
 
-Three independently deployed ASP.NET Core hosts communicating over HTTP only:
+Three independently deployed ASP.NET Core hosts. They communicate over HTTP today; Phase 2's
+messaging is built and tested on both sides but **not registered**, so no message flows in the
+shipped system and the synchronous path is still the only one:
 
 | Service | Port | Database | Role | Status |
 |---|---|---|---|---|

@@ -3,7 +3,9 @@
   <!--
     Service boundary guard.
 
-    AgenticShop services communicate over HTTP only. A ProjectReference from one service to
+    AgenticShop services communicate over runtime channels only — HTTP today, AMQP from Phase 2 —
+    and neither needs a compile-time reference, which is why a message contract is duplicated per
+    service rather than shared. A ProjectReference from one service to
     another would quietly turn the solution into a distributed monolith: compile-time
     coupling, one deployment unit in all but name, and no way to exercise the failure modes
     that the later roadmap phases exist to teach.
@@ -40,7 +42,7 @@
     </ItemGroup>
 
     <Error Condition="'@(_AgenticShopCrossServiceReference)' != ''"
-           Text="Service boundary violation: $(MSBuildProjectName) references @(_AgenticShopCrossServiceReference->'%(Filename)'). AgenticShop services communicate over HTTP only. Remove the ProjectReference and instead define the contract you need in this service — an interface plus a typed HttpClient, as Ordering will do for Catalog and Stock." />
+           Text="Service boundary violation: $(MSBuildProjectName) references @(_AgenticShopCrossServiceReference->'%(Filename)'). AgenticShop services communicate over runtime channels only — HTTP today, AMQP from Phase 2. Remove the ProjectReference and instead define the contract you need in this service: an interface plus a typed HttpClient for a call, or a copy of the message record for an event, as Ordering does for Catalog and Stock." />
   </Target>
 
 </Project>

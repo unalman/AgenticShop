@@ -222,6 +222,23 @@ escape `ExecuteAsync` would be caught in Stock and not in Ordering. The assembly
 test reading both implementations, so parity means two tests asserting the same list; only one list is
 complete.
 
+**An order whose outcome never arrives stays `Pending` forever.** *Medium · Phase 3.* If Stock's
+consumer drops a message — it does, after losing the `stock_items` concurrency race twice, because
+there is no dead-letter queue to put it in — Ordering never hears the outcome and the order is
+stranded. Nothing resolves it: there is no timeout, no poller and no worker other than the two message
+pumps. Accepted rather than overlooked, because the fix is Phase 3's reservation-expiry worker and
+building a timer now would be the repository's first piece of scheduling machinery. Until then a
+stranded order is findable by query (`status = 'Pending'` and `updated_at_utc IS NULL`, which is why
+that column is nullable rather than defaulted to the placement time) but not self-healing.
+
+**The outcome consumer trusts Stock's echo of the lines.** *Low.* `StockReserved` carries the product
+ids and quantities Stock held, and the consumer transitions the order without reconciling them against
+the order's own lines. A mismatch — Stock held 2 of a line that asked for 3 — would settle the order as
+`Confirmed` while under-fulfilled, and nothing would notice. It is only reachable through a bug in
+Stock's consumer, which builds that list from the request lines verbatim and is tested against them,
+so the exposure is small; the honest statement is that the check is absent rather than that the
+mismatch is impossible. Reconciling costs a `Lines` include and a set comparison on every delivery.
+
 ### Data and API
 
 **Unknown JSON fields are silently ignored.** *Info.* Verified in Catalog: `{"bogus":1}` returns

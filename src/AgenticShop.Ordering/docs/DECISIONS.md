@@ -230,6 +230,33 @@ protection. Declaring it costs no storage and emits no DDL.
 because the arm is part of the copied skeleton and because Phase 2 will need it, and the divergence
 between "declared" and "exercised" is recorded rather than hidden.
 
+### Revised 2026-10-23, Phase 2b-ii — both halves of this entry have now been superseded
+
+The reasoning above was correct when it was written and each of its predictions came true, which is
+why the entry is kept rather than rewritten.
+
+**`UpdatedAtUtc` now exists.** The premise was that the status is decided before the single save, so
+the column could only equal `PlacedAtUtc`. Phase 2 removed the premise: `StockOutcomeConsumer`
+transitions a persisted order from `Pending` to `Confirmed` or `Failed`, so there is a real update path
+and a timestamp to record. The column is **nullable** rather than defaulted to `PlacedAtUtc`, which
+keeps "never updated" distinguishable from "updated at the instant it was placed" — a difference that
+matters when looking for a stranded order.
+
+**`xmin` is no longer inert, and its first real job is not the one predicted.** This entry expected the
+saga to drive an order through *several* states, which would need the token to serialise them. What
+actually needs it is narrower and more immediate: two deliveries of different outcome messages racing on
+one row. The inbox catches a redelivery of the *same* message, but a second message for an
+already-settled order is only distinguishable because the loser gets a
+`DbUpdateConcurrencyException`, requeues once, and then finds the order terminal with no inbox row of
+its own — which is what turns "an event arrived late" into a logged producer bug instead of a silent
+overwrite. The handler's concurrency arm is therefore reachable from the consumer, though still not
+from any HTTP path.
+
+**Still true:** an order settles exactly once, `TransitionTo` only fires from `Pending`, and
+`PartiallyConfirmed` remains in the vocabulary and the CHECK constraint. The event path does not
+produce it — Stock holds all lines or none — but rows written by the synchronous path carry it, so it
+cannot be removed while that path exists.
+
 ## O14 · Confirm-phase policy — **added 2026-09-24**
 
 A failure or timeout during the confirm phase ends the order in terminal `PartiallyConfirmed` and
@@ -515,6 +542,87 @@ decision — which is what keeps all 78 pre-existing Ordering integration tests 
 **Revisit.** Phase 2b, which moves the emission point, flips `mandatory`, adds the consumer-side
 inbox and deletes the synchronous reserve. And Phase 3 for retention: rows are never deleted, so the
 table grows without bound.
+
+---
+
+## O20 · The outcome consumer, and an inbox that exists for observability rather than correctness
+
+**Added 2026-10-23, Phase 2b-ii.**
+
+**Decision.** `StockOutcomeConsumer` binds `ordering.stock-outcomes` to Stock's exchange on
+`stock.reserved` and `stock.reservation-rejected`, and settles the order the event answers:
+`Pending → Confirmed` on a hold, `Pending → Failed` on a refusal. The transition and an
+`InboxMessage` row commit in one `SaveChangesAsync`. **Not registered in `Program.cs`**, for the same
+reason Stock's consumer is not.
+
+**Why unwired.** The synchronous placement path still decides every order's status, and two writers of
+one status would contradict each other — the last to save wins, and which that is depends on timing.
+The increment that registers this consumer also deletes the synchronous reserve and moves
+`OrderPlaced` emission to before reservation, so there is no state in between where both are live.
+
+**Why the transition is binary.** Stock holds every line of an order or none of them (its D16), so an
+outcome is `StockReserved` or `StockReservationRejected` and never a mixture. **This is why O14's
+confirm-phase policy has no equivalent here.** O14 exists to classify partial outcomes — including the
+"some confirmed and cannot be undone" case that produces `PartiallyConfirmed` — and the event path
+cannot reach that state. `PartiallyConfirmed` stays in the enum and the CHECK constraint because rows
+written by the synchronous path carry it, but nothing on this path writes one. When the synchronous
+path is deleted, O14 becomes historical rather than merely unreached.
+
+**Why the inbox, when it is not what makes redelivery safe.** This is the part worth stating plainly,
+because Stock's inbox *is* load-bearing for correctness and copying its justification across would
+have produced a plausible sentence and a wrong one. Here `TransitionTo` only fires from `Pending`, so
+a redelivered `StockReserved` finds a terminal order and changes nothing — the domain already refuses
+the double settlement.
+
+What the inbox buys is the ability to **distinguish two situations that otherwise look identical**. A
+consumer that finds an already-settled order is looking at either a redelivery of the message that
+settled it, or a *different* message for the same order — which would mean Stock published two
+outcomes for one `OrderPlaced`. The first is ordinary at-least-once behaviour and logs at
+`Information`; the second is a producer bug and logs at `Error`. Without the inbox both present as "an
+event arrived and the order was already terminal", and §4.7's severity split — which is load-bearing
+throughout this repository — cannot be honoured. So the justification is observability, not
+correctness, and `AContradictorySecondOutcomeForASettledOrderChangesNothing` asserts the row that
+makes the distinction possible is absent for the message that was refused.
+
+**Why `xmin`'s first real use is here.** Two deliveries of *different* messages racing on one order row
+are separated by the concurrency token, not by the inbox: the loser gets a
+`DbUpdateConcurrencyException`, requeues once, and then finds the order terminal with no inbox row of
+its own. That sequence is what turns a silent overwrite into a logged contradiction. See the revision
+note on **O13**.
+
+**Why tests seed `Pending` orders straight into the database.** `POST /orders` cannot produce one:
+`OrderPlacer.WriteAsync` throws on `Pending`, because the synchronous path settles an order before it
+saves one. Seeding through the API would have meant testing the consumer against a state production
+cannot reach. The fixture calls `Order.Create` and saves through a scope, so the domain's own guards
+still run and only the endpoint is bypassed — and the bypass is the thing the next increment removes.
+
+**Why the tests use a canary rather than a timeout.** Two of them assert that a delivery was *ignored*,
+and "sleep three seconds then check" passes for the wrong reason on a slow machine. Each instead
+publishes a second, distinct outcome afterwards and waits on that: with `prefetchCount` 1 and serial
+dispatch, if the later delivery was processed then every delivery before it was too. The assertion is
+about a completed state rather than an elapsed duration.
+
+**Accepted residual: a stranded order stays `Pending` forever.** If Stock drops an outcome — which it
+does after losing the `stock_items` concurrency race twice, there being no dead-letter queue —
+Ordering never hears it. Resolving that needs a timeout or a poller, and this repository has no
+scheduling machinery; the reservation-expiry worker is Phase 3. Recorded in
+`../../../docs/KNOWN-ISSUES.md`, along with the query that finds such an order.
+
+**Verified.** Full suite **552/552**, Ordering's integration project 94 (87 before this decision). The
+messaging tests run against a real `rabbitmq:4-alpine` container: a published `StockReserved` settles a
+seeded `Pending` order to `Confirmed` with `UpdatedAtUtc` set and one inbox row; a
+`StockReservationRejected` settles it to `Failed`; a redelivery leaves both the status and the
+timestamp untouched and adds no row. `StockEventContractTests` pins the wire format from the other
+direction — the field names are the ones Stock's own suite asserts its serializer produces, so the two
+services hold independent assertions on one format rather than a shared fixture neither can see.
+
+**What it does not do.** No saga, no compensation, no `OrderPlaced` emission change, no API change, and
+no reconciliation of `StockReserved.Lines` against the order's own lines. `POST /orders` still answers
+201 with a terminal status.
+
+**Revisit.** The next increment: register both consumers, move `OrderPlaced` emission to before
+reservation, write the order as `Pending`, delete the synchronous reserve and confirm, flip Stock's
+`mandatory` to `true`, and turn `POST /orders` into a 202.
 
 ---
 
