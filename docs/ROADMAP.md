@@ -59,7 +59,7 @@ is recorded in `src/AgenticShop.Ordering/docs/ARCHITECTURE.md` §6.
 
 ---
 
-## Phase 1 — Reliability and observability *(in progress)*
+## Phase 1 — Reliability and observability *(complete)*
 
 Now that a network hop exists, make its failure modes survivable and visible.
 
@@ -146,14 +146,43 @@ What the migration did *not* do is add per-field detail to a validation rejectio
 says that a request was rejected and where, not which field failed. That is deliberate, and recorded
 as an accepted residual rather than left implicit.
 
-**Contention is the phase's real driver.** Stock measured a 40-way burst holding only 4 of 10 units
-because there is no server-side retry on `xmin` conflict (decision D9) — the measurement and the log
-are in `src/AgenticShop.Stock/docs/ARCHITECTURE.md` §7. Retry policies plus idempotency keys are what
-turn that 409 into a transparent retry, which is exactly why idempotency comes first.
+**Contention was the phase's stated driver, and the phase did not dissolve it.** Stock measured a
+40-way burst holding only 4 of 10 units because there is no server-side retry on `xmin` conflict
+(decision D9) — the measurement and the log are in `src/AgenticShop.Stock/docs/ARCHITECTURE.md` §7.
+This paragraph originally claimed that retry policies plus idempotency keys were "what turn that 409
+into a transparent retry". **That was wrong, and the retry item above already said so:** Stock's
+conflict 409 is a normal 4xx and is not retried, so the burst still holds 4 of 10. The item is handed
+to Phase 2, where a single-consumer queue serialises reservations and the contention disappears
+rather than being retried away.
 
-Note that Phase 2 largely dissolves this problem rather than solving it — a single-consumer queue
-serialises reservations, so the contention disappears. If Phase 2 arrives quickly, the retry work
-here may be worth less than it looks.
+Idempotency keys were still worth doing first — they closed the largest residual the repository had —
+just not for that reason. Note also that Phase 2 largely dissolves the contention problem rather than
+solving it, so if Phase 2 arrives quickly the retry work here is worth less than it looks.
+
+### What closed the phase
+
+Every item above is done, and the one open `KNOWN-ISSUES.md` item this phase owned is resolved.
+
+**The "single 5xx observed once under three-container load" was real, reproducible on demand, and
+misdiagnosed.** It was not a PostgreSQL deadlock. `SettleAsync` read the reservation and its stock
+item in two statements; under READ COMMITTED each takes its own snapshot, so a winner committing
+between them left the loser with a stale `Pending` reservation beside a fresh `Reserved = 0`. The
+state machine passed on the stale half, the counter guard threw `InvalidOperationException` on the
+fresh half, and because that happens *before* `SaveChangesAsync` the `xmin` token never ran — an
+ordinary conflict reported to the caller as a 500. Measured at **7 in 10,000 parallel confirms and
+6 in 10,000 parallel releases**, with the counters correct in every iteration, so it was a reporting
+defect and never a safety one. Fixed with one LEFT JOIN, re-measured at **0 × 500 across 45,000
+requests**, and guarded by a statement count rather than a burst, because 7 in 10,000 cannot be raced
+reliably. Stock decision **D15**; full account in `docs/KNOWN-ISSUES.md`.
+
+Two of the three claims on file were wrong in ways worth carrying into Phase 2. It needed no
+three-container load to reproduce — one container was enough. And "five subsequent full-solution runs
+were clean" was never evidence of absence: at that rate a single ten-request test sees it roughly once
+in a hundred runs, so five clean runs is the *expected* result.
+
+Verified at closure: `dotnet build` clean under `TreatWarningsAsErrors`; **519 tests passing**
+(Shared 45 unit · Catalog 68 unit + 40 integration · Stock 82 unit + 64 integration · Ordering
+142 unit + 78 integration); database isolation **22/22**.
 
 ---
 

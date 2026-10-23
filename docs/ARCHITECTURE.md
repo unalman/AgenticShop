@@ -321,6 +321,19 @@ Without a concurrency token two overlapping writes both succeed and the second s
 the first. The stakes differ per service — a lost price edit on `Product`, overselling on
 `StockItem` — which is why the testing burden differs too.
 
+**The token guards the write, so the read that feeds it must be atomic too.** When one handler needs
+two rows, reading them in two statements gives each its own READ COMMITTED snapshot, and a commit
+landing in between yields a mixed-vintage pair — one entity stale, the other fresh. Every invariant
+checked across that pair is then evaluated against a state that never existed.
+
+Stock shipped exactly this. `SettleAsync` saw a still-`Pending` reservation beside an already-zeroed
+`Reserved`, its counter guard threw `InvalidOperationException` *before* `SaveChangesAsync`, and the
+`xmin` token whose job was to produce the 409 never ran — so an ordinary conflict reached the caller
+as a 500, at 7 in 10,000 parallel confirms and 6 in 10,000 parallel releases. Reading both rows in
+one statement (a join) leaves one snapshot, and the loser gets a 409 from the state machine or from
+the token with no third outcome. Stock decision **D15**; `SettleReadAtomicityTests` counts the
+statements rather than racing the window, which at that rate a burst test cannot reliably hit.
+
 **Never `HasDefaultValue` on a non-nullable `bool`.** EF's sentinel for `bool` is `false`, so an
 explicit `false` is indistinguishable from "unset": EF omits the column from the INSERT and the
 database default is applied instead.
@@ -853,6 +866,7 @@ A convention enforced only by prose will be violated. These fail the build or th
 | `ComposeConfigurationTests` | compose image matches `TestPostgreSql.Image`; **every** published port is loopback-pinned, not merely free of a literal `0.0.0.0`; no literal credentials; isolation script mounted | all three |
 | `TestHostIsolationTests` | the app under test really uses the Testcontainers database | all three |
 | `LeafServiceBoundaryTests` | a service that makes no outbound calls registers no `HttpClient`, and references no `AgenticShop.*` assembly but the shared one | Stock |
+| `SettleReadAtomicityTests` | the settle path reads both rows in **one** statement, hence one snapshot — counted from the SQL the host actually issues, because the window it closes is ~7 in 10,000 and cannot be raced reliably | Stock |
 | `ServiceBoundaryTests` | the orchestrator references no other service assembly, and *does* register its clients | Ordering |
 | `ServiceTracingTests` | the `/health` span filter matches whole path segments, and is actually wired into the instrumentation rather than only written down | Shared |
 | `DownstreamHealthCheckTests` | the readiness probe resolves its target per call, so a test host's override reaches it | Ordering |

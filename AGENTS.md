@@ -19,16 +19,16 @@ evolved gradually into a distributed e-commerce backend. **The deferrals in §8 
 do not "improve" the project by adding infrastructure it has declined, and see `docs/ROADMAP.md`
 for what each phase unblocks.
 
-**Phase 0 complete, Phase 1 in progress.** All three services are implemented: **Catalog** is the
-reference every convention originates from, **Stock** follows it with the deliberate divergences
-recorded in §10, **Ordering** is the orchestrator — the only service with outbound calls, and the
-one that forced the conventions to be re-derived rather than copied. **`AgenticShop.Shared`** was
-extracted in Phase 1 and is not a service: it holds the filter, the correlation middleware,
-`IRequestContract`, the logging, tracing and health-response configuration and the exception-handler
-skeleton.
+**Phase 0 and Phase 1 complete; Phase 2 is next.** All three services are implemented: **Catalog**
+is the reference every convention originates from, **Stock** follows it with the deliberate
+divergences recorded in §10, **Ordering** is the orchestrator — the only service with outbound
+calls, and the one that forced the conventions to be re-derived rather than copied.
+**`AgenticShop.Shared`** was extracted in Phase 1 and is not a service: it holds the filter, the
+correlation middleware, `IRequestContract`, the logging, tracing and health-response configuration
+and the exception-handler skeleton.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **517 pass**
-(Shared 45 unit; Catalog 68 unit + 40 integration; Stock 82 unit + 62 integration; Ordering 142 unit
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **519 pass**
+(Shared 45 unit; Catalog 68 unit + 40 integration; Stock 82 unit + 64 integration; Ordering 142 unit
 + 78 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
@@ -105,12 +105,15 @@ otherwise guess wrong.
   from those, never from `Message`. `ArgumentException` cannot express a 409.
 - **EF Core (§4.3).** Optimistic concurrency is mandatory on every entity —
   `builder.Property<uint>("xmin").IsConcurrencyToken().ValueGeneratedOnAddOrUpdate();` which emits
-  no DDL, because `UseXminAsConcurrencyToken()` **does not exist in Npgsql 10**. Never
-  `HasDefaultValue` on a non-nullable `bool`: an explicit `false` is dropped from the INSERT and
-  comes back as the default. `CHECK` SQL is verbatim, so it names columns *after* snake_case
-  renaming, and reading constraints back needs `db.GetService<IDesignTimeModel>().Model`. Name
-  unique indexes through a `public const` — the handler branches on the name. A foreign key inside
-  one service's own database is fine; only a key crossing a service boundary is forbidden.
+  no DDL, because `UseXminAsConcurrencyToken()` **does not exist in Npgsql 10**. The token guards
+  only the *write*: when one handler **mutates** on a decision spanning **two rows**, read them in
+  **one statement**, or two READ COMMITTED snapshots can hand it a mixed-vintage pair and turn a
+  plain conflict into a 500 (Stock **D15**). Never `HasDefaultValue` on a non-nullable `bool`: an
+  explicit `false` is dropped from the INSERT and comes back as the default. `CHECK` SQL is verbatim,
+  so it names columns *after* snake_case renaming, and reading constraints back needs
+  `db.GetService<IDesignTimeModel>().Model`. Name unique indexes through a `public const` — the
+  handler branches on the name. A foreign key inside one service's own database is fine; only a key
+  crossing a service boundary is forbidden.
 - **Migrations (§4.4).** `MigrateAsync()` runs at startup **only in `Development`** — do not remove
   that guard.
 - **Endpoints (§4.5).** **Every group registers

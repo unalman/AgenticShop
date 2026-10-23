@@ -148,23 +148,6 @@ container. Worth knowing before CI.
 No coverage report, threshold or CI step. Either wire up `--collect:"XPlat Code Coverage"` or drop
 the reference.
 
-**A single 5xx was observed once under three-container load and never explained.** *Medium · Phase 1.*
-During a full-solution run, `ParallelConfirmsOfOneReservationShipTheGoodsExactlyOnce` reported eight
-409s and one 200 out of ten parallel confirms — so the tenth response was neither, and the only
-remaining candidate is a 5xx, most plausibly a PostgreSQL deadlock or serialisation failure that the
-handler's default arm reports as a 500.
-
-It was **not** confirmed, and it has not reproduced: five subsequent full-solution runs were clean,
-and the only unhandled exceptions logged anywhere in them were Ordering's fourteen deliberate 502
-tests. Stock also passes reliably on its own — it needs the parallel load of three Testcontainers
-plus the compose database to surface.
-
-The assertion that hid it is fixed (see Resolved below), so a recurrence now fails on
-"contention is a client-visible conflict, never a server fault" and names the real cause instead of a
-mismatched tally. What remains open is the underlying question: **is there a genuine 5xx path under
-contention?** Chasing it needs a reproducible load, which is Phase 1's job alongside retry policies —
-and a retry would likely dissolve it rather than explain it.
-
 **`CatalogApiFixture.DisposeAsync` is not exception-safe.** *Low.* If `_factory.DisposeAsync()`
 throws, `_postgres.DisposeAsync()` never runs and the container leaks until Ryuk reaps it. Wants a
 `try/finally`. **`StockApiFixture` and `OrderingApiFixture` both have one** — fixed forward rather
@@ -285,9 +268,69 @@ either 200 or 409" (strictly stronger than a tally, since it also excludes 400/4
 applied to `AParallelBurstNeverOversells`, whose `(successes + conflicts) == 25` had the identical
 hiding problem.
 
-**Caught by:** a single failing full-solution run out of six. It did not reproduce, which is exactly
-why the assertion order matters — an intermittent failure that reports the wrong thing is
-indistinguishable from a flaky test, and gets retried until it goes green.
+**Caught by:** a single failing full-solution run out of six. It did not reproduce in the five runs
+that followed, which is exactly why the assertion order matters — an intermittent failure that
+reports the wrong thing is indistinguishable from a flaky test, and gets retried until it goes green.
+The fault behind it has since been reproduced on demand and explained, in the next entry. That the
+strengthened assertion was still never the thing that found it is the point of both entries.
+
+### The "unexplained 5xx" was a read-skew race, and the diagnosis on file was wrong
+
+*Resolved 2026-10-23.* The open item recorded a single 5xx seen once under three-container load,
+guessed at "most plausibly a PostgreSQL deadlock or serialisation failure", and noted that five
+subsequent full-solution runs were clean.
+
+It was a genuine, on-demand-reproducible 5xx path, and none of the three claims about it survived
+contact with a load harness. Replaying the same two bursts against a live container produced
+**7 × 500 in 10,000 parallel confirms and 6 × 500 in 10,000 parallel releases** — with the counters
+correct in every one of those iterations, so safety was never at risk. The exception was:
+
+```
+System.InvalidOperationException: Cannot settle 4 unit(s): only 0 are reserved.
+   at StockItem.RequireCoveredByReserved(Int32)          StockItem.cs:143
+   at StockItem.ConfirmReservation(Int32)                StockItem.cs:115
+   at ReservationEndpoints.SettleAsync(...)              ReservationEndpoints.cs:136
+```
+
+**There is no `PostgresException` anywhere in that chain.** `SettleAsync` read the reservation and
+its stock item in two statements. Under READ COMMITTED each statement takes its own snapshot, so a
+winner committing between them left the loser holding a stale `Pending` reservation next to a fresh
+`Reserved = 0`. The state machine passed on the stale half, the counter guard threw on the fresh
+half, and because it throws *before* `SaveChangesAsync` the `xmin` token never ran — the mechanism
+whose whole job is to produce the 409 was bypassed entirely.
+
+Each wrong claim is instructive in a different way:
+
+- **Not a deadlock.** No lock-order inversion is reachable: a confirm holds the reservation and wants
+  the item, and the only thing that holds the item — a reserve — inserts a *new* reservation row and
+  never touches an existing one. No cycle. Tracing the lock order was enough to doubt the diagnosis;
+  reading the log was enough to refute it.
+- **Not rare, not load-dependent.** 0.07% of requests, on a single container, with no three-container
+  load whatsoever. "It needs the parallel load of three Testcontainers plus the compose database to
+  surface" was an inference from where it happened to be *noticed*, never a measurement.
+- **"Five clean runs" was not evidence of absence.** One test × ten requests per run is a ~0.7% chance
+  of seeing it. Five clean runs is the *expected* result, and it was read as exoneration.
+
+The fix is one query — a LEFT JOIN reading both rows in one statement, hence one snapshot. The loser
+now gets either the state machine's 409 or the `xmin` 409; there is no third outcome. Re-measured
+afterwards: **0 × 500 across 45,000 requests** (10,000 confirms, 10,000 releases, 25,000 reserves)
+with every invariant intact. `src/AgenticShop.Stock/docs/DECISIONS.md` → **D15**.
+
+Reserve was immune throughout and measured 0 × 500 in 25,000 requests: one item read, and
+`InsufficientStockException` is already classified as a 409. That asymmetry is itself confirmation
+that the two-statement read was the cause.
+
+**Caught by:** a throwaway load harness against a live container, reading `docker logs` for the
+correlation id carried in each 500 body. Not by the suite — and it could not have been. At 7 in
+10,000, a ten-request parallel burst sees this about once in a hundred runs, which is why the guard
+is a **statement count** rather than a burst: `SettleReadAtomicityTests` asserts the settle path
+issues exactly one SELECT naming both tables, and pins the mechanism instead of racing it. **A race
+too rare to test is not a race too rare to guard.**
+
+Also note what the harness itself got wrong first: the capture was wired by registering an
+`IInterceptor` in the container, which EF Core did not pick up, so the guard recorded no SQL at all.
+Only the test's own non-vacuity assertion turned that into a red build instead of a guard that passes
+having matched nothing — the same failure mode `AGENTS.md` §10 warns about for reflection-based guards.
 
 ### The rest, as an index
 

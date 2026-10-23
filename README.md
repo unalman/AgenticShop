@@ -311,21 +311,29 @@ Each phase adds one capability, and only once the previous phase makes it necess
 Three hosts, synchronous HTTP, one database per service, Testcontainers. All three services
 are implemented and verified: at the close of Phase 0, 426 tests, a clean build under
 `TreatWarningsAsErrors`, database isolation 22/22, and the three-host path driven by hand
-through `http/ordering.http`. **The suite is now at 517.**
+through `http/ordering.http`. **The suite is now at 519.**
 
-**Phase 1 — Reliability and observability** *(in progress)*
-Shared infrastructure library — **done** · idempotency keys on `POST /orders` — **done** ·
-retry/circuit-breaker/timeout policies on Ordering's typed clients — **done** · Serilog structured
-logging — **done in all three services** · OpenTelemetry distributed tracing — **done in all three** ·
-dependency-aware health checks — **done** · Dockerfiles and a `full` compose profile — **done** ·
-CI — **done**. Retry is driven by a measured problem:
-a 40-way burst against 10 units of stock held only 4, because `xmin` conflicts are not retried.
+**Phase 1 — Reliability and observability** *(complete)*
+Shared infrastructure library · idempotency keys on `POST /orders` · retry/circuit-breaker/timeout
+policies on Ordering's typed clients · Serilog structured logging in all three services ·
+OpenTelemetry distributed tracing in all three · dependency-aware health checks · Dockerfiles and a
+`full` compose profile · CI.
 Idempotency keys came first, because retrying without them double-reserves stock — and they closed
 the largest residual the repository had, since a retried `POST /orders` used to create a second order
-and a second set of holds. Note that the HTTP retry now in place does **not** address that burst:
-Stock's conflict 409 is a normal 4xx and is not retried. Reserve is also exempt from retry, because a
+and a second set of holds. Note that the HTTP retry now in place does **not** address the contention
+burst: Stock's conflict 409 is a normal 4xx and is not retried, so a 40-way burst against 10 units
+still holds only 4. That item belongs to Phase 2. Reserve is also exempt from retry, because a
 retried reserve whose first attempt committed is answered 409 and would be misread as out-of-stock —
 see `src/AgenticShop.Ordering/docs/DECISIONS.md` → O18.
+
+Closing the phase also settled the one open defect it owned: a 5xx seen once under parallel load and
+recorded as "most plausibly a PostgreSQL deadlock". It was neither, and it was never rare. Stock's
+settle path read the reservation and its stock item in two statements, so a winner committing between
+them left the loser deciding from a stale `Pending` reservation and a fresh `Reserved = 0` — the
+`xmin` token never ran, and an ordinary conflict reached the caller as a 500. Reproduced at 7 in
+10,000 parallel confirms and 6 in 10,000 parallel releases, fixed with one join, re-measured at
+**0 × 500 across 45,000 requests**, and now guarded by a statement count rather than a burst.
+`src/AgenticShop.Stock/docs/DECISIONS.md` → D15.
 
 **Phase 2 — Asynchronous messaging** ← the inflection point
 RabbitMQ · replace synchronous reservation with `OrderPlaced` / `StockReserved`

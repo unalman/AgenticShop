@@ -125,13 +125,45 @@ reconciliation. Cost: `HasConversion<string>()` plus a `varchar(20)`. A new enum
 matching CHECK update fails loudly at insert time — the intended behaviour, since the schema and
 the enum are one vocabulary. `ContractSchemaAlignmentTests` asserts the two lists agree.
 
+## D15 · The settle path reads the reservation and its stock item in one statement
+
+`SettleAsync` needs two rows. Reading them in two queries gave each its own READ COMMITTED
+snapshot, so a winner committing in between left the loser holding a stale `Pending` reservation
+next to a fresh `Reserved = 0`: the state machine passed on the stale half,
+`RequireCoveredByReserved` threw on the fresh half, and because it throws *before*
+`SaveChangesAsync` the `xmin` token never ran. An ordinary conflict reached the caller as a 500.
+
+Measured on a live container: **7 × 500 in 10,000 parallel confirms, 6 × 500 in 10,000 parallel
+releases**, with the counters correct in every iteration. Reserve was immune — 0 in 25,000 — because
+it reads one row and `InsufficientStockException` is already classified as a 409. That asymmetry is
+what identifies the two-statement read as the cause rather than something environmental.
+
+One LEFT JOIN means one snapshot, so the loser gets either the state machine's 409 or the `xmin` 409
+and there is no third outcome. Re-measured after the fix: **0 × 500 across 45,000 requests**.
+
+**LEFT, not inner.** The RESTRICT foreign key makes a missing stock item unreachable, and that case
+is deliberately a 500 rather than the caller's 404. An inner join would collapse the two and report
+data damage as a bad request.
+
+**Why a statement-count guard instead of a bigger burst.** At 7 in 10,000, a ten-request parallel
+test sees this about once in a hundred runs, so five consecutive green full-solution runs are the
+*expected* outcome and not evidence of absence. `SettleReadAtomicityTests` therefore counts SQL:
+exactly one SELECT naming both tables, asserted for confirm and release. It pins the mechanism
+rather than racing it, and carries a non-vacuity assertion — which earned its keep immediately,
+because the first wiring registered the interceptor in DI where EF Core did not pick it up, so the
+capture recorded nothing and would otherwise have asserted on an empty list.
+
+Full account: `../../../docs/KNOWN-ISSUES.md` → "The 'unexplained 5xx' was a read-skew race".
+
 ## Not in the approval list, decided during implementation
 
 - **Domain exceptions carry typed properties**, and the handler builds client text from them rather
   than from `Message`. Prevents a reworded exception from silently changing the public contract.
 - **A diverged-counter fault is a 500.** `StockItem.RequireCoveredByReserved` throws
   `InvalidOperationException` when `Reserved` has drifted from the reservation rows. No caller
-  input can produce it, so blaming the caller would be wrong.
+  input can produce it, so blaming the caller would be wrong. It *was* reachable with no bad input
+  at all, through the read skew D15 removed — which is exactly why the classification stays at 500
+  rather than being softened to a 409: with the skew closed, reaching it again means real corruption.
 - **`StockApiFixture.DisposeAsync` uses `try/finally`**, unlike Catalog's. Fixed forward rather
   than copied; the divergence is tracked in `../../../docs/KNOWN-ISSUES.md`.
 

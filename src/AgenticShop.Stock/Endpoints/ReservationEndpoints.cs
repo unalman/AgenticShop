@@ -109,16 +109,33 @@ public static class ReservationEndpoints
         CancellationToken cancellationToken,
         bool confirm)
     {
-        var reservation = await db.StockReservations
-            .FirstOrDefaultAsync(r => r.Id == reservationId, cancellationToken);
+        // One statement, therefore one snapshot. Reading the reservation and its stock item in
+        // two separate queries is unsafe under READ COMMITTED: a winner can commit between them,
+        // leaving the loser with a still-Pending reservation against an item whose Reserved has
+        // already fallen to zero. The state machine then passes on stale input, the counter guard
+        // fires on fresh input, and the resulting InvalidOperationException is thrown before
+        // SaveChangesAsync — so the xmin token never runs and an ordinary conflict is reported as
+        // a 500 instead of a 409. Measured on a live container: 7 in 10,000 parallel confirms and
+        // 6 in 10,000 parallel releases.
+        //
+        // The join is a LEFT one only to preserve the distinction below. The RESTRICT foreign key
+        // makes a missing stock item unreachable, and an inner join would silently report that
+        // data damage as the caller's 404.
+        var pair = await (
+            from r in db.StockReservations.Where(x => x.Id == reservationId)
+            join candidate in db.StockItems
+                on r.StockItemId equals candidate.Id into candidates
+            from i in candidates.DefaultIfEmpty()
+            select new { Reservation = r, Item = i })
+            .FirstOrDefaultAsync(cancellationToken);
 
-        if (reservation is null)
+        if (pair is null)
         {
             return Results.NotFound();
         }
 
-        var item = await db.StockItems
-            .FirstOrDefaultAsync(s => s.Id == reservation.StockItemId, cancellationToken);
+        var reservation = pair.Reservation;
+        var item = pair.Item;
 
         // The foreign key is Restrict, so a reservation without its stock item cannot exist.
         // Reaching this means the schema or the data has been damaged outside the API, which

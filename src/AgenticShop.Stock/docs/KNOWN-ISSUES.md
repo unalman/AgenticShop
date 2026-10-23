@@ -13,14 +13,17 @@ worth knowing.
 
 ### Concurrency
 
-**Contention throughput is poor by design.** *Medium · Phase 1 (retry) or Phase 2 (serialisation).*
+**Contention throughput is poor by design.** *Medium · Phase 2 (serialisation).*
 A live burst held only 4 of 10 units — the numbers and the log are in `ARCHITECTURE.md` §7.
 Nothing is oversold and nothing is a 5xx, so this is correct optimistic-concurrency behaviour with
 no server-side retry (decision D9), not a defect.
 
 It matters because Ordering's synchronous placement reserves line by line and will fail often under
-load. Either Phase 1 adds retry, or Phase 2's single-consumer queue dissolves the contention
-entirely. **Ordering's policy is decided: fail fast** — see
+load. **Phase 1 closed without touching it, deliberately.** The retry that landed on Ordering's typed
+clients cannot help here: Stock's `xmin`-conflict 409 is a normal 4xx and is not retried, so the
+burst still holds 4 of 10 — see `../../../docs/ROADMAP.md` → Phase 1 and Ordering's **O18**. What
+remains is Phase 2's, where a single-consumer queue dissolves the contention instead of retrying it.
+**Ordering's policy is decided: fail fast** — see
 `../../AgenticShop.Ordering/docs/DECISIONS.md` → **O16**.
 
 ### API

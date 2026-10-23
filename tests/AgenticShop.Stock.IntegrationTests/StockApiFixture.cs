@@ -35,6 +35,12 @@ public sealed class StockApiFixture : IAsyncLifetime
     /// </summary>
     public IServiceScope CreateScope() => _factory!.Services.CreateScope();
 
+    /// <summary>
+    /// The host's SQL recorder. Safe to use from one test at a time: the collection runs
+    /// sequentially, so a capture window cannot overlap another test's requests.
+    /// </summary>
+    public SettleSqlCapture Sql => _factory!.SqlCapture;
+
     public async Task InitializeAsync()
     {
         await _postgres.StartAsync();

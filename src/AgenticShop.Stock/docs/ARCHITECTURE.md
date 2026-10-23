@@ -194,6 +194,26 @@ confirm of one reservation produced `200=1, 409=19, 5xx=0` and shipped exactly o
 rather than restating it. It was the single most important input to the Ordering design, which
 decided to **fail fast** — see `../../AgenticShop.Ordering/docs/DECISIONS.md` → **O16**.
 
+### The token is only as strong as the read that feeds it
+
+`xmin` protects the write. It cannot protect a decision computed from two rows read at different
+times. `SettleAsync` originally read the reservation and its stock item in **two statements**, and
+under READ COMMITTED each takes its own snapshot — so a winner committing between them left the
+loser holding a stale `Pending` reservation next to a fresh `Reserved = 0`. The state machine passed
+on the stale half, `RequireCoveredByReserved` threw on the fresh half, and because it throws *before*
+`SaveChangesAsync` the token never ran. An ordinary conflict surfaced as a 500.
+
+Measured on a live container: **7 × 500 in 10,000 parallel confirms, 6 × 500 in 10,000 parallel
+releases**, with the counters correct in every iteration. Reserve was immune — 0 in 25,000 — because
+it reads one row and its rejection is already a classified 409.
+
+Fixed by reading both rows in one LEFT JOIN: one statement, one snapshot, so the loser now gets the
+state machine's 409 or the token's 409 and there is no third outcome. Re-measured at **0 × 500
+across 45,000 requests**. Decision **D15**; guarded by `SettleReadAtomicityTests`.
+
+The transferable rule: a guard that mixes a stale entity with a fresh one does not detect the
+conflict, it *becomes* one.
+
 ## 8. Divergences from Catalog
 
 Each was the right call for this service, and each is the evidence that the conventions transfer:
@@ -205,6 +225,7 @@ Each was the right call for this service, and each is the evidence that the conv
 | `decimal` money + currency | **`int` counters only** | stock is not money |
 | light concurrency test | **parallel overselling tests** | on `Product` a missed token loses a price edit; on `StockItem` it oversells |
 | DTO-limit vs column-limit guard | **enum/CHECK and bound guards** | copying the original verbatim would have matched nothing and passed vacuously |
+| test harness copied verbatim | **harness plus a SQL capture** | `SettleReadAtomicityTests` must count the statements a settle actually issues, which is observable only from inside the host's `DbContext`; neither other service has a two-row read whose atomicity is load-bearing. `StockApiFactory` wires it through `IDbContextOptionsConfiguration<StockDbContext>` — see D15 |
 
 Referenced from `AgenticShop.Shared`, not copied: `DataAnnotationValidationFilter`,
 `CorrelationIdMiddleware`, `IRequestContract` and the `ProblemDetailsExceptionHandler` base class.
