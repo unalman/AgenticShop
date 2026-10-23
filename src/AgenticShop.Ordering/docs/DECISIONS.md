@@ -616,13 +616,45 @@ timestamp untouched and adds no row. `StockEventContractTests` pins the wire for
 direction — the field names are the ones Stock's own suite asserts its serializer produces, so the two
 services hold independent assertions on one format rather than a shared fixture neither can see.
 
-**What it does not do.** No saga, no compensation, no `OrderPlaced` emission change, no API change, and
-no reconciliation of `StockCommitted.Lines` against the order's own lines. `POST /orders` still answers
-201 with a terminal status.
+**What it does not do** *(as written — see the revision below)*. No saga, no compensation, no
+`OrderPlaced` emission change, no API change, and no reconciliation of `StockCommitted.Lines` against
+the order's own lines. `POST /orders` still answers 201 with a terminal status.
 
-**Revisit.** The next increment: register both consumers, move `OrderPlaced` emission to before
-reservation, write the order as `Pending`, delete the synchronous reserve and confirm, flip Stock's
-`mandatory` to `true`, and turn `POST /orders` into a 202.
+### Revised 2026-10-23, Phase 2b-iii — everything the "Revisit" list named is done
+
+This consumer is registered in `Program.cs`, `OrderPlaced` is emitted before any reservation exists,
+the order is written `Pending`, the synchronous reserve and confirm are deleted, both publishers'
+`mandatory` is `true`, and `POST /orders` answers 202. The only item from "What it does not do" that
+survives is the line reconciliation, still absent and still listed in `../../../docs/KNOWN-ISSUES.md`.
+
+Four things about the flip were not in that list and are worth recording here rather than only in the
+commit:
+
+- **The idempotency replay changed meaning.** It used to replay the recorded status verbatim; it now
+  derives it from the order's current state — 202 while `Pending`, 200 once settled. Replaying a
+  recorded 202 would keep telling a client that work is in flight after it finished. What the key still
+  guarantees exactly is that a retry places nothing, which is the part that was always load-bearing.
+  **O17's stored status code is now a constant 202 and is no longer read**; dropping the column is a
+  schema change left to the cleanup.
+- **Stock left the readiness check.** Ordering makes no synchronous call to it, so a Stock outage must
+  not make Ordering report itself unready — it can still accept orders and the outbox buffers the
+  events. `OrderApiTests` now asserts Stock's *absence* from `/health/ready`, because a check that
+  quietly came back would re-couple the two services' availability. The broker is not checked at all
+  yet: with an outbox a broker outage is degraded rather than down, so which endpoint it belongs on is
+  a real question rather than an obvious one.
+- **Entries this flip superseded, listed together because one change superseded all of them:** **O9**
+  (ambiguous failures resolved by a read) — there is no read; **O10** (never release a `Confirmed`
+  reservation) — Ordering releases nothing; **O14** (confirm-phase policy) — there is no confirm phase,
+  and `PartiallyConfirmed` is unreachable from the event path; **O16** (fail fast and compensate) —
+  there is nothing to compensate, because Stock takes every line or none; **O18**'s reserve-retry
+  exemption — there is no reserve call. Each still describes code that exists in the repository,
+  because Stock's HTTP reservation endpoints and Ordering's `IStockClient` were deliberately left for
+  the cleanup commit rather than deleted inside the behavioural flip. They get their own markers when
+  that code goes.
+- **Verified end to end through compose**, which is the only place all three services and the broker
+  meet and no test covers: 202 with `status: Pending`, then `Confirmed` on a poll, `quantity_on_hand`
+  10 → 7 with `reserved` back to 0, one inbox row and one drained outbox row on each side, and a
+  repeated idempotency key answering 200 with the same order id.
 
 ---
 

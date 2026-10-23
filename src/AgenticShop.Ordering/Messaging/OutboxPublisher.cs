@@ -162,16 +162,27 @@ public sealed class OutboxPublisher(
 
             var body = Encoding.UTF8.GetBytes(message.PayloadJson);
 
-            // mandatory is false, and in this increment it has to be: nothing binds a queue to the
-            // exchange until Phase 2's Stock consumer arrives, so a mandatory publish would come
-            // back as basic.return, surface as a PublishException, and leave the row unpublished to
-            // be retried forever. Messages published now are accepted and discarded by the broker.
-            // 2b binds a queue and should flip this to true, where it earns its keep by turning a
-            // missing binding into a loud failure instead of a silent one.
+            // mandatory, because a queue is bound now: Stock's consumer binds `stock.order-placed` to
+            // this exchange on `order.placed`. With it on, a publish that cannot be routed comes back
+            // as basic.return and surfaces as a PublishException, so the row stays unpublished and is
+            // retried rather than being accepted and silently discarded by the broker. That is the
+            // difference between "nobody is listening *yet*" and "nobody will ever hear this" — the
+            // first is worth a retry, the second is a bug, and without mandatory the two are
+            // indistinguishable from the producer's side.
+            //
+            // Consequence worth knowing: if Stock has not started, its queue is not bound, so every
+            // publish returns and the outbox backs up until Stock appears. That is correct — nothing
+            // is lost, and buffering is what the outbox is for — but it does mean a producer's log
+            // fills with warnings during a consumer's downtime, and head-of-line blocking (see
+            // docs/KNOWN-ISSUES.md) means the oldest unrouteable row holds up the rest.
+            //
+            // It was false while nothing was bound, because a mandatory publish with no queue returns
+            // every message and leaves every row to be retried forever. Both copies of this flag had
+            // to flip in the same commit, which is exactly the forgetting risk that entry recorded.
             await channel.BasicPublishAsync(
                 exchange: message.Exchange,
                 routingKey: message.RoutingKey,
-                mandatory: false,
+                mandatory: true,
                 basicProperties: properties,
                 body: body,
                 cancellationToken: stoppingToken);

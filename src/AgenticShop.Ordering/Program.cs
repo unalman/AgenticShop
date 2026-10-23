@@ -73,6 +73,13 @@ builder.Services.AddScoped<OrderPlacer>();
 // can still serve reads and still write outbox rows.
 builder.Services.AddHostedService<OutboxPublisher>();
 
+// The consumer that settles orders. Registered alongside the publisher because the flip is one change:
+// from here on a placement writes a Pending order and publishes OrderPlaced, and this is what
+// advances it. Registering one without the other would leave orders Pending forever, or settle them
+// twice. Same rule as the publisher — nothing may escape ExecuteAsync, or a broker outage stops a
+// host that could still be accepting and persisting orders.
+builder.Services.AddHostedService<StockOutcomeConsumer>();
+
 builder.Services.AddProblemDetails();
 builder.Services.AddExceptionHandler<OrderingExceptionHandler>();
 
@@ -82,29 +89,35 @@ builder.Services.AddExceptionHandler<OrderingExceptionHandler>();
 // make Ordering report itself down, or one failure becomes two — Stock goes down, an orchestrator
 // pulls Ordering out of rotation, and Ordering stops serving the reads it could still have answered.
 //
-// /health/ready is readiness: the same database plus Catalog and Stock, because "can I place an order
-// right now" genuinely depends on both.
+// /health/ready is readiness: the same database plus Catalog, because "can I accept an order right
+// now" depends on resolving its lines against Catalog and nothing else.
+//
+// Stock is deliberately absent from readiness, and its absence is a consequence of the outbox rather
+// than an oversight. Ordering makes no synchronous call to Stock any more, so a Stock outage does not
+// stop Ordering accepting an order — it stops the order being *settled*, and the outbox buffers the
+// event until Stock returns. Reporting unready because Stock is down would pull Ordering out of
+// rotation and stop it accepting exactly the work the outbox exists to hold. That is the "one outage
+// becomes two" failure the two-endpoint split exists to prevent, arriving through a different door.
+//
+// The broker is absent too, for now. With an outbox a broker outage is degraded rather than down —
+// orders are accepted and persisted, events queue in the table — so which endpoint it belongs on, if
+// either, is a real question rather than an obvious one. Recorded in docs/KNOWN-ISSUES.md.
 //
 // The probe client is built apart from the typed clients so it stays outside the resilience
-// pipeline, whose 35-second total timeout would turn a *slow* Catalog into a dead Ordering. One
-// client shared by both checks; the reasoning is on DownstreamHealthChecks.AddDownstreamCheck.
+// pipeline, whose 35-second total timeout would turn a *slow* Catalog into a dead Ordering.
 using var healthProbeClient = new HttpClient { Timeout = DownstreamHealthCheck.Timeout };
 
 builder.Services
     .AddHealthChecks()
     .AddDbContextCheck<OrderingDbContext>(name: HealthEndpoint.DatabaseCheckName)
-    // Both base URLs are resolved by a lambda rather than read into a Uri here, for the reason
+    // The base URL is resolved by a lambda rather than read into a Uri here, for the reason
     // ARCHITECTURE.md §5.4 gives for the connection string: a test host's configuration override
     // does not exist yet, so a value read now freezes appsettings.Development.json and the probe
-    // dials whatever is listening on the developer's own 5081 and 5082. Startup still fails fast on
-    // a missing or malformed key — RequireServiceBaseUrl runs again on app.Configuration below.
+    // dials whatever is listening on the developer's own 5081. Startup still fails fast on a missing
+    // or malformed key — RequireServiceBaseUrl runs again on app.Configuration below.
     .AddDownstreamCheck(
         "Catalog",
         () => new Uri(RequireServiceBaseUrl(builder.Configuration, "Catalog")),
-        healthProbeClient)
-    .AddDownstreamCheck(
-        "Stock",
-        () => new Uri(RequireServiceBaseUrl(builder.Configuration, "Stock")),
         healthProbeClient);
 
 builder.Services.AddOpenApi();

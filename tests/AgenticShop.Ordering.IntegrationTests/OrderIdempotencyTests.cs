@@ -13,15 +13,27 @@ namespace AgenticShop.Ordering.IntegrationTests;
 /// <remarks>
 /// <para>
 /// The property that matters is not "the second request gets the same status" — it is <b>the second
-/// request places nothing</b>. So the assertions go to the database and to the Stock fake's call log
-/// rather than stopping at the response: one order row, one key row, and one set of reserve calls no
-/// matter how many times the key is presented.
+/// request places nothing</b>. So the assertions go to the database rather than stopping at the
+/// response: one order row, one key row, and one queued <c>OrderPlaced</c> no matter how many times
+/// the key is presented. The last of those is the one that changed with the flip, and it is now the
+/// sharpest of the three — a duplicate event is a duplicate reservation, and neither the order count
+/// nor the status code would reveal it.
 /// </para>
 /// <para>
 /// The claim's position in the placement sequence gets its own test, because it is the part that is
 /// easy to get wrong. Claiming before resolve would burn the key on a basket the caller can still
-/// fix; claiming after reserve would leave a window in which two requests both hold stock.
+/// fix; claiming after the write would leave a window in which two requests both persist an order.
 /// <see cref="ABasketFailureDoesNotConsumeTheKey"/> is what pins it.
+/// </para>
+/// <para>
+/// <b>What is no longer tested here, and why.</b> Two tests used to assert that a repeated key
+/// replayed a recorded 409 (stock refused) or 502 (downstream fault). Neither status can be recorded
+/// any more: Stock is not called during a placement, so it cannot refuse inside one, and the only
+/// downstream that is called — Catalog — fails before the key is claimed at all. A refusal now arrives
+/// asynchronously and settles the order as <c>Failed</c>, which
+/// <see cref="StockOutcomeConsumerTests"/> covers against a real broker. The replay rule changed with
+/// them: the status is derived from where the order actually is rather than replayed verbatim, so a
+/// key whose order has settled replays a 200.
 /// </para>
 /// </remarks>
 [Collection("Ordering API")]
@@ -34,13 +46,13 @@ public sealed class OrderIdempotencyTests(OrderingApiFixture fixture) : OrderApi
         var key = NewIdempotencyKey();
 
         var first = await PlaceAsync(OrderWith((productId, 2)), idempotencyKey: key);
-        first.StatusCode.Should().Be(HttpStatusCode.Created);
+        first.StatusCode.Should().Be(HttpStatusCode.Accepted);
         var firstBody = await BodyAsync(first);
 
         var second = await PlaceAsync(OrderWith((productId, 2)), idempotencyKey: key);
 
         second.StatusCode.Should().Be(
-            HttpStatusCode.Created,
+            HttpStatusCode.Accepted,
             "a repeated key replays the recorded outcome, it does not report a conflict");
 
         var secondBody = await BodyAsync(second);
@@ -52,61 +64,36 @@ public sealed class OrderIdempotencyTests(OrderingApiFixture fixture) : OrderApi
         (await ReadAllOrdersAsync()).Should().HaveCount(1, "the second attempt placed nothing");
         (await ReadAllIdempotencyKeysAsync()).Should().HaveCount(1);
 
+        // The assertion that matters most now. One order and one key are consistent with a second
+        // event having been queued against the same order, and that would be a second reservation —
+        // a real double-hold wearing the clothes of a correct replay.
+        (await ReadAllOutboxMessagesAsync()).Should()
+            .HaveCount(1, "one placement queues one OrderPlaced, however many times the key is presented");
+
+        // Both answers are 202 because this fixture has no Stock on the other end of the broker, so
+        // the order is still Pending when the replay arrives. That is exactly the case the derived
+        // status is written for; StockOutcomeConsumerTests covers the settled half, where the same key
+        // replays a 200.
+        secondBody.Status.Should().Be(nameof(OrderStatus.Pending));
+
         Stock.CountCalls(FakeStockClient.ReserveOperation).Should()
-            .Be(1, "one line, one placement: a second reserve would be a second hold on real stock");
-        Stock.CountCalls(FakeStockClient.ConfirmOperation).Should().Be(1);
+            .Be(0, "Stock is not called during a placement at all any more");
     }
 
-    [Fact]
-    public async Task ARepeatedKeyAfterAStockRefusalReplaysThe409WithTheSameOrderId()
-    {
-        var productId = AddProduct();
-        Stock.ReserveFailsWith = FakeStockClient.Failure.Refused;
-        Stock.ReserveFailsFromCall = 0;
-        var key = NewIdempotencyKey();
-
-        var first = await PlaceAsync(OrderWith((productId, 1)), idempotencyKey: key);
-        first.StatusCode.Should().Be(HttpStatusCode.Conflict);
-        var firstOrderId = OrderIdFrom(await ProblemAsync(first));
-
-        var second = await PlaceAsync(OrderWith((productId, 1)), idempotencyKey: key);
-
-        second.StatusCode.Should().Be(
-            HttpStatusCode.Conflict,
-            "the recorded status is replayed verbatim, and 409 is what the first attempt answered");
-
-        OrderIdFrom(await ProblemAsync(second)).Should()
-            .Be(firstOrderId, "the replay names the same Failed order so it can still be queried");
-
-        (await ReadAllOrdersAsync()).Should().HaveCount(1);
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(1);
-    }
-
-    [Fact]
-    public async Task ARepeatedKeyAfterADownstreamFailureReplaysThe502RatherThanA409()
-    {
-        var productId = AddProduct();
-        Stock.ConfirmFailsWith = FakeStockClient.Failure.Fault;
-        Stock.ConfirmFailsFromCall = 0;
-        Stock.ListFails = true;   // so reconciliation cannot resolve the ambiguity
-        var key = NewIdempotencyKey();
-
-        var first = await PlaceAsync(OrderWith((productId, 1)), idempotencyKey: key);
-        first.StatusCode.Should().Be(HttpStatusCode.BadGateway);
-
-        var second = await PlaceAsync(OrderWith((productId, 1)), idempotencyKey: key);
-
-        // This is why the status code is stored rather than derived from Order.Status. The order is
-        // PartiallyConfirmed here and Failed in the test above; deriving 409 from "Failed" would have
-        // told this client to fix its basket when the real problem was ours.
-        second.StatusCode.Should().Be(HttpStatusCode.BadGateway);
-
-        var problem = await ProblemAsync(second);
-        problem.Title.Should().Be("Downstream failure.");
-        OrderIdFrom(problem).Should().NotBeEmpty();
-
-        (await ReadAllOrdersAsync()).Should().HaveCount(1);
-    }
+    // Two tests lived here: ARepeatedKeyAfterAStockRefusalReplaysThe409WithTheSameOrderId and
+    // ARepeatedKeyAfterADownstreamFailureReplaysThe502RatherThanA409. Both are gone rather than
+    // weakened, because the states they replayed can no longer be recorded.
+    //
+    // The first made Stock refuse a line and asserted the 409 was replayed verbatim. Stock is not
+    // called during a placement any more, so no refusal can happen inside one; a refusal is now an
+    // asynchronous outcome that settles the order as Failed, covered by StockOutcomeConsumerTests.
+    //
+    // The second made the confirm phase fault and asserted the 502 was replayed rather than a 409, and
+    // it existed to justify storing the status code instead of deriving it from Order.Status — because
+    // a Failed order could have come from either. That ambiguity is gone with the confirm phase: after
+    // the claim is taken the only outcomes are "accepted" and, later, whatever the consumer decides.
+    // The stored code is now a constant 202, which is why the replay derives its status from the
+    // order's current state instead.
 
     [Fact]
     public async Task ABasketFailureDoesNotConsumeTheKey()
@@ -126,7 +113,7 @@ public sealed class OrderIdempotencyTests(OrderingApiFixture fixture) : OrderApi
         var retried = await PlaceAsync(OrderWith((usd, 1)), idempotencyKey: key);
 
         retried.StatusCode.Should().Be(
-            HttpStatusCode.Created,
+            HttpStatusCode.Accepted,
             "the key is still unused, so the corrected request is a first attempt rather than a replay");
 
         (await ReadAllOrdersAsync()).Should().HaveCount(1);
@@ -146,7 +133,7 @@ public sealed class OrderIdempotencyTests(OrderingApiFixture fixture) : OrderApi
 
         var retried = await PlaceAsync(OrderWith((active, 1)), idempotencyKey: key);
 
-        retried.StatusCode.Should().Be(HttpStatusCode.Created);
+        retried.StatusCode.Should().Be(HttpStatusCode.Accepted);
         (await ReadAllOrdersAsync()).Should().HaveCount(1);
     }
 
@@ -267,7 +254,7 @@ public sealed class OrderIdempotencyTests(OrderingApiFixture fixture) : OrderApi
         var response = await PlaceAsync(OrderWith((productId, 1)), idempotencyKey: key);
 
         response.StatusCode.Should().Be(
-            HttpStatusCode.Created,
+            HttpStatusCode.Accepted,
             "a GUID, a prefixed token and a dotted date form are all ordinary caller choices");
     }
 
@@ -292,39 +279,41 @@ public sealed class OrderIdempotencyTests(OrderingApiFixture fixture) : OrderApi
         (await ReadAllOrdersAsync()).Should().HaveCount(1, "exactly one request won the claim");
         (await ReadAllIdempotencyKeysAsync()).Should().HaveCount(1);
 
-        // The invariant that makes the key worth having: one line, so one hold, however many
-        // requests presented the key. Without the claim the losers would each have reserved.
+        // The invariant that makes the key worth having, and the sharpest assertion in this test:
+        // one line, so one queued event, however many requests presented the key. Without the claim
+        // the losers would each have written an order *and* an OrderPlaced, and twelve events for one
+        // basket is twelve reservations — a far worse outcome than a duplicate row, because nothing
+        // downstream can tell the copies apart.
         //
-        // An exact count in a parallel test, which the house rule normally forbids — safe here
-        // because the count does not depend on interleaving. Exactly one request can insert the key
-        // row, and only that request ever reaches Reserve; every other attempt is refused or
-        // replayed before any side effect. The overselling tests cannot say the same, because there
-        // the number of winners genuinely depends on who reaches xmin first.
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(1);
+        // An exact count in a parallel test, which the house rule normally forbids — safe here because
+        // the count does not depend on interleaving. Exactly one request can insert the key row, and
+        // only that request ever reaches the write. The overselling tests cannot say the same, because
+        // there the number of winners genuinely depends on who reaches xmin first.
+        (await ReadAllOutboxMessagesAsync()).Should().HaveCount(1);
 
         statuses.Should().OnlyContain(
-            status => status == HttpStatusCode.Created || status == HttpStatusCode.Conflict,
+            status => status == HttpStatusCode.Accepted || status == HttpStatusCode.Conflict,
             "every attempt either won the claim, replayed it, or was refused while it was still open");
 
-        statuses.Should().Contain(HttpStatusCode.Created, "the claim winner placed a real order");
+        statuses.Should().Contain(HttpStatusCode.Accepted, "the claim winner placed a real order");
 
-        // Most of the 201s are replays, not placements — which is the point, and the reason the
-        // count above is 1 rather than 12. What makes them all legitimate is that they name the same
-        // order: a replay that returned a different id would be a second placement wearing a 201.
-        var created = responses.Where(response => response.StatusCode == HttpStatusCode.Created).ToList();
-        var createdIds = new HashSet<Guid>();
+        // Most of the 202s are replays, not placements — which is the point, and the reason the
+        // counts above are 1 rather than 12. What makes them all legitimate is that they name the same
+        // order: a replay that returned a different id would be a second placement wearing a 202.
+        var accepted = responses.Where(response => response.StatusCode == HttpStatusCode.Accepted).ToList();
+        var acceptedIds = new HashSet<Guid>();
 
-        foreach (var response in created)
+        foreach (var response in accepted)
         {
             var body = await BodyAsync(response);
 
-            createdIds.Add(body.Id);
+            acceptedIds.Add(body.Id);
 
             response.Headers.Location!.ToString().Should()
-                .Be($"/api/v1/orders/{body.Id}", "a 201 carries the Location of the order it names");
+                .Be($"/api/v1/orders/{body.Id}", "a 202 carries the Location of the order to poll");
         }
 
-        createdIds.Should().HaveCount(1, "every 201, first attempt or replay, names the same order");
+        acceptedIds.Should().HaveCount(1, "every 202, first attempt or replay, names the same order");
 
         foreach (var response in responses)
         {

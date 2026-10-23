@@ -5,6 +5,7 @@ using AgenticShop.Shared.Tracing;
 using AgenticShop.Stock.Data;
 using AgenticShop.Stock.Endpoints;
 using AgenticShop.Stock.Errors;
+using AgenticShop.Stock.Messaging;
 using Microsoft.EntityFrameworkCore;
 using Scalar.AspNetCore;
 using Serilog;
@@ -18,8 +19,12 @@ builder.Host.UseSerilog((context, configuration) => configuration
     .WriteTo.Console(outputTemplate: ServiceLogging.ConsoleOutputTemplate));
 
 // One span per inbound request, exported to the console here so the span tree is visible with no
-// collector running, and over OTLP whenever OTEL_EXPORTER_OTLP_ENDPOINT is set. Stock is a leaf
-// service: no outbound calls, so no HttpClient instrumentation.
+// collector running, and over OTLP whenever OTEL_EXPORTER_OTLP_ENDPOINT is set. No HttpClient
+// instrumentation: Stock still makes no outbound *HTTP* call, which is what LeafServiceBoundaryTests
+// pins. It does now publish, over AMQP, and those spans are not exported — the consumer creates an
+// Activity directly because its source is not registered with the tracer provider, and a
+// Stock-specific source name does not belong in the shared tracing configuration. Recorded in
+// docs/KNOWN-ISSUES.md.
 builder.Services.AddServiceTracing(
     builder.Configuration,
     serviceName: "AgenticShop.Stock",
@@ -37,6 +42,17 @@ builder.Services.AddDbContext<StockDbContext>(options => options
 builder.Services.AddProblemDetails();
 builder.Services.AddExceptionHandler<StockExceptionHandler>();
 
+// Both halves of the messaging path, registered together because neither works alone: the consumer
+// writes outcome rows that only the publisher drains, and a publisher with nothing writing rows is
+// idle. This is the registration that makes the event path live — until it, the synchronous reserve
+// endpoint was the only way stock moved, and the two must never both be wired.
+//
+// Neither may let an exception escape ExecuteAsync. An unhandled exception in a hosted service stops
+// the host, so a broker outage would take down an API that can still answer every read and still
+// serve the HTTP endpoints it keeps.
+builder.Services.AddHostedService<OrderPlacedConsumer>();
+builder.Services.AddHostedService<OutboxPublisher>();
+
 // Liveness, answered by the one dependency this service owns. Same shape as Catalog, which carries
 // the full reasoning; see docs/ARCHITECTURE.md §4.10.
 builder.Services
@@ -52,6 +68,12 @@ var app = builder.Build();
 // returns 500 on every request that touches the database. Deliberately called after Build()
 // so it validates the same merged configuration the DbContext will resolve.
 RequireConnectionString(app.Configuration);
+
+// Same reasoning, for the broker: a missing or malformed URL would otherwise surface as a warning
+// from two background loops every five seconds rather than as a startup failure naming the key that
+// is wrong. This validates the configuration, not the connection — Stock must still start with the
+// broker down, because unacknowledged deliveries are redelivered and unpublished rows wait.
+OutboxPublisher.RequireBrokerUrl(app.Configuration);
 
 // Correlation id first so failures raised by later middleware still carry it. The middleware also
 // makes the id ambient for every log line of the request, which is why it has to be out here.

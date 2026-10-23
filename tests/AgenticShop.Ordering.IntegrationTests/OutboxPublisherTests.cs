@@ -66,7 +66,7 @@ public sealed class OutboxPublisherTests(OrderingMessagingFixture fixture) : IAs
 
         var response = await PlaceAsync(product, quantity: 2);
 
-        response.StatusCode.Should().Be(HttpStatusCode.Created);
+        response.StatusCode.Should().Be(HttpStatusCode.Accepted);
 
         var body = await BodyAsync(response);
         var correlationId = response.Headers.GetValues(CorrelationIdMiddleware.HeaderName).Single();

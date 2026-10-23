@@ -259,6 +259,26 @@ So the "Verified" paragraph above is historical: the counters it describes movin
 `Confirmed`, and the suite has grown since. The current numbers are in the increment that made the
 change.
 
+### Revised again 2026-10-23, Phase 2b-iii — it is wired now
+
+**Both hosted services are registered in `Program.cs`, and the synchronous reservation path they
+replaced is deleted from Ordering.** The "Why built but not wired" paragraph above is historical: it
+described a real constraint (two live reservation paths would double-hold every order) that the flip
+resolved by removing one of them in the same commit that registered the other. Stock's own HTTP
+reservation endpoints were *not* deleted in that commit — they still exist and now have no caller, and
+removing them with the ~30 tests that cover them is a separate cleanup, so that the behavioural change
+stays reviewable on its own.
+
+Two consequences worth carrying forward from the wiring:
+
+- **`mandatory` is now `true` on Stock's publisher**, because Ordering binds `ordering.stock-outcomes`.
+  It had to flip in the same commit as Ordering's own flag, which is exactly the forgetting risk
+  `docs/KNOWN-ISSUES.md` recorded when both were `false`.
+- **Stock's startup now requires a broker URL.** `Program.cs` validates `RabbitMq:Url` the way it
+  validates the connection string, so a missing value fails the boot rather than producing a warning
+  from two background loops every five seconds. An *unreachable* broker does not fail startup, and
+  should not: unacknowledged deliveries are redelivered and unpublished rows wait.
+
 ## Not in the approval list, decided during implementation
 
 - **Domain exceptions carry typed properties**, and the handler builds client text from them rather

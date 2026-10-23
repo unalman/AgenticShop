@@ -205,18 +205,23 @@ Verified at closure: `dotnet build` clean under `TreatWarningsAsErrors`; **519 t
   `administrator` tag, because the image's env-var bootstrap cannot create a scoped one; accepted for
   a loopback-bound throwaway container and recorded as a divergence to revisit the moment it is
   reachable off-machine.
-- Replace synchronous reservation with events: `OrderPlaced` → Stock consumes → `StockCommitted` /
-  `StockReservationRejected`. **Both consumers are built and tested against a real broker, and both
-  are deliberately not registered** — neither service's `Program.cs` starts them, so the synchronous
-  reserve is still the only path live and nothing can double-hold. Stock holds an order's lines or none
-  of them and answers with a single outcome; Ordering's consumer settles the order that answer belongs
-  to, `Pending → Confirmed` or `Pending → Failed`. That binary is why O14's confirm-phase policy has no
-  equivalent on the event path: there is no partial outcome to classify. What remains is the flip —
-  register both, move `OrderPlaced` emission to before reservation, write the order as `Pending`,
-  delete the synchronous reserve and confirm, flip Stock's `mandatory` to `true`, and turn
-  `POST /orders` into a 202 — in one commit, because there is no state in between where only one path
-  is wired. `src/AgenticShop.Stock/docs/DECISIONS.md` → **D16**,
+- ~~Replace synchronous reservation with events: `OrderPlaced` → Stock consumes → `StockCommitted` /
+  `StockReservationRejected`.~~ **Done (2026-10-23).** The synchronous reserve and confirm are gone
+  from Ordering's placement path, both consumers are registered in their services' `Program.cs`, and
+  `POST /orders` answers **202** with a `Pending` order that the outcome consumer settles. Stock takes
+  every line of an order or none of them and answers with a single outcome, which is why the
+  transition is binary and O14's confirm-phase policy has no equivalent on this path — there is no
+  partial outcome to classify. `mandatory` is `true` on both publishers now that queues are bound.
+  Verified end to end through the compose stack: 202 → `Pending`, then `Confirmed` on a poll,
+  `quantity_on_hand` 10 → 7 with `reserved` back to 0, one inbox row and one drained outbox row on
+  each side. `src/AgenticShop.Stock/docs/DECISIONS.md` → **D16**,
   `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O20**.
+
+  **Two things this did not do, deliberately.** Stock's HTTP reservation endpoints and Ordering's
+  `IStockClient` still exist and now have no caller; deleting them, with the ~30 tests that cover
+  them, is a separate cleanup commit so the behavioural flip stays reviewable on its own. And the
+  contention measurement in Stock's `ARCHITECTURE.md` §7 still describes a live endpoint — it becomes
+  historical when that endpoint goes.
 - ~~**Outbox pattern.**~~ **Done on the producer side (2026-10-23).** An `outbox_messages` table, an
   `OutboxPublisher` hosted service and an `OrderPlaced` contract — carrying the stable message id
   this bullet called cheap to decide now and expensive to retrofit. The row joins the order's own

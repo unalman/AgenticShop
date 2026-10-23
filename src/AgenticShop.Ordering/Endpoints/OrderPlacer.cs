@@ -11,8 +11,8 @@ using Npgsql;
 namespace AgenticShop.Ordering.Endpoints;
 
 /// <summary>
-/// Places an order: resolve every line against Catalog, hold it in Stock, settle the holds, and
-/// write the order exactly once.
+/// Places an order: resolve every line against Catalog, write the order as <c>Pending</c>, and queue
+/// the event that gets it fulfilled.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -21,29 +21,37 @@ namespace AgenticShop.Ordering.Endpoints;
 /// external call inside one transaction", and names <c>POST /orders</c> as the case. It has no
 /// interface, no second consumer and one public method; the endpoint still owns binding, the result
 /// and the status code. It lives beside the endpoint that uses it rather than in <c>Domain/</c>,
-/// because it needs the <see cref="OrderingDbContext"/> and the clients, and the domain must not
-/// reference either.
+/// because it needs the <see cref="OrderingDbContext"/> and the Catalog client, and the domain must
+/// not reference either.
 /// </para>
 /// <para>
-/// <b>The order row is written once, at the end, already terminal.</b> Nothing is persisted before
-/// the downstream calls, so no reader can ever observe a <see cref="OrderStatus.Pending"/> order and
-/// there is no "insert then update" that can fail between the two. The cost is the accepted
-/// dual-write residual: if this process dies mid-confirm, Stock holds confirmed reservations for an
-/// order id that was never written. See <c>docs/ROADMAP.md</c> → "Confirm-phase failure".
+/// <b>The order row is written first, as <see cref="OrderStatus.Pending"/>, and settled later by
+/// something else.</b> That reverses Phase 0's rule, and the reversal is the point of Phase 2. The old
+/// rule wrote the row once at the end, already terminal, so no reader could ever observe a
+/// <c>Pending</c> order — but it could only do that by making the downstream calls first, which left
+/// the accepted dual-write residual: a process dying mid-confirm left Stock holding committed
+/// reservations for an order id that was never written. Writing the row first, in the same transaction
+/// as the event that asks for the work, means a crash afterwards leaves an order that can still be
+/// fulfilled. The residual is closed rather than documented.
 /// </para>
 /// <para>
-/// <b>Cancellation stops at the first side effect.</b> Resolving against Catalog honours the
-/// caller's token, because nothing has happened yet and abandoning is free. From the first reserve
-/// onward every call uses <see cref="CancellationToken.None"/>: a client that hangs up must not
-/// leave stock held against an order nobody recorded. Those calls are still bounded — by
-/// <c>HttpClient.Timeout</c> and by EF's command timeout — so this cannot hang the request.
+/// <b>There is no compensation left in this class.</b> Reserve, confirm, reconcile and release all went
+/// with the synchronous path: Stock holds every line of an order or none of them, so there is no partial
+/// state here to undo, and what used to be O14's confirm-phase policy is now a consumer on the other
+/// side of a broker. The only failure this path can still produce is Catalog's, and that happens before
+/// anything is written.
+/// </para>
+/// <para>
+/// <b>Cancellation stops at the first side effect.</b> Resolving against Catalog honours the caller's
+/// token, because nothing has happened yet and abandoning is free. From the claim onward every call
+/// uses <see cref="CancellationToken.None"/>: a client that hangs up must not leave a key claimed with
+/// no order behind it, which would strand that key for good. Those calls are still bounded — by EF's
+/// command timeout — so this cannot hang the request.
 /// </para>
 /// </remarks>
 public sealed class OrderPlacer(
     OrderingDbContext db,
-    ICatalogClient catalog,
-    IStockClient stock,
-    ILogger<OrderPlacer> logger)
+    ICatalogClient catalog)
 {
     /// <summary>Used from the first side-effecting call onward; see the remarks.</summary>
     private static readonly CancellationToken NotCancellable = CancellationToken.None;
@@ -71,16 +79,15 @@ public sealed class OrderPlacer(
 
         var order = Order.Create(orderId, resolved[0].Product.Currency, lines);
 
-        // Claimed after Resolve and before Reserve, and that placement is the whole design. Resolve
-        // is pure reads, so a bad basket — an unorderable product, a mixed currency — fails before
-        // the key is consumed and the client can retry the same key once it has fixed the request.
-        // Reserve is the first side effect, so the claim has to be committed before it: a duplicate
-        // arriving mid-placement must find the row and be refused rather than placing alongside us.
+        // Claimed after Resolve and before the write, and that placement is still the whole design.
+        // Resolve is pure reads, so a bad basket — an unorderable product, a mixed currency — fails
+        // before the key is consumed and the client can retry the same key once it has fixed the
+        // request. The write is now the first side effect, so the claim has to be committed before it:
+        // a duplicate arriving mid-placement must find the row and be refused rather than placing
+        // alongside us.
         var claim = await ClaimAsync(idempotencyKey);
 
-        var reservations = await ReserveAsync(order, resolved, claim);
-
-        return await ConfirmAsync(order, reservations, claim);
+        return await WriteAsync(order, claim);
     }
 
     /// <summary>
@@ -191,258 +198,41 @@ public sealed class OrderPlacer(
     }
 
     /// <summary>
-    /// Holds every line, and returns the reservation ids in line order.
+    /// The one and only write of the placement path: add the order, complete the key, queue the event,
+    /// commit.
     /// </summary>
     /// <remarks>
-    /// The ids live only for the duration of this placement and are deliberately never persisted:
-    /// Stock owns them, and a copy here would be a second source of truth that could drift. Later
-    /// reconciliation goes through <see cref="IStockClient.ListByOrderAsync"/>, which is keyed by
-    /// order id and reports the product id every line can be matched on.
-    /// </remarks>
-    private async Task<IReadOnlyList<Guid>> ReserveAsync(
-        Order order,
-        IReadOnlyList<ResolvedLine> resolved,
-        OrderIdempotencyKey claim)
-    {
-        var reservations = new List<Guid>(resolved.Count);
-
-        foreach (var line in resolved)
-        {
-            Guid? reservationId;
-
-            try
-            {
-                reservationId = await stock.ReserveAsync(line.Product.Id, order.Id, line.Quantity, NotCancellable);
-            }
-            catch (DownstreamServiceException exception)
-            {
-                logger.LogError(exception,
-                    "Stock could not be reached while reserving product {ProductId} for order {OrderId}.",
-                    line.Product.Id, order.Id);
-
-                // A timed-out reserve may have created a hold whose 201 was never seen, so read the
-                // authoritative state back and release whatever is pending. The outcome is
-                // deliberately ignored: no confirm has been issued and the order id is fresh, so
-                // nothing can be Confirmed and Failed stays truthful even if the read failed too.
-                await ReconcileAsync(order);
-
-                await WriteAsync(order, OrderStatus.Failed, StatusCodes.Status502BadGateway, claim);
-
-                throw new OrderPlacementIncompleteException(order.Id, order.Status);
-            }
-
-            if (reservationId is null)
-            {
-                // A clean refusal. The holds taken so far are known and still Pending, so they can
-                // be released without a read — which matters because under contention this is the
-                // hot path, and a reconciliation read per rejected order would be a real cost.
-                await ReleaseAsync(reservations);
-
-                await WriteAsync(order, OrderStatus.Failed, StatusCodes.Status409Conflict, claim);
-
-                throw new StockUnavailableException(line.Product.Id, order.Id);
-            }
-
-            reservations.Add(reservationId.Value);
-        }
-
-        return reservations;
-    }
-
-    /// <summary>
-    /// Settles every hold, then applies the confirm-phase policy: never release a confirmed
-    /// reservation, reconcile an ambiguous failure by reading the authoritative state back, and
-    /// record what actually happened rather than what was hoped for.
-    /// </summary>
-    private async Task<Order> ConfirmAsync(
-        Order order,
-        IReadOnlyList<Guid> reservations,
-        OrderIdempotencyKey claim)
-    {
-        var settled = 0;
-
-        foreach (var reservationId in reservations)
-        {
-            try
-            {
-                if (await stock.ConfirmAsync(reservationId, NotCancellable))
-                {
-                    settled++;
-                    continue;
-                }
-            }
-            catch (DownstreamServiceException exception)
-            {
-                logger.LogError(exception,
-                    "Stock could not be reached while confirming reservation {ReservationId} for order " +
-                    "{OrderId}; {Settled} of {Total} lines were already confirmed.",
-                    reservationId, order.Id, settled, reservations.Count);
-            }
-
-            // A false here is genuinely ambiguous: Stock answers 409 both for "already confirmed",
-            // which decision D3 says must be treated as success, and for an xmin conflict, which
-            // must not. Only the read below can tell them apart, so it is never guessed at.
-            break;
-        }
-
-        if (settled == reservations.Count)
-        {
-            return await WriteAsync(order, OrderStatus.Confirmed, StatusCodes.Status201Created, claim);
-        }
-
-        var outcome = await ReconcileAsync(order);
-
-        // AllConfirmed covers the case the loop could not see: the confirm applied and only its
-        // response was lost. That is a success, and reporting it as anything else would have the
-        // caller retry an order that has already shipped.
-        if (outcome == ReconciliationOutcome.AllConfirmed)
-        {
-            return await WriteAsync(order, OrderStatus.Confirmed, StatusCodes.Status201Created, claim);
-        }
-
-        // Unknown is recorded as PartiallyConfirmed rather than Failed: "we do not know whether
-        // something shipped" must never be written down as "nothing shipped".
-        var status = outcome == ReconciliationOutcome.NoneConfirmed
-            ? OrderStatus.Failed
-            : OrderStatus.PartiallyConfirmed;
-
-        await WriteAsync(order, status, StatusCodes.Status502BadGateway, claim);
-
-        throw new OrderPlacementIncompleteException(order.Id, order.Status);
-    }
-
-    /// <summary>
-    /// Reads back what Stock actually holds for this order, releasing whatever is still Pending.
-    /// </summary>
-    /// <remarks>
-    /// Releases are issued for <c>Pending</c> rows only. A <c>Confirmed</c> one is never released:
-    /// Stock refuses it, and even if it did not, release would return the hold without returning the
-    /// stock, leaving counters that describe inventory which has already left.
-    /// </remarks>
-    private async Task<ReconciliationOutcome> ReconcileAsync(Order order)
-    {
-        IReadOnlyList<StockReservationSnapshot> snapshots;
-
-        try
-        {
-            snapshots = await stock.ListByOrderAsync(order.Id, NotCancellable);
-        }
-        catch (DownstreamServiceException exception)
-        {
-            logger.LogError(exception,
-                "Could not read back the reservations for order {OrderId}; its outcome is unknown and " +
-                "it will be recorded as needing reconciliation.",
-                order.Id);
-
-            return ReconciliationOutcome.Unknown;
-        }
-
-        var confirmed = snapshots
-            .Where(snapshot => snapshot.IsConfirmed)
-            .Select(snapshot => snapshot.ProductId)
-            .ToHashSet();
-
-        await ReleaseAsync(snapshots
-            .Where(snapshot => snapshot.IsPending)
-            .Select(snapshot => snapshot.Id)
-            .ToList());
-
-        if (confirmed.Count == 0)
-        {
-            return ReconciliationOutcome.NoneConfirmed;
-        }
-
-        // Matched on product id rather than by count: Stock reports one reservation per product per
-        // order, and product id is what an order line carries, so the two sides can be compared
-        // without Ordering having kept anything Stock owns.
-        return order.Lines.All(line => confirmed.Contains(line.ProductId))
-            ? ReconciliationOutcome.AllConfirmed
-            : ReconciliationOutcome.SomeConfirmed;
-    }
-
-    /// <summary>
-    /// Best effort by design. A release that fails — refused, or Stock unreachable — is logged and
-    /// does not change how the order is classified, because the classification describes what
-    /// shipped and a stranded hold ships nothing. The hold stays until Phase 3's expiry worker.
-    /// </summary>
-    private async Task ReleaseAsync(IReadOnlyList<Guid> reservationIds)
-    {
-        foreach (var reservationId in reservationIds)
-        {
-            try
-            {
-                if (await stock.ReleaseAsync(reservationId, NotCancellable))
-                {
-                    continue;
-                }
-
-                // Refused. Benign when it means "already released", a stranded hold when it means an
-                // xmin conflict; the status code cannot distinguish them and the outcome is the same
-                // either way, so this is a warning rather than an error.
-                logger.LogWarning(
-                    "Stock refused to release reservation {ReservationId}; if it is still pending the " +
-                    "hold is stranded until reservation expiry exists.",
-                    reservationId);
-            }
-            catch (DownstreamServiceException exception)
-            {
-                logger.LogError(exception,
-                    "Could not release reservation {ReservationId}; the hold is stranded until " +
-                    "reservation expiry exists.",
-                    reservationId);
-            }
-        }
-    }
-
-    /// <summary>
-    /// The one and only write of the placement path: transition, add, complete the key, commit.
-    /// Every caller reaches it exactly once, which is what makes the row write-once.
-    /// </summary>
-    /// <remarks>
-    /// The order insert and the key's completion are the same <c>SaveChangesAsync</c>, so EF wraps
-    /// them in one transaction and there is no window in which an order exists without its key
-    /// pointing at it. That window is exactly what a retry would exploit: a key written afterwards
-    /// could be lost to a crash, and the next attempt would place a second order.
     /// <para>
-    /// <paramref name="statusCode"/> is recorded verbatim and replayed verbatim. It must stay in
-    /// step with what <c>OrderingExceptionHandler</c> actually returns for the exception thrown
-    /// alongside it, which is why the two are written at the same call site rather than derived
-    /// from <see cref="Order.Status"/> — a <see cref="OrderStatus.Failed"/> order came from either a
-    /// 409 or a 502, and the status is not recoverable from the row.
+    /// Four things in one <c>SaveChangesAsync</c> — the order, its lines, the idempotency key's
+    /// completion and the <c>OrderPlaced</c> outbox row. EF wraps them in one transaction, so there is
+    /// no window in which an order exists without its key pointing at it (the window a retry would
+    /// exploit) and none in which the order exists without the event that gets it fulfilled.
+    /// </para>
+    /// <para>
+    /// <b>The order is written <see cref="OrderStatus.Pending"/>, which reverses Phase 0's rule.</b>
+    /// That rule existed because nothing could advance a <c>Pending</c> row — there was no worker. There
+    /// is one now, and writing <c>Pending</c> is the point: the row exists before the work does, so a
+    /// crash after this commit leaves an order that can still be fulfilled rather than stock committed
+    /// against an order nobody recorded. That was the dual-write residual, and the outbox is what
+    /// closes it.
+    /// </para>
+    /// <para>
+    /// The status code recorded on the key is a constant now, because a successful placement has exactly
+    /// one outcome. The failures that used to be recorded here no longer exist on this path: Stock's
+    /// answer arrives later through the outcome consumer, and a Catalog failure happens before the key
+    /// is claimed at all. The column stays — dropping it is a schema change that belongs with the rest
+    /// of the dead-code cleanup, and it still distinguishes a completed claim from an in-flight one.
     /// </para>
     /// </remarks>
-    private async Task<Order> WriteAsync(
-        Order order,
-        OrderStatus status,
-        int statusCode,
-        OrderIdempotencyKey claim)
+    private async Task<Order> WriteAsync(Order order, OrderIdempotencyKey claim)
     {
-        switch (status)
-        {
-            case OrderStatus.Confirmed:
-                order.Confirm();
-                break;
-            case OrderStatus.Failed:
-                order.Fail();
-                break;
-            case OrderStatus.PartiallyConfirmed:
-                order.MarkPartiallyConfirmed();
-                break;
-            default:
-                throw new InvalidOperationException(
-                    $"Order {order.Id} cannot be persisted as {status}: Phase 0 writes an order once, already terminal.");
-        }
-
-        claim.Complete(order.Id, statusCode);
+        claim.Complete(order.Id, StatusCodes.Status202Accepted);
 
         db.Orders.Add(order);
 
-        // Written here rather than published here, so the event joins the order's transaction and
-        // the two cannot disagree. OutboxPublisher drains it afterwards.
-        if (status == OrderStatus.Confirmed)
-        {
-            db.OutboxMessages.Add(CreateOrderPlacedMessage(order));
-        }
+        // Written here rather than published here, so the event joins the order's transaction and the
+        // two cannot disagree. OutboxPublisher drains it afterwards.
+        db.OutboxMessages.Add(CreateOrderPlacedMessage(order));
 
         await db.SaveChangesAsync(NotCancellable);
 
@@ -454,14 +244,11 @@ public sealed class OrderPlacer(
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Only <see cref="OrderStatus.Confirmed"/> publishes, and that condition is deliberately
-    /// temporary.</b> In this increment reservation has already happened synchronously by the time
-    /// <see cref="WriteAsync"/> runs, so a <see cref="OrderStatus.Failed"/> order was never placed,
-    /// and a <see cref="OrderStatus.PartiallyConfirmed"/> one already holds stock a consumer must not
-    /// reserve a second time. When reservation moves behind the event the rule inverts: the row is
-    /// written at acceptance, before any hold exists, and the saga decides the outcome. What survives
-    /// that change is the contract and this row's place inside the order's transaction; what does not
-    /// is the <c>if</c> around it.
+    /// Written for every accepted order, unconditionally. That was not true when the outbox was first
+    /// added: reservation happened synchronously before this point, so only a <c>Confirmed</c> order had
+    /// anything for a consumer to do and the row was wrapped in an <c>if</c>. Reservation now happens
+    /// <i>because of</i> this row, so the condition is not merely unnecessary but inverted — gating it
+    /// on a settled status would mean never publishing anything.
     /// </para>
     /// <para>
     /// The traceparent is captured here rather than in the publisher because this is the last point at
@@ -486,19 +273,4 @@ public sealed class OrderPlacer(
     private sealed record WantedLine(Guid ProductId, int Quantity);
 
     private sealed record ResolvedLine(CatalogProduct Product, int Quantity);
-
-    private enum ReconciliationOutcome
-    {
-        /// <summary>Every line of the order is Confirmed in Stock.</summary>
-        AllConfirmed,
-
-        /// <summary>At least one line is Confirmed and at least one is not.</summary>
-        SomeConfirmed,
-
-        /// <summary>Nothing is Confirmed, so nothing shipped.</summary>
-        NoneConfirmed,
-
-        /// <summary>Stock could not be read back, so the outcome is unknown.</summary>
-        Unknown
-    }
 }

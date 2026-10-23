@@ -13,16 +13,19 @@ namespace AgenticShop.Ordering.Endpoints;
 /// </summary>
 /// <remarks>
 /// <para>
-/// There is no list endpoint. A status-filtered list would be the operator's way into
-/// <see cref="OrderStatus.PartiallyConfirmed"/> orders, but it would need paging to be safe, and
-/// Catalog's paging is explicitly not house style — Stock has no list endpoint for the same reason.
-/// Phase 0 does not need one: the 409 and 502 bodies carry the order id, and
-/// <c>GET /api/v1/orders/{id}</c> returns the whole record. Phase 2's saga will need a work queue
-/// rather than a list, which is a different thing.
+/// There is no list endpoint. A status-filtered list would be the operator's way into the orders that
+/// need attention, but it would need paging to be safe, and Catalog's paging is explicitly not house
+/// style — Stock has no list endpoint for the same reason. The 409 and 502 bodies carry the order id,
+/// and <c>GET /api/v1/orders/{id}</c> returns the whole record, so a client can always reach what it
+/// placed. Finding orders that were accepted and never settled is a different need — an operator's
+/// query, not a client's — and until a read model exists it is a direct one:
+/// <c>status = 'Pending' AND updated_at_utc IS NULL</c>.
 /// </para>
 /// <para>
-/// There is no cancel, and no route that mutates a persisted order. Placement is the only write
-/// path, which is what makes the row write-once and <see cref="OrderStatus.Pending"/> unpersisted.
+/// There is no cancel, and no route that mutates a persisted order. Placement is still the only
+/// <i>HTTP</i> write path, but it is no longer the only writer: <c>StockOutcomeConsumer</c> advances a
+/// <see cref="OrderStatus.Pending"/> order to a terminal one, which is why <c>Pending</c> is now
+/// persisted and why <see cref="Order.UpdatedAtUtc"/> exists.
 /// </para>
 /// </remarks>
 public static class OrderEndpoints
@@ -43,12 +46,15 @@ public static class OrderEndpoints
         orders.MapPost("/", PlaceAsync)
             .WithName("PlaceOrder")
             .WithSummary(
-                "Places an order: resolves every line against Catalog, holds and settles it in " +
-                "Stock, and writes the order once. Requires an Idempotency-Key header; repeating a " +
-                "key replays the first attempt instead of placing again. 409 when a product cannot " +
-                "be ordered, stock was refused, or the key is already in use; 502 when a downstream " +
-                "service let the placement down.")
-            .Produces<OrderResponse>(StatusCodes.Status201Created)
+                "Accepts an order: resolves every line against Catalog, writes the order as Pending " +
+                "and queues the event that gets it fulfilled. Requires an Idempotency-Key header; " +
+                "repeating a key replays the first attempt instead of placing again, and reports the " +
+                "order's current state. 202 while the order is still Pending, 200 on a replay once it " +
+                "has settled. 409 when a product cannot be ordered or the key is in use; 502 when " +
+                "Catalog let the placement down. Whether stock could be held is not answered here — " +
+                "poll GET /api/v1/orders/{id}.")
+            .Produces<OrderResponse>(StatusCodes.Status202Accepted)
+            .Produces<OrderResponse>(StatusCodes.Status200OK)
             .ProducesValidationProblem()
             .ProducesProblem(StatusCodes.Status400BadRequest)
             .ProducesProblem(StatusCodes.Status409Conflict)
@@ -82,10 +88,10 @@ public static class OrderEndpoints
         }
 
         // Every non-success outcome is an exception classified by OrderingExceptionHandler, so the
-        // endpoint has one job: turn a placed order into a 201 with a Location.
+        // endpoint has one job: turn an accepted order into a 202 with a Location to poll.
         var order = await placer.PlaceAsync(request, idempotencyKey, cancellationToken);
 
-        return Created(order);
+        return Accepted(order);
     }
 
     /// <summary>
@@ -128,39 +134,41 @@ public static class OrderEndpoints
                 "but no such order exists.");
         }
 
-        return Replay(claim.StatusCode!.Value, order);
+        return Replay(order);
     }
 
     /// <summary>
-    /// Rebuilds the recorded response. The status is replayed verbatim; the body comes from the
-    /// order row rather than a stored payload.
+    /// Rebuilds the response for a key that has already been used, from the order's current state.
     /// </summary>
     /// <remarks>
-    /// For a 201 that is byte-identical to the original, because the row is write-once and
-    /// <see cref="OrderResponse.From"/> is a pure function of it. For a failure the detail text
-    /// differs from the first attempt's and says that this is a replay — a deliberate deviation,
-    /// because storing serialised response bodies would create a second source of truth that could
-    /// drift from the row it describes. The status is what a client branches on, and that is exact.
+    /// <para>
+    /// The status is <b>derived</b> rather than replayed verbatim, which is a deliberate weakening of
+    /// the usual idempotency contract and a direct consequence of the order no longer being write-once.
+    /// The first attempt answers 202 because the order is <c>Pending</c>; a retry minutes later finds it
+    /// <c>Confirmed</c> or <c>Failed</c>, and repeating 202 would tell the client that work is still in
+    /// flight when it finished long ago. So a replay reports where the order actually is — 202 while
+    /// <c>Pending</c>, 200 once settled. What the key still guarantees exactly is the part that matters:
+    /// a retry never places a second order.
+    /// </para>
+    /// <para>
+    /// The claim's stored status code is no longer read. It is written as a constant 202 because that is
+    /// the only successful outcome now, and the column survives only to distinguish a completed claim
+    /// from an in-flight one — which <see cref="OrderIdempotencyKey.OrderId"/> already does. Dropping it
+    /// is a schema change that belongs with the dead-code cleanup rather than with this flip.
+    /// </para>
+    /// <para>
+    /// There is no failure branch any more. A 409 for refused stock and a 502 for a downstream fault
+    /// used to complete a claim with that status and be replayed from it; neither can happen after the
+    /// claim is taken, because Stock's answer arrives asynchronously and Catalog is resolved before the
+    /// key is claimed at all.
+    /// </para>
     /// </remarks>
-    private static IResult Replay(int statusCode, Order order) => statusCode switch
-    {
-        StatusCodes.Status201Created => Created(order),
+    private static IResult Replay(Order order) => order.IsTerminal
+        ? Results.Ok(OrderResponse.From(order))
+        : Accepted(order);
 
-        _ => Results.Problem(
-            title: statusCode == StatusCodes.Status502BadGateway
-                ? OrderingExceptionHandler.DownstreamFailureTitle
-                : OrderingExceptionHandler.ConflictFailureTitle,
-            detail: "This is the recorded outcome of an earlier attempt made with the same " +
-                "idempotency key. No new order was placed.",
-            statusCode: statusCode,
-            extensions: new Dictionary<string, object?>(StringComparer.Ordinal)
-            {
-                ["orderId"] = order.Id
-            })
-    };
-
-    private static IResult Created(Order order)
-        => Results.Created($"/api/v1/orders/{order.Id}", OrderResponse.From(order));
+    private static IResult Accepted(Order order)
+        => Results.Accepted($"/api/v1/orders/{order.Id}", OrderResponse.From(order));
 
     private static async Task<IResult> GetAsync(
         Guid id,

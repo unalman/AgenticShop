@@ -129,13 +129,22 @@ public abstract class OrderApiTestBase(OrderingApiFixture fixture) : IAsyncLifet
     private static void AddIdempotencyKey(HttpRequestMessage message, string idempotencyKey)
         => message.Headers.Add(OrderEndpoints.IdempotencyKeyHeader, idempotencyKey);
 
+    /// <summary>
+    /// Places an order and asserts it was accepted.
+    /// </summary>
+    /// <remarks>
+    /// 202 rather than 201, and the body's status is <c>Pending</c>: placement no longer fulfils the
+    /// order, it records it and queues the event that will. Tests that need a settled order assert on
+    /// the outcome consumer's side, in <see cref="StockOutcomeConsumerTests"/>, because in this
+    /// fixture there is no Stock on the other end of the broker to answer.
+    /// </remarks>
     protected async Task<OrderResponse> PlaceSuccessfullyAsync(params (Guid ProductId, int Quantity)[] lines)
     {
         var response = await PlaceAsync(OrderWith(lines));
 
         response.StatusCode.Should().Be(
-            HttpStatusCode.Created,
-            "the placement should have succeeded: {Body}",
+            HttpStatusCode.Accepted,
+            "the placement should have been accepted: {Body}",
             await response.Content.ReadAsStringAsync());
 
         return await BodyAsync(response);
@@ -194,6 +203,21 @@ public abstract class OrderApiTestBase(OrderingApiFixture fixture) : IAsyncLifet
         return await db.IdempotencyKeys
             .AsNoTracking()
             .FirstOrDefaultAsync(claim => claim.Key == key);
+    }
+
+    /// <summary>
+    /// Every queued event. Since the flip this is how "the second attempt placed nothing" is proven
+    /// most directly: a second <c>OrderPlaced</c> for one order would be a second reservation, and
+    /// neither the order count nor the status code would show it.
+    /// </summary>
+    protected async Task<List<OutboxMessage>> ReadAllOutboxMessagesAsync()
+    {
+        using var scope = Fixture.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<OrderingDbContext>();
+
+        return await db.OutboxMessages
+            .AsNoTracking()
+            .ToListAsync();
     }
 
     /// <summary>

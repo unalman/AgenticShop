@@ -1,13 +1,9 @@
 using System.Net;
 using System.Text.Json;
-using AgenticShop.Ordering.Data;
 using AgenticShop.Ordering.Domain;
-using AgenticShop.Ordering.IntegrationTests.Fakes;
 using AgenticShop.Ordering.Messaging;
 using AgenticShop.Shared.Middleware;
 using FluentAssertions;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
 
 namespace AgenticShop.Ordering.IntegrationTests;
 
@@ -27,12 +23,18 @@ namespace AgenticShop.Ordering.IntegrationTests;
 /// be a race with a background loop, and a test that flakes is worse than no test — it teaches the
 /// next reader to retry rather than to look.
 /// </para>
+/// <para>
+/// Every accepted placement now writes a row, unconditionally. That was not true when the outbox was
+/// first added — reservation was synchronous and only a <c>Confirmed</c> order had anything for a
+/// consumer to do — and the change is the flip: the row is now the <i>cause</i> of the reservation
+/// rather than a record of one that already happened.
+/// </para>
 /// </remarks>
 [Collection("Ordering API")]
 public sealed class OutboxWriteTests(OrderingApiFixture fixture) : OrderApiTestBase(fixture)
 {
     [Fact]
-    public async Task AConfirmedPlacementWritesOneOrderPlacedRowInTheSameTransaction()
+    public async Task AnAcceptedPlacementWritesOneOrderPlacedRowInTheSameTransaction()
     {
         var product = AddProduct(name: "Blue Widget", price: 12.50m);
 
@@ -80,7 +82,7 @@ public sealed class OutboxWriteTests(OrderingApiFixture fixture) : OrderApiTestB
 
         var response = await PlaceAsync(OrderWith((product, 1)));
 
-        response.StatusCode.Should().Be(HttpStatusCode.Created);
+        response.StatusCode.Should().Be(HttpStatusCode.Accepted);
 
         var correlationId = response.Headers
             .GetValues(CorrelationIdMiddleware.HeaderName)
@@ -99,29 +101,14 @@ public sealed class OutboxWriteTests(OrderingApiFixture fixture) : OrderApiTestB
             "the correlation id is the trace id, so the message must be traceable back to the request that wrote it");
     }
 
-    [Fact]
-    public async Task APlacementThatStockRefusesWritesNoOutboxRow()
-    {
-        var product = AddProduct();
-
-        Stock.ReserveFailsWith = FakeStockClient.Failure.Refused;
-
-        var response = await PlaceAsync(OrderWith((product, 1)));
-
-        response.StatusCode.Should().Be(HttpStatusCode.Conflict);
-
-        (await ReadAllOutboxMessagesAsync()).Should().BeEmpty(
-            "an order that was never placed has nothing for a consumer to act on, and a rejection is " +
-            "not this event — it is the saga's to publish once reservation moves behind the message");
-    }
-
-    private async Task<List<OutboxMessage>> ReadAllOutboxMessagesAsync()
-    {
-        using var scope = Fixture.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<OrderingDbContext>();
-
-        return await db.OutboxMessages
-            .AsNoTracking()
-            .ToListAsync();
-    }
+    // APlacementThatStockRefusesWritesNoOutboxRow used to live here. The scenario it covered no
+    // longer exists: Stock is not called during a placement, so it cannot refuse one, and every
+    // accepted placement queues an event. A refusal is now an inbound outcome that settles the order
+    // as Failed, which is StockOutcomeConsumerTests' subject.
+    //
+    // The property it was really guarding — that a row is only written for an order that was actually
+    // accepted — is still covered, from the other side: PlacementFailureTests asserts that a Catalog
+    // failure writes no order at all, and ARepeatedKeyReplaysTheOrderAndPlacesNothingAgain asserts
+    // that a replayed key queues exactly one event. Between them there is no path that writes a row
+    // without an accepted order behind it.
 }

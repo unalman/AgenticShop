@@ -1,17 +1,22 @@
 ### Ordering — manual requests
 #
-# Ordering is the orchestrator, so a smoke check needs all three services up:
+# Ordering is the orchestrator, so a smoke check needs all three services and the broker up:
 #
-#   docker compose up -d db
+#   docker compose up -d                             # PostgreSQL *and* RabbitMQ
 #   dotnet run --project src/AgenticShop.Catalog     # http://localhost:5081
 #   dotnet run --project src/AgenticShop.Stock       # http://localhost:5082
 #   dotnet run --project src/AgenticShop.Ordering    # http://localhost:5083
 #
+# `docker compose up -d db` is no longer enough: Stock and Ordering both read RabbitMq:Url at startup
+# and fail without it, so the broker has to be running too.
+#
 # Run the requests top to bottom: the order at the bottom consumes the product and the stock
 # provisioned above it. Every response carries an X-Correlation-Id, which is that request's W3C trace
-# id: read it off the step 3 response and grep all three logs for it, and the placement's Catalog and
-# Stock calls appear under the same id. That is the end-to-end check of outbound propagation the suite
-# cannot make with the clients faked.
+# id. Read it off the step 3 response and grep all three logs for it: the placement's Catalog call
+# appears under it in Ordering, and — because the traceparent is carried in a column on the outbox row
+# and put back onto the message as a header — Stock's consumer logs the same id while it takes the
+# stock. That is the end-to-end check of propagation across the broker hop, and no test in the suite
+# makes it with both services real.
 #
 # Propagation is traceparent, injected by the HttpClient instrumentation. The requests below send no
 # correlation header, because an inbound X-Correlation-Id is ignored rather than adopted — the id
@@ -30,10 +35,14 @@
 ### Health — liveness: this service's database only, never a downstream
 GET {{ordering}}/health
 
-### Health — readiness: that database plus Catalog and Stock
+### Health — readiness: that database plus Catalog, and deliberately not Stock
 # Stop Catalog and re-run both: /health stays 200 while this one goes 503 and names Catalog. That is
 # the point of having two endpoints — a liveness probe that depended on a downstream would let one
 # outage take Ordering out of rotation too.
+#
+# Stock is absent from this endpoint on purpose. Ordering makes no synchronous call to it any more, so
+# a Stock outage must not stop Ordering accepting orders it can still take — the outbox buffers the
+# event and the order settles when Stock returns. Stop Stock and re-run: /health/ready stays 200.
 GET {{ordering}}/health/ready
 
 ### 1. Create a product in Catalog
@@ -60,8 +69,11 @@ Content-Type: application/json
   "quantityOnHand": 10
 }
 
-### 3. Place an order -> 201 Confirmed
-# Reserves 2 units, confirms them, and writes the order once, already terminal.
+### 3. Place an order -> 202 Pending
+# Reserves nothing. It writes the order and queues OrderPlaced in one transaction, then answers —
+# before any stock has moved. Stock's consumer takes the 2 units and publishes StockCommitted;
+# Ordering's consumer settles the order. Poll step 4 until it reads Confirmed, which on an idle broker
+# is well under a second.
 # @name placeOrder
 POST {{ordering}}/api/v1/orders
 Content-Type: application/json
@@ -73,10 +85,12 @@ Idempotency-Key: smoke-place-1
   ]
 }
 
-### 3b. Repeat step 3 with the same key -> 201, and nothing placed
-# Same status, same order id, same Location — but stock is still at 8 on hand, because the second
-# request was replayed rather than placed. This is the request to run twice and then check step 5
-# again: if on-hand dropped to 6, idempotency is broken.
+### 3b. Repeat step 3 with the same key -> the order's current state, and nothing placed
+# 202 while it is still Pending, 200 once it has settled. The replay reports where the order actually
+# is rather than repeating the first answer, because a recorded 202 would keep telling you work is in
+# flight after it finished. Either way: same order id, same Location, and stock still at 8 on hand.
+# This is the request to run twice and then check step 5 again — if on-hand dropped to 6, idempotency
+# is broken, and the sharper version of that check is that only one OrderPlaced was ever queued.
 POST {{ordering}}/api/v1/orders
 Content-Type: application/json
 Idempotency-Key: smoke-place-1
@@ -87,13 +101,20 @@ Idempotency-Key: smoke-place-1
   ]
 }
 
-### 4. Read it back
+### 4. Read it back — this is the poll the 202 tells you to do
+# Pending first, then Confirmed once the round trip through Stock completes.
 GET {{ordering}}/api/v1/orders/{{orderId}}
 
 ### 5. Stock after the order: on-hand 8, reserved 0, and one Confirmed reservation
+# `reserved` is 0 rather than 2 because Stock's consumer reserves and confirms in one transaction:
+# the units left inventory rather than being held against it.
 GET {{stock}}/api/v1/stock/{{productId}}
 
-### 6. The reconciliation view Ordering used to decide the outcome
+### 6. Stock's reservation view for this order — a manual cross-check, no longer a code path
+# Ordering does not read this any more. It existed so the synchronous confirm phase could reconcile an
+# ambiguous failure by reading the authoritative state back, and that phase is gone. It is still useful
+# here to confirm by hand that exactly one Confirmed reservation of 2 units exists, and it is scheduled
+# for deletion along with the rest of the un-called HTTP reservation endpoints.
 GET {{stock}}/api/v1/reservations?orderId={{orderId}}
 
 ### Duplicate lines for one product are combined into a single hold
@@ -110,9 +131,16 @@ Idempotency-Key: smoke-combined
   ]
 }
 
-### Ordering more than is available -> 409, the earlier holds released, the order written as Failed
-# The response body carries an orderId extension: a failed placement still writes a row. Repeating
-# this key replays the same 409 with the same orderId rather than placing again.
+### Ordering more than is available -> 202 now, and Failed later
+# This used to answer 409 synchronously and it cannot any more: placement does not consult Stock, so
+# it accepts the order and queues the event. Stock's consumer then refuses it (InsufficientStock),
+# publishes StockReservationRejected, and Ordering's consumer settles the order as Failed. Read the
+# order id out of this response and poll step 4 with it to watch that happen.
+#
+# Nothing was ever held, so there is nothing to release — Stock takes every line of an order or none of
+# them, which is why the old "the earlier holds are released" behaviour has no equivalent here.
+# Repeating this key replays the order's current state (202, then 200 with status Failed) rather than
+# placing again.
 POST {{ordering}}/api/v1/orders
 Content-Type: application/json
 Idempotency-Key: smoke-overstock
@@ -199,8 +227,14 @@ Idempotency-Key: has spaces
 ### Unknown order -> 404
 GET {{ordering}}/api/v1/orders/88888888-8888-8888-8888-888888888888
 
-### A 502 cannot be provoked from here
-# It needs Catalog or Stock to fail mid-placement, which no request can arrange. The confirm-phase
-# policy is covered by ConfirmPhaseFailureTests, and the idempotency replay of a 502 by
-# OrderIdempotencyTests, both of which script the client seam. The residual both accept is in
-# docs/KNOWN-ISSUES.md under "Cross-service consistency".
+### A 502 can only come from Catalog now
+# Stock is not called during a placement, so it cannot fail one. Stop Catalog and re-run step 3: the
+# failure happens while resolving lines, before the idempotency key is claimed, so the answer is 502,
+# no order is written, and the key survives for the caller to fix the basket and retry.
+#
+# The confirm phase used to be the other source of 502s, and the tests that covered it
+# (ConfirmPhaseFailureTests, and the two OrderIdempotencyTests that replayed a recorded 409 or 502)
+# were deleted with it rather than rewritten — the states they replayed can no longer be recorded.
+# What replaced that failure mode is milder and findable: an order that was accepted and never settled
+# stays Pending, and `status = 'Pending' AND updated_at_utc IS NULL` finds it. See
+# docs/KNOWN-ISSUES.md under Messaging.

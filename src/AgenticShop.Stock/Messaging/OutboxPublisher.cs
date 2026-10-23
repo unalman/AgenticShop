@@ -154,20 +154,23 @@ public sealed class OutboxPublisher(
 
             var body = Encoding.UTF8.GetBytes(message.PayloadJson);
 
-            // mandatory is false, and in this increment it has to be — for the mirror image of the
-            // reason it is false in Ordering. Nothing binds a queue to agenticshop.stock until
-            // Ordering's outcome consumer arrives in the next increment, so a mandatory publish would
-            // come back as basic.return, surface as a PublishException, and leave the row unpublished
-            // to be retried forever. Messages published now are accepted and discarded.
+            // mandatory, because a queue is bound now: Ordering's outcome consumer binds
+            // `ordering.stock-outcomes` to this exchange on `stock.committed` and
+            // `stock.reservation-rejected`. With it on, an unroutable publish returns as basic.return
+            // and surfaces as a PublishException, so the row stays unpublished and is retried instead
+            // of being accepted and discarded. Without it, a missing binding is indistinguishable from
+            // a successful delivery — the outcome event simply never reaches anyone, and the order it
+            // answers stays Pending forever.
             //
-            // That makes two copies of this flag whose correct value depends on a later increment,
-            // which is exactly how one of them gets forgotten. Both are recorded in
-            // docs/KNOWN-ISSUES.md, and the consumer that binds a queue is the one that should flip
-            // the producer's flag.
+            // It was false while nothing was bound, because a mandatory publish with no queue returns
+            // every message and leaves every row to be retried forever. Both copies of this flag —
+            // here and in Ordering's publisher — flipped in the same commit, which is what the
+            // KNOWN-ISSUES entry said had to happen; two copies of a flag whose correct value depends
+            // on a later increment is exactly how one of them gets forgotten.
             await channel.BasicPublishAsync(
                 exchange: message.Exchange,
                 routingKey: message.RoutingKey,
-                mandatory: false,
+                mandatory: true,
                 basicProperties: properties,
                 body: body,
                 cancellationToken: stoppingToken);

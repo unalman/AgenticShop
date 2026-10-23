@@ -91,122 +91,16 @@ public sealed class PlacementFailureTests(OrderingApiFixture fixture) : OrderApi
             "nothing is reserved until every line has been resolved");
     }
 
-    [Fact]
-    public async Task WhenStockRefusesALine_TheEarlierHoldsAreReleasedAndTheOrderIsFailed()
-    {
-        var first = AddProduct(name: "Anchor");
-        var second = AddProduct(name: "Rope");
-        var third = AddProduct(name: "Chain");
-
-        // The middle line is refused. Under contention this is the ordinary case, not an edge: Stock
-        // measured a 40-way burst holding only 4 of 10 units, because it does not retry on an xmin
-        // conflict.
-        Stock.ReserveFailsWith = FakeStockClient.Failure.Refused;
-        Stock.ReserveFailsFromCall = 1;
-
-        var response = await PlaceAsync(OrderWith((first, 1), (second, 1), (third, 1)));
-
-        response.StatusCode.Should().Be(HttpStatusCode.Conflict);
-
-        var problem = await ProblemAsync(response);
-        problem.Detail.Should().Be($"Not enough stock is available for product {second}.");
-
-        var orderId = OrderIdFrom(problem);
-
-        // Fail fast: the third line is never attempted, and the one hold that was taken is given back.
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(2);
-        Stock.CountCalls(FakeStockClient.ConfirmOperation).Should().Be(0, "nothing was settled");
-        Stock.CountCalls(FakeStockClient.ReleaseOperation).Should().Be(1);
-        Stock.Reservations.Should().OnlyContain(r => r.Status == StockReservationSnapshot.Statuses.Released);
-
-        var persisted = await ReadOrderAsync(orderId);
-
-        persisted!.Status.Should().Be(OrderStatus.Failed);
-        persisted.Lines.Should().HaveCount(3, "the order records what was asked for, not what was held");
-    }
-
-    [Fact]
-    public async Task AFailedOrderIsStillQueryable()
-    {
-        var first = AddProduct(name: "Anchor");
-        var second = AddProduct(name: "Rope");
-
-        Stock.ReserveFailsWith = FakeStockClient.Failure.Refused;
-        Stock.ReserveFailsFromCall = 1;
-
-        var problem = await ProblemAsync(await PlaceAsync(OrderWith((first, 1), (second, 1))));
-
-        var response = await Client.GetAsync($"/api/v1/orders/{OrderIdFrom(problem)}");
-
-        response.StatusCode.Should().Be(HttpStatusCode.OK);
-
-        var body = await BodyAsync(response);
-
-        body.Status.Should().Be(nameof(OrderStatus.Failed));
-        body.Lines.Should().HaveCount(2);
-    }
-
-    [Fact]
-    public async Task WhenStockIsUnreachableWhileReserving_TheOrderIsFailedNotPartiallyConfirmed()
-    {
-        var first = AddProduct(name: "Anchor");
-        var second = AddProduct(name: "Rope");
-
-        Stock.ReserveFailsWith = FakeStockClient.Failure.Fault;
-        Stock.ReserveFailsFromCall = 1;
-
-        var response = await PlaceAsync(OrderWith((first, 1), (second, 1)));
-
-        response.StatusCode.Should().Be(HttpStatusCode.BadGateway);
-
-        var persisted = await ReadOrderAsync(OrderIdFrom(await ProblemAsync(response)));
-
-        // Nothing can have shipped — no confirm was ever issued — so Failed stays truthful and the
-        // fourth status is not needed. This is the asymmetry the policy turns on.
-        persisted!.Status.Should().Be(OrderStatus.Failed);
-    }
-
-    [Fact]
-    public async Task WhenTheReserveReadBackAlsoFails_TheOrderIsStillFailed()
-    {
-        // The reserve phase is the one place where an unreadable Stock does not force
-        // PartiallyConfirmed, because "we do not know" can only mean "a hold may be stranded", and a
-        // stranded hold ships nothing.
-        var first = AddProduct(name: "Anchor");
-        var second = AddProduct(name: "Rope");
-
-        Stock.ReserveFailsWith = FakeStockClient.Failure.Fault;
-        Stock.ReserveFailsFromCall = 1;
-        Stock.ListFails = true;
-
-        var response = await PlaceAsync(OrderWith((first, 1), (second, 1)));
-
-        response.StatusCode.Should().Be(HttpStatusCode.BadGateway);
-
-        var persisted = await ReadOrderAsync(OrderIdFrom(await ProblemAsync(response)));
-
-        persisted!.Status.Should().Be(OrderStatus.Failed);
-    }
-
-    [Fact]
-    public async Task AReserveThatAppliedButLostItsResponse_IsFoundByTheReadAndReleased()
-    {
-        // The reservation really exists in Stock and its id was never returned, so the only way to
-        // give the hold back is to read the order's reservations and release what is still pending.
-        var first = AddProduct(name: "Anchor");
-        var second = AddProduct(name: "Rope");
-
-        Stock.ReserveFailsWith = FakeStockClient.Failure.AppliedThenLost;
-        Stock.ReserveFailsFromCall = 1;
-
-        var response = await PlaceAsync(OrderWith((first, 1), (second, 1)));
-
-        response.StatusCode.Should().Be(HttpStatusCode.BadGateway);
-
-        Stock.CountCalls(FakeStockClient.ListOperation).Should().Be(1);
-        Stock.Reservations.Should().HaveCount(2);
-        Stock.Reservations.Should().OnlyContain(r => r.Status == StockReservationSnapshot.Statuses.Released);
-    }
+    // Five tests lived here that drove Stock failures through a placement: a refused line releasing
+    // the earlier holds, an unreachable Stock answering 502, an unreadable Stock, a reserve that
+    // applied and lost its response. All five went with the synchronous path, because none of those
+    // things can happen during a placement any more — Stock is not called, so it cannot refuse, fault
+    // or time out inside the request. A refusal is now an asynchronous outcome that settles the order
+    // as Failed, which is StockOutcomeConsumerTests' subject, and it is asserted there against a real
+    // broker rather than against a fake client.
+    //
+    // What is left in this file is the only failure a placement can still produce: Catalog's. That
+    // happens while resolving lines, before the idempotency key is claimed, so it writes nothing.
 
     [Fact]
     public async Task ACatalogOutage_Returns502AndWritesNoOrder()

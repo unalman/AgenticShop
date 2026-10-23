@@ -161,6 +161,11 @@ services:
       ASPNETCORE_ENVIRONMENT: Development
       # DEVELOPMENT ONLY placeholder password, the same published value as .env.example.
       ConnectionStrings__Stock: "Host=db;Port=5432;Database=agenticshop_stock;Username=stock_svc;Password=${STOCK_DB_PASSWORD:?create a .env file from .env.example}"
+      # Compose DNS name `rabbitmq`, not localhost: inside the container localhost is the container
+      # itself. Substituted rather than literal, so ComposeConfigurationTests keeps holding for every
+      # credential line in this file — and note the variable is `*_PASS`, not `*PASSWORD`, the shape
+      # that test's classifier had to be widened to catch.
+      RabbitMq__Url: "amqp://${RABBITMQ_DEFAULT_USER:?create a .env file from .env.example}:${RABBITMQ_DEFAULT_PASS:?create a .env file from .env.example}@rabbitmq:5672/"
     ports:
       - "127.0.0.1:5082:8080"
     healthcheck:
@@ -182,10 +187,18 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      # Healthy, not started. Ordering resolves products against Catalog and reserves against Stock
-      # in the middle of a placement, so starting before either can answer produces a 502 that the
-      # caller sees as a failure of the order rather than of the boot sequence. Waiting on health is
-      # what makes `docker compose --profile full up -d` usable as one command.
+      # Healthy, not started. The two reasons are different, and only one of them survived the flip.
+      #
+      # Catalog: Ordering still resolves every line against it mid-placement, so starting before
+      # Catalog can answer produces a 502 the caller sees as a failure of the order rather than of the
+      # boot sequence.
+      #
+      # Stock: Ordering no longer calls it at all. The dependency is now about the broker — Stock's
+      # consumer is what binds `stock.order-placed`, and with `mandatory: true` a publish to an
+      # exchange with no bound queue comes back as basic.return and leaves the row unpublished. So
+      # starting Stock first narrows a window in which every placement would queue an event it cannot
+      # deliver yet. Waiting on Stock's /health does not prove the consumer has bound the queue, only
+      # that the host is up; it narrows the window rather than closing it.
       catalog:
         condition: service_healthy
       stock:
@@ -207,12 +220,17 @@ services:
       # ComposeConfigurationTests keeps holding for every credential line in this file.
       RabbitMq__Url: "amqp://${RABBITMQ_DEFAULT_USER:?create a .env file from .env.example}:${RABBITMQ_DEFAULT_PASS:?create a .env file from .env.example}@rabbitmq:5672/"
 
-      # There is deliberately no `depends_on: rabbitmq` here, unlike catalog and stock above. Those
-      # are waited on because a placement that reaches them mid-request fails in a way the caller
-      # sees as the order's fault. The broker is different: the outbox absorbs an unreachable
-      # broker, so Ordering can serve every request it serves today with the broker down, and the
-      # publisher simply retries. Declaring the dependency would claim otherwise. Phase 2b, where
-      # reservation moves behind the event, is what makes it true — and is when it should be added.
+      # There is still deliberately no `depends_on: rabbitmq`, and the note that used to sit here
+      # predicted the flip would change that. It did not, and the prediction was wrong in an
+      # instructive way: it assumed that moving reservation behind the event would make the broker a
+      # hard dependency, when the outbox is precisely what stops it being one. Ordering still accepts
+      # and persists an order with the broker unreachable — Pending row plus outbox row in one
+      # transaction — and the publisher drains it when the broker returns. What a broker outage costs
+      # is that accepted orders do not settle, which is degradation the outbox is designed to absorb,
+      # not a reason to refuse to start.
+      #
+      # Both services do validate the broker URL at startup, so a *missing* configuration still fails
+      # the boot. An unreachable broker does not, and should not.
     ports:
       - "127.0.0.1:5083:8080"
     healthcheck:

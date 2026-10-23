@@ -27,9 +27,9 @@ calls, and the one that forced the conventions to be re-derived rather than copi
 correlation middleware, `IRequestContract`, the logging, tracing and health-response configuration
 and the exception-handler skeleton.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **552 pass**
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **533 pass**
 (Shared 45 unit; Catalog 68 unit + 44 integration; Stock 82 unit + 77 integration; Ordering 142 unit
-+ 94 integration). Database isolation verified 22/22.
++ 75 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
 
@@ -240,26 +240,27 @@ profile, not `full`, because a broker has no host-process equivalent and no port
 profile").
 
 **Also permitted, because a message now flows:** the **outbox** (Ordering decision **O19**) and
-**Stock's consumer with its inbox** — the latter built and tested against a real broker but **not
-registered in `Program.cs`**, so nothing consumes a message in the shipped system and the synchronous
-reserve is still the only live path (Stock decision **D16**). Registering the consumer before that path
-is deleted would double-hold every order, which is why the two change in one commit. The saga,
-dead-letter queues and consumer retry stay deferred — though the DLQ deferral's own reasoning, "each
-needs a consumer to be for", has now expired, and what not having one costs is recorded in
-`docs/KNOWN-ISSUES.md`. Two settings are deliberately temporary and listed there too: `mandatory:
-false`, because no queue is bound in production yet, and Confirmed-only emission, because reservation
-is still synchronous. Nothing else on the list above has been unblocked.
+**both consumers with their inboxes** — Stock's `OrderPlacedConsumer` and Ordering's
+`StockOutcomeConsumer`, each registered in its own service's `Program.cs` (Stock **D16**, Ordering
+**O20**). The synchronous reserve and confirm are gone from Ordering's placement, `POST /orders`
+answers **202** with a `Pending` order that the outcome consumer settles, and `mandatory` is `true` on
+both publishers now that queues are bound. The saga, dead-letter queues and consumer retry stay
+deferred — though the DLQ deferral's own reasoning, "each needs a consumer to be for", expired when the
+consumers arrived, and what not having one costs is recorded in `docs/KNOWN-ISSUES.md`. Nothing else
+on the list above has been unblocked.
 
 Three of those carry a rule that is easy to get wrong, and only one of them is fully test-guarded.
-**Do not extend retry to another outbound call before reading O18** — the exemption on reserve is what
-stops a retry from stranding a hold and reporting it as out-of-stock. **A health check that calls
-another service must carry the `ready` tag**, or it lands on `/health` and a liveness endpoint that
-depends on a downstream turns one outage into two; the existing test pins Catalog and Stock by name,
-so it will *not* catch a third check added without the tag. **`--profile full` publishes the services
-on the host's own 5081–5083**, so never run it while `dotnet watch` holds those ports — a bind
-failure, not a merge. Relatedly, do not "simplify" Ordering's readiness probe back to a `Uri` built at
-registration: it resolves its target per call precisely so a test host can override it, and reverting
-it turns the suite red only while something happens to occupy those ports (§5.4).
+**A health check that calls another service must carry the `ready` tag**, or it lands on `/health` and
+a liveness endpoint that depends on a downstream turns one outage into two; the test pins Catalog by
+name and asserts Stock's *absence* — Ordering no longer calls Stock, so a Stock outage must not make it
+unready — but it will still not catch a third check added without the tag. **`--profile full` publishes
+the services on the host's own 5081–5083**, so never run it while `dotnet watch` holds those ports — a
+bind failure, not a merge. Relatedly, do not "simplify" Ordering's readiness probe back to a `Uri`
+built at registration: it resolves its target per call precisely so a test host can override it, and
+reverting it turns the suite red only while something happens to occupy those ports (§5.4). **O18's
+retry exemption is historical** — it existed for the reserve call, which is gone. Its reasoning still
+binds any future outbound write: retrying a non-idempotent call is how a hold gets stranded and then
+reported as out-of-stock.
 
 ## 9. Git rules
 

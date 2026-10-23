@@ -28,18 +28,20 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
     private const string TraceIdPattern = "^[0-9a-f]{32}$";
 
     [Fact]
-    public async Task PlacingAnOrder_ReservesConfirmsAndReturns201WithALocation()
+    public async Task PlacingAnOrder_AcceptsItAsPendingAndReturns202WithALocation()
     {
         var product = AddProduct(name: "Blue Widget", price: 12.50m);
 
         var response = await PlaceAsync(OrderWith((product, 2)));
 
-        response.StatusCode.Should().Be(HttpStatusCode.Created);
+        response.StatusCode.Should().Be(HttpStatusCode.Accepted);
         response.Headers.Location!.ToString().Should().StartWith("/api/v1/orders/");
 
         var body = await BodyAsync(response);
 
-        body.Status.Should().Be(nameof(OrderStatus.Confirmed));
+        body.Status.Should().Be(nameof(OrderStatus.Pending),
+            "placement accepts the order and queues the event that fulfils it. Nothing has been " +
+            "reserved yet, so a terminal status here would be a lie the client acts on");
         body.OrderNumber.Should().MatchRegex(@"^ORD-\d{8}-[0-9a-f]{8}$");
         body.Currency.Should().Be("USD");
         body.TotalAmount.Should().Be(25.00m);
@@ -49,13 +51,18 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
         body.Lines[0].LineTotal.Should().Be(25.00m);
         body.Lines[0].ProductName.Should().Be("Blue Widget");
 
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(1);
-        Stock.CountCalls(FakeStockClient.ConfirmOperation).Should().Be(1);
-        Stock.CountCalls(FakeStockClient.ReleaseOperation).Should().Be(0, "nothing needed compensating");
+        // Stock is not called at all, and that is the whole change. Asserted on the fake rather than
+        // inferred from the status code, because a test that only checked for 202 would still pass if
+        // the synchronous call were added back — and the failure that would cause is a double
+        // reservation, not a wrong status.
+        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0);
+        Stock.CountCalls(FakeStockClient.ConfirmOperation).Should().Be(0);
+        Stock.CountCalls(FakeStockClient.ReleaseOperation).Should().Be(0);
+        Stock.Reservations.Should().BeEmpty();
     }
 
     [Fact]
-    public async Task TheOrderIsWrittenOnceWithATerminalStatusAndAllItsLines()
+    public async Task TheOrderIsWrittenOnceAsPendingWithAllItsLines()
     {
         var first = AddProduct(name: "Anchor", price: 4.00m);
         var second = AddProduct(name: "Rope", price: 7.25m);
@@ -69,25 +76,26 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
         var persisted = orders.Single();
 
         persisted.Id.Should().Be(body.Id);
-        persisted.Status.Should().Be(OrderStatus.Confirmed);
-        persisted.IsTerminal.Should().BeTrue();
+        persisted.Status.Should().Be(OrderStatus.Pending,
+            "written before the work is done, which is what lets a crash leave an order that can " +
+            "still be fulfilled instead of stock committed against an order nobody recorded");
+        persisted.IsTerminal.Should().BeFalse();
+        persisted.UpdatedAtUtc.Should().BeNull("nothing has settled it yet");
         persisted.Lines.Should().HaveCount(2);
         persisted.TotalAmount.Should().Be(4.00m + 21.75m);
         persisted.Lines.Sum(line => line.LineTotal).Should().Be(persisted.TotalAmount);
     }
 
-    [Fact]
-    public async Task NoOrderIsEverPersistedAsPending()
-    {
-        // The constraint the confirm-phase policy depends on: the row is written once, after
-        // reservation, confirmation and reconciliation, and already terminal. A Pending row in Phase 0
-        // would be a row nothing can advance, because there is no worker.
-        var product = AddProduct();
-
-        await PlaceSuccessfullyAsync((product, 1));
-
-        (await ReadAllOrdersAsync()).Should().OnlyContain(order => order.Status != OrderStatus.Pending);
-    }
+    // A test named NoOrderIsEverPersistedAsPending used to live here, asserting the opposite of the
+    // two above. It was not weakened by the flip, it was inverted by it, and deleting it silently
+    // would leave the next reader free to "restore" the Phase 0 rule without knowing why it went.
+    //
+    // The rule was: write the row once, at the end, already terminal, so no reader could ever observe
+    // a Pending order — because nothing could advance one. There is a worker now, so the premise is
+    // gone, and the rule's cost is now visible: it could only write last by calling Stock first, which
+    // is what produced the dual-write residual (a crash mid-confirm left Stock holding committed
+    // reservations for an order id that was never written). Writing Pending first is what closes that.
+    // See Ordering's O13 revision and O20.
 
     [Fact]
     public async Task ALineSnapshotsTheCatalogSoALaterEditCannotRewriteOrderHistory()
@@ -109,18 +117,16 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
     }
 
     [Fact]
-    public async Task DuplicateProductLinesAreCombinedIntoOneHold()
+    public async Task DuplicateProductLinesAreCombinedIntoOneLine()
     {
-        // Stock's UNIQUE(order_id, stock_item_id) allows one hold per product per order, so the
-        // second line would simply be refused. Combining is lossless: the unit price comes from
-        // Catalog and is the same for both.
+        // Stock's UNIQUE(order_id, stock_item_id) still allows one reservation per product per order,
+        // so a consumer handed two lines for one product would refuse the order outright. Combining is
+        // lossless: the unit price comes from Catalog and is the same for both. The reason survived
+        // the flip even though the enforcement moved — it used to be a 409 inside the request, and is
+        // now a rejected message in a consumer, which is slower to notice and harder to attribute.
         var product = AddProduct(price: 5.00m);
 
         var body = await PlaceSuccessfullyAsync((product, 2), (product, 3));
-
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(1);
-        Stock.Reservations.Should().ContainSingle();
-        Stock.Reservations[0].Quantity.Should().Be(5);
 
         body.Lines.Should().ContainSingle();
         body.Lines[0].Quantity.Should().Be(5);
@@ -222,7 +228,9 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
 
         body.Id.Should().Be(placed.Id);
         body.OrderNumber.Should().Be(placed.OrderNumber);
-        body.Status.Should().Be(nameof(OrderStatus.Confirmed));
+        body.Status.Should().Be(nameof(OrderStatus.Pending),
+            "this fixture has no Stock on the other end of the broker, so nothing settles the order. " +
+            "The settled states are StockOutcomeConsumerTests' subject, asserted against a real broker");
         body.TotalAmount.Should().Be(12.00m);
         body.Lines.Should().ContainSingle();
     }
@@ -337,7 +345,7 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
     }
 
     [Fact]
-    public async Task HealthReady_ReportsEachUnreachableDownstreamByName()
+    public async Task HealthReady_ReportsTheUnreachableDownstreamByName()
     {
         // Readiness is the endpoint that is allowed to depend on other services, and it has to say
         // *which* one — "Unhealthy" alone is what the framework's default writer gives and is the
@@ -351,7 +359,14 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
         entries.Should().ContainKey(HealthEndpoint.DatabaseCheckName);
         entries[HealthEndpoint.DatabaseCheckName].Should().Be("Healthy", "the database is up");
         entries["Catalog"].Should().Be("Unhealthy");
-        entries["Stock"].Should().Be("Unhealthy");
+
+        // Asserted as an absence, and the absence is the point rather than an omission. Ordering makes
+        // no synchronous call to Stock any more, so a Stock outage must not make Ordering report
+        // itself unready: it can still accept orders and the outbox buffers the events. Naming it here
+        // is what stops a later change from quietly re-coupling the two services' availability — the
+        // failure that AGENTS.md §8's ready-tag rule exists to prevent, arriving through readiness
+        // rather than liveness.
+        entries.Should().NotContainKey("Stock");
     }
 
     [Fact]

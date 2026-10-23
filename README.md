@@ -323,7 +323,7 @@ Each phase adds one capability, and only once the previous phase makes it necess
 Three hosts, synchronous HTTP, one database per service, Testcontainers. All three services
 are implemented and verified: at the close of Phase 0, 426 tests, a clean build under
 `TreatWarningsAsErrors`, database isolation 22/22, and the three-host path driven by hand
-through `http/ordering.http`. **The suite is now at 552.**
+through `http/ordering.http`. **The suite is now at 533.**
 
 **Phase 1 — Reliability and observability** *(complete)*
 Shared infrastructure library · idempotency keys on `POST /orders` · retry/circuit-breaker/timeout
@@ -348,8 +348,8 @@ them left the loser deciding from a stale `Pending` reservation and a fresh `Res
 `src/AgenticShop.Stock/docs/DECISIONS.md` → D15.
 
 **Phase 2 — Asynchronous messaging** ← the inflection point *(in progress)*
-~~RabbitMQ~~ **done** · ~~outbox~~ **done, producer side** · replace synchronous reservation with
-`OrderPlaced` / `StockCommitted` events · saga with compensation · dead-letter queues.
+~~RabbitMQ~~ **done** · ~~outbox~~ **done** · ~~replace synchronous reservation with events~~ **done**
+· saga with compensation · dead-letter queues.
 
 The broker is in compose's **default** profile rather than behind `full`: it has no host-process
 equivalent and no port to collide with, so hiding it would leave `dotnet watch` with nothing to
@@ -363,29 +363,35 @@ outbox row's, not the order's, so a second event type per order cannot collide i
 And the W3C `traceparent` is captured into a column at write time, because the publisher is a
 background loop with no ambient activity — without it the trace would stop at the broker.
 
-Nothing consumes the message yet, and reservation is still synchronous, so a placement behaves exactly
-as it did before: that is what keeps the pre-existing Ordering tests passing unchanged. The next
-increment moves reservation behind the event, adds Stock's consumer and inbox, and deletes the
-synchronous path in the same commit so the two are never live at once. Two settings are deliberately
-temporary and are recorded in `docs/KNOWN-ISSUES.md` rather than left in code comments: publishing is
-`mandatory: false` because no queue is bound yet, and only `Confirmed` orders publish because stock is
-already held by the time the row is written.
-`src/AgenticShop.Ordering/docs/DECISIONS.md` → O19.
+**Reservation is asynchronous now.** `POST /orders` resolves the basket against Catalog, writes the
+order as `Pending` and queues `OrderPlaced` in the *same* transaction, then answers **202** with a
+`Location` to poll. Stock consumes the event, takes every line of the order or none of them, and
+answers with `StockCommitted` or `StockReservationRejected` through an outbox of its own; Ordering
+consumes that and settles the order, `Pending → Confirmed` or `Pending → Failed`. A repeated
+idempotency key replays the order's *current* state — 202 while it is still `Pending`, 200 once it has
+settled — because replaying a recorded 202 would keep telling a client that work is in flight after it
+finished. What the key still guarantees exactly is the part that matters: a retry never places a
+second order.
 
-**Both consumers now exist and neither is registered.** Stock consumes `OrderPlaced`, holds an order's
-lines or none of them, and answers with `StockCommitted` or `StockReservationRejected` through an outbox
-of its own; Ordering consumes those outcomes and settles the order, `Pending → Confirmed` or
-`Pending → Failed`. Both are tested end to end against a real broker — the test host registers them,
-`Program.cs` does not — so the synchronous reserve is still the only path live and nothing can
-double-hold. That is also why the flip has to be one commit: registering a consumer while the
-synchronous path still runs would reserve every order twice.
+Writing the order first is what closed the dual-write residual the synchronous path carried. That path
+could only write the row last, already terminal, by calling Stock first — so a crash mid-confirm left
+Stock holding committed reservations for an order id that was never written. Now a crash after the
+commit leaves an order that can still be fulfilled.
 
-Two consequences worth knowing before reading the code. Stock's all-or-nothing hold makes the outcome
-binary, so `PartiallyConfirmed` is unreachable from the event path and O14's confirm-phase policy has
-no equivalent there. And an order whose outcome never arrives stays `Pending` forever — there is no
-timeout or poller, because the reservation-expiry worker is Phase 3; the residual and the query that
-finds such an order are in `docs/KNOWN-ISSUES.md`.
-`src/AgenticShop.Stock/docs/DECISIONS.md` → D16 · `src/AgenticShop.Ordering/docs/DECISIONS.md` → O20.
+Verified end to end through the compose stack, which is the only place all three services and the
+broker meet: 202 with `status: Pending`, then `Confirmed` on a poll, `quantity_on_hand` 10 → 7 with
+`reserved` back to 0, and one inbox row plus one drained outbox row on each side.
+
+Three consequences worth knowing before reading the code. Stock's all-or-nothing hold makes the
+outcome binary, so `PartiallyConfirmed` is unreachable from the event path and O14's confirm-phase
+policy has no equivalent there — it survives only for rows the old path wrote. `mandatory` is now
+`true` on both publishers, so an event with no bound queue fails loudly instead of vanishing; the
+consequence is that a producer's outbox backs up while its consumer is down. And an order whose
+outcome never arrives stays `Pending` forever: there is no timeout or poller, because the
+reservation-expiry worker is Phase 3, and the query that finds such an order is in
+`docs/KNOWN-ISSUES.md`.
+`src/AgenticShop.Stock/docs/DECISIONS.md` → D16 ·
+`src/AgenticShop.Ordering/docs/DECISIONS.md` → O19, O20.
 
 **Phase 3 — Data and scale**
 Redis caching and idempotency store · reservation-expiry worker · read models ·

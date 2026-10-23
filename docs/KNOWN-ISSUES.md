@@ -162,28 +162,30 @@ design avoids — so they are excluded from the Phase 1 shared-library extractio
 
 ### Cross-service consistency
 
-**A confirm-phase failure strands stock, and a process crash can orphan it.** *Medium · Phase 2.*
-Stock's `Confirmed` is terminal (Stock decision D3) and confirm decrements `quantity_on_hand`, so a
-confirm that fails part-way through has no clean undo. Ordering records the outcome as a terminal
-`PartiallyConfirmed` order and answers 502; the policy and its classification table are in
-`src/AgenticShop.Ordering/docs/DECISIONS.md` → **O14** and that service's `ARCHITECTURE.md` §5.
+**The confirm phase is gone, and with it both residuals this entry used to carry.** *Closed
+2026-10-23.* Stock's `Confirmed` is still terminal (Stock decision D3) and confirming still decrements
+`quantity_on_hand`, but nothing outside Stock confirms anything any more: Ordering no longer calls it,
+and Stock's consumer reserves and confirms in one transaction. There is no part-way-through state, so
+there is nothing to strand and nothing to undo — which is also why O14's classification table and
+`PartiallyConfirmed` have no equivalent on the event path.
 
-Two residuals, both accepted for Phase 0:
+The two residuals, and what became of each:
 
-- **A release that fails during compensation leaves the hold in place** until Phase 3's expiry
-  worker. Detectable per order through Stock's `GET /api/v1/reservations?orderId=`.
-- **If the Ordering process dies mid-confirm there is no order row at all**, because the row is
-  written once at the end of placement. Stock then holds confirmed reservations against an order id
-  that exists in neither database's queryable surface, and the endpoint above cannot find it either
-  — `orderId` is required. Discovery needs a cross-database query for reservation order ids with no
-  matching order. This is the dual-write problem. Ordering's outbox now exists and closes the
-  *event-delivery* half of it; this residual is the other half, and it closes when Phase 2b writes the
-  order as `Pending` before reserving rather than once, already terminal, afterwards.
+- *A release that fails during compensation leaves the hold in place.* There is no compensation. An
+  all-or-nothing hold has no partial state to release, and Ordering has no client left to release
+  with.
+- *If the Ordering process dies mid-confirm there is no order row at all.* This was the dual-write
+  problem, and it is **closed rather than mitigated**: the order row is now written *first*, as
+  `Pending`, in the same transaction as the `OrderPlaced` outbox row. A crash after that commit leaves
+  an order that can still be fulfilled instead of stock committed against an order id that exists in
+  neither database's queryable surface. Discovery no longer needs a cross-database query for
+  reservation order ids with no matching order.
 
-Neither can oversell. Confirm decrements both counters and release decrements only `reserved`, so
-`reserved <= quantity_on_hand` holds on every path including the failing ones. The exposure is
-inventory *under*-availability, not negative stock — which is what makes both residuals survivable
-while no money moves.
+Neither could oversell, and neither can now: reserve and confirm are one transaction, so
+`reserved <= quantity_on_hand` holds on every path including the failing ones. What replaced the old
+exposure is a different and milder one — an order accepted and never settled — and it is listed under
+Messaging below. The old shape lost a row entirely and was invisible without joining two databases;
+the new one leaves a findable row that says exactly what is wrong.
 
 ### Messaging
 
@@ -222,14 +224,19 @@ escape `ExecuteAsync` would be caught in Stock and not in Ordering. The assembly
 test reading both implementations, so parity means two tests asserting the same list; only one list is
 complete.
 
-**An order whose outcome never arrives stays `Pending` forever.** *Medium · Phase 3.* If Stock's
-consumer drops a message — it does, after losing the `stock_items` concurrency race twice, because
-there is no dead-letter queue to put it in — Ordering never hears the outcome and the order is
-stranded. Nothing resolves it: there is no timeout, no poller and no worker other than the two message
-pumps. Accepted rather than overlooked, because the fix is Phase 3's reservation-expiry worker and
-building a timer now would be the repository's first piece of scheduling machinery. Until then a
-stranded order is findable by query (`status = 'Pending'` and `updated_at_utc IS NULL`, which is why
-that column is nullable rather than defaulted to the placement time) but not self-healing.
+**An order whose outcome never arrives stays `Pending` forever.** *Medium · Phase 3.* **This stopped
+being hypothetical when the synchronous path was deleted**: every order is now written `Pending` and
+depends on an outcome event to settle, so this is the live failure mode of the design rather than a
+corner of it. If Stock's consumer drops a message — it does, after losing the `stock_items`
+concurrency race twice, because there is no dead-letter queue to put it in — or if the outcome is lost
+on the way back, Ordering never hears and the order is stranded. Nothing resolves it: there is no
+timeout, no poller and no worker other than the two message pumps. Accepted rather than overlooked,
+because the fix is Phase 3's reservation-expiry worker and building a timer now would be the
+repository's first piece of scheduling machinery. Until then a stranded order is findable by query
+(`status = 'Pending'` and `updated_at_utc IS NULL`, which is why that column is nullable rather than
+defaulted to the placement time) but not self-healing. Note the asymmetry with the old residual this
+replaced: that one lost an order row entirely and was invisible without a cross-database query, while
+this one leaves a findable row that says exactly what is wrong.
 
 **The outcome consumer trusts Stock's echo of the lines.** *Low.* `StockCommitted` carries the product
 ids and quantities Stock held, and the consumer transitions the order without reconciling them against
@@ -284,13 +291,14 @@ was deliberately not solved with a cleanup worker nothing has asked for — but 
 decision deferred by omission rather than by choice, so it is recorded here instead of being left for
 whoever first notices a slow query. Phase 3's data work is where it belongs.
 
-**Publishing is `mandatory: false`, and 2b must flip it.** *Medium · Phase 2b.* With no queue bound to
-`agenticshop.orders`, a mandatory publish would come back as `basic.return`, surface as a
-`PublishException`, and leave the row unpublished to be retried forever — so `false` is correct today
-and messages are accepted and discarded. The risk is that it stays `false`: once a consumer binds a
-queue, `mandatory: true` is what turns a missing or mis-keyed binding into a loud failure instead of an
-event that silently goes nowhere. Recorded because a flag whose correct value depends on a later
-increment is exactly what gets forgotten, and the failure it prevents is invisible by construction.
+**`mandatory: true` makes a consumer's downtime back up the producer's outbox.** *Info.* Both
+publishers now publish as mandatory, which is correct — an event with no bound queue fails loudly
+instead of vanishing, and before the flip it did vanish. The cost is the mirror image: while a
+consumer is down its queue is unbound, so every publish returns as `basic.return`, surfaces as a
+`PublishException`, and leaves its row unpublished. Combined with the head-of-line blocking above,
+that means one unrouteable row holds up everything behind it until the consumer returns. Nothing is
+lost and everything drains afterwards, which is the outbox doing its job; what it looks like from the
+outside is a producer logging warnings for as long as its consumer is down.
 
 **RabbitMQ 4 rejects a transient non-exclusive queue.** *Info.* Declaring one closes the channel with
 `code=541 INTERNAL_ERROR — Feature 'transient_nonexcl_queues' is deprecated`. Found by a failing test
