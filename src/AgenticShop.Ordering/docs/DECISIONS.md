@@ -66,9 +66,15 @@ written exactly once, after reservation, confirmation and reconciliation have al
 written already terminal. `Pending` stays in the enum and in the `CHECK` as the construction state and
 for Phase 2's saga.
 
-**Consequence accepted.** A status that is never persisted is odd on its face, and
-`APersistedOrderIsAlwaysTerminalBecauseNothingWritesItAsPending` exists so the oddity is asserted
-rather than discovered.
+**Consequence accepted.** A status that is never persisted is odd on its face, and three tests assert
+the oddity rather than leaving it to be discovered: `PendingIsTheOnlyNonTerminalStatus` on the enum,
+`NoOrderIsEverPersistedAsPending` over the API, and `NoOrderIsWrittenAsPendingWhateverHappens` across
+the confirm-failure paths.
+
+This entry used to cite `APersistedOrderIsAlwaysTerminalBecauseNothingWritesItAsPending`. No test of
+that name has ever existed — it appears nowhere in the repository except in the sentence that cited
+it. Corrected 2026-10-23 against the three above, which do exist and between them cover the enum, the
+API and the failure paths.
 
 ## O4 · `OrderNumber` is derived, not sequenced
 

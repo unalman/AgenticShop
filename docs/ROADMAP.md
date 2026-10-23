@@ -192,14 +192,22 @@ Verified at closure: `dotnet build` clean under `TreatWarningsAsErrors`; **519 t
 - Replace synchronous reservation with events: `OrderPlaced` → Stock consumes → `StockReserved` /
   `StockReservationRejected`
 - **Outbox pattern** — only justified now, because it exists to make "write a row and publish an
-  event" atomic. The design is already outbox-ready: every write path is a single
-  `SaveChangesAsync`, so an entity and an outbox row would already be atomic
+  event" atomic. **Correction to what this bullet used to claim:** the design is *nearly*
+  outbox-ready, but placement is not a single `SaveChangesAsync`. Ordering runs two — the
+  idempotency claim at `OrderPlacer.cs:101`, before any reservation happens, and the order + lines
+  + key completion at `:436`. An outbox row is atomic with the order only in the second, which is
+  where it belongs; the claim transaction holds no order row to be atomic with
 - **Inbox** for consumer-side deduplication. Prerequisite: the Phase 2 event contracts must carry
   a stable message id from the start — cheap to decide then, expensive to retrofit
 - Saga / process manager in Ordering owning the order lifecycle and compensation — including
   driving Phase 0's terminal `PartiallyConfirmed` orders to a resolved state, which a synchronous
   orchestrator with no worker can only record. It also makes a persisted `Pending` order the normal
-  case, which needs the migration Phase 0 deliberately did not write
+  case. **Correction:** that needs no status migration. `Pending` is already an `OrderStatus`
+  member, already listed in `ck_orders_status_known`, already emitted verbatim by the initial
+  migration, and already what `Order.Create` sets — Phase 0 wrote the vocabulary and simply never
+  persisted it, and `ContractSchemaAlignmentTests` keeps enum and CHECK in step. What a saga does
+  need is the outbox table, plus `UpdatedAtUtc` and a live `xmin` on `Order` if it updates rows
+  rather than writing each one once
 - Dead-letter queues, retry policies, at-least-once semantics
 - Closes the dual-write orphan residual: a process death mid-confirm currently leaves Stock holding
   reservations for an order row that was never written — `KNOWN-ISSUES.md` → "Cross-service

@@ -812,7 +812,7 @@ Each was considered and declined, with the phase that would justify it:
 | Declined | Why not yet |
 |---|---|
 | RabbitMQ / any broker | Nothing is asynchronous |
-| Outbox / Inbox | An outbox makes "write a row and publish an event" atomic; there are no events. Note the design is already outbox-ready: every write path is a single `SaveChangesAsync`, so an entity and an outbox row would already be atomic. Stock's reserve commits the counter and the reservation row together, which is the same property |
+| Outbox / Inbox | An outbox makes "write a row and publish an event" atomic; there are no events. The design is *nearly* outbox-ready — and less so than this row claimed until it was checked on 2026-10-23. Ordering's placement runs **two** `SaveChangesAsync` calls: the idempotency claim at `OrderPlacer.cs:101`, before any reservation, and the order + lines + key completion at `:436`. An outbox row is therefore atomic with the order only in the second save, which is where it belongs; the claim transaction holds no order row to be atomic with. Stock's reserve genuinely is one save, committing the counter and the reservation row together |
 | Redis | No cache pressure, no distributed idempotency store to hold |
 | Authentication / authorization | Deferred by the project owner. Adding it later needs a customer identity column on `Order` plus a cross-cutting policy — a migration and a concern, which is why no placeholder seam was pre-built |
 | Kubernetes / Helm, YARP gateway | Phase 4 |

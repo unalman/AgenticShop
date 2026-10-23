@@ -44,7 +44,7 @@ jobs:
       - name: Build
         run: dotnet build AgenticShop.slnx --configuration Release
 
-      # 517 tests. The 180 integration tests need Docker, which ubuntu-latest provides, and they
+      # 519 tests. The 182 integration tests need Docker, which ubuntu-latest provides, and they
       # need nothing else: each project starts its own PostgreSQL through Testcontainers. No compose
       # stack and no `services:` block belongs here — the harness was verified isolated by running it
       # with `docker compose stop db`, and starting compose would only compete for the same ports.
