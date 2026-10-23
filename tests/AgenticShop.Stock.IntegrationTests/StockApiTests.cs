@@ -146,37 +146,6 @@ public sealed class StockApiTests(StockApiFixture fixture) : IAsyncLifetime
     }
 
     [Fact]
-    public async Task UpdateStock_BelowWhatIsReserved_Returns400()
-    {
-        var productId = Guid.NewGuid();
-        await CreateStockAsync(productId, 10);
-        await ReserveAsync(productId, Guid.NewGuid(), 6);
-
-        var response = await Client.PutAsJsonAsync($"{StockUrl}/{productId}", new UpdateStockRequest(5));
-
-        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
-        (await ReadJsonAsync<ProblemDetails>(response)).Detail.Should().BeNull(
-            "the domain message names internal parameters and is formatted with the server culture");
-    }
-
-    [Fact]
-    public async Task UpdateStock_DownToExactlyWhatIsReserved_Succeeds()
-    {
-        var productId = Guid.NewGuid();
-        await CreateStockAsync(productId, 10);
-        await ReserveAsync(productId, Guid.NewGuid(), 6);
-
-        var response = await Client.PutAsJsonAsync($"{StockUrl}/{productId}", new UpdateStockRequest(6));
-
-        response.StatusCode.Should().Be(HttpStatusCode.OK);
-
-        var updated = await ReadJsonAsync<StockResponse>(response);
-
-        updated.QuantityOnHand.Should().Be(6);
-        updated.Available.Should().Be(0);
-    }
-
-    [Fact]
     public async Task UpdateStock_ForAnUnknownProduct_Returns404()
     {
         var response = await Client.PutAsJsonAsync($"{StockUrl}/{Guid.NewGuid()}", new UpdateStockRequest(1));
@@ -272,17 +241,6 @@ public sealed class StockApiTests(StockApiFixture fixture) : IAsyncLifetime
         response.StatusCode.Should().Be(HttpStatusCode.Created, "the stock record should have been created");
 
         return await ReadJsonAsync<StockResponse>(response);
-    }
-
-    internal async Task<ReservationResponse> ReserveAsync(Guid productId, Guid orderId, int quantity)
-    {
-        var response = await Client.PostAsJsonAsync(
-            $"{StockUrl}/{productId}/reservations",
-            new ReserveStockRequest(orderId, quantity));
-
-        response.StatusCode.Should().Be(HttpStatusCode.Created, "the reservation should have been created");
-
-        return await ReadJsonAsync<ReservationResponse>(response);
     }
 
     /// <summary>

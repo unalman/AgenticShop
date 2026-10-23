@@ -44,7 +44,7 @@ public class RequestContractCoverageTests
         // would match nothing and pass without proving anything.
         ContractTypes
             .Count(t => t.IsClass && t.Name.EndsWith("Request", StringComparison.Ordinal))
-            .Should().BeGreaterThanOrEqualTo(3);
+            .Should().BeGreaterThanOrEqualTo(2);
     }
 
     [Fact]
@@ -52,7 +52,6 @@ public class RequestContractCoverageTests
     {
         typeof(IRequestContract).IsAssignableFrom(typeof(SetStockRequest)).Should().BeTrue();
         typeof(IRequestContract).IsAssignableFrom(typeof(UpdateStockRequest)).Should().BeTrue();
-        typeof(IRequestContract).IsAssignableFrom(typeof(ReserveStockRequest)).Should().BeTrue();
     }
 
     [Fact]
@@ -61,6 +60,5 @@ public class RequestContractCoverageTests
         // The marker means "validate me on the way in". Asserting it on responses too would be
         // noise, so this documents the boundary of the rule rather than extending it.
         typeof(IRequestContract).IsAssignableFrom(typeof(StockResponse)).Should().BeFalse();
-        typeof(IRequestContract).IsAssignableFrom(typeof(ReservationResponse)).Should().BeFalse();
     }
 }

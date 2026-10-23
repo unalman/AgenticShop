@@ -15,12 +15,10 @@ namespace AgenticShop.Stock.Messaging;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Not registered in <c>Program.cs</c> yet.</b> This increment adds the consumer and proves it
-/// against a real broker, but the synchronous <c>POST /api/v1/stock/{productId}/reservations</c> path
-/// is still the only one live, so Ordering's placement behaves exactly as it did. Both paths reserving
-/// at once would double-hold every order. The next increment registers this, deletes the synchronous
-/// reserve, and moves Ordering's emission point — in one commit, so there is no state in between where
-/// both are wired.
+/// <b>This is the only way stock moves.</b> The synchronous <c>POST /api/v1/stock/{productId}/reservations</c>
+/// path is gone, so there is no second writer that could double-hold an order, and the only other
+/// writer of <c>stock_items</c> is <c>PUT /api/v1/stock/{productId}</c> replacing the physical count —
+/// a race this consumer's <c>xmin</c> token resolves, covered by <c>ConsumerStockContentionTests</c>.
 /// </para>
 /// <para>
 /// <b>Everything is one transaction or nothing.</b> The inbox row, the reservations, the counter

@@ -44,8 +44,8 @@ builder.Services.AddExceptionHandler<StockExceptionHandler>();
 
 // Both halves of the messaging path, registered together because neither works alone: the consumer
 // writes outcome rows that only the publisher drains, and a publisher with nothing writing rows is
-// idle. This is the registration that makes the event path live — until it, the synchronous reserve
-// endpoint was the only way stock moved, and the two must never both be wired.
+// idle. The consumer is the only way stock moves now — the synchronous reserve endpoint is gone, so
+// there is no second path that could double-hold an order.
 //
 // Neither may let an exception escape ExecuteAsync. An unhandled exception in a hosted service stops
 // the host, so a broker outage would take down an API that can still answer every read and still
@@ -103,7 +103,6 @@ if (app.Environment.IsDevelopment())
 }
 
 app.MapStockEndpoints();
-app.MapReservationEndpoints();
 
 app.Run();
 

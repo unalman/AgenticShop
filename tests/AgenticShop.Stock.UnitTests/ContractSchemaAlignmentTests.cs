@@ -126,7 +126,7 @@ public class ContractSchemaAlignmentTests
             }
         }
 
-        checkedProperties.Should().BeGreaterThanOrEqualTo(3, "the check must not pass vacuously");
+        checkedProperties.Should().BeGreaterThanOrEqualTo(2, "the check must not pass vacuously");
     }
 
     [Fact]
