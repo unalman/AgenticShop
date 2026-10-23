@@ -74,8 +74,9 @@ docker compose exec db bash /usr/local/bin/verify-db-isolation   # 22 checks; no
 ## 4. Technology
 
 .NET 10 (`net10.0`) · ASP.NET Core **Minimal APIs**, no controllers · PostgreSQL 17 via EF Core ·
-RabbitMQ 4 in compose (nothing publishes to it yet) · xunit + FluentAssertions with Testcontainers ·
-`.slnx`. The full stack, its versions and where each is pinned: `docs/TECHNOLOGY.md`.
+RabbitMQ 4 in compose, which Ordering publishes to through an outbox · xunit + FluentAssertions with
+Testcontainers · `.slnx`. The full stack, its versions and where each is pinned:
+`docs/TECHNOLOGY.md`.
 
 - **`TreatWarningsAsErrors` is on.** A warning fails the build. Fix it; do not suppress it.
 - All package versions live in `Directory.Packages.props`; a `PackageReference` must omit
@@ -214,7 +215,7 @@ each deferral, including the few with no assigned phase: `docs/DECISIONS.md`.
 
 **Still deferred — do not add:**
 
-**Outbox / Inbox · Redis · authentication / authorization · Kubernetes / Helm · API gateway (YARP) ·
+**Inbox · Redis · authentication / authorization · Kubernetes / Helm · API gateway (YARP) ·
 CQRS · DDD tactical patterns · event sourcing.**
 
 Also do not add at this size: repository or service layers, an `Application` layer, a mediator,
@@ -236,8 +237,16 @@ compose's opt-in `full` profile (→ "One Dockerfile for three services") · **a
 "CI as a drift gate, not a deployment pipeline") · **RabbitMQ in compose** — in the **default**
 profile, not `full`, because a broker has no host-process equivalent and no port to collide with, so
 `dotnet watch` keeps working and gains something to publish to (→ "RabbitMQ, in compose's default
-profile"). Nothing else on the list above has been unblocked; the outbox and inbox stay deferred
-until a message actually flows.
+profile").
+
+**Also permitted, because a message now flows:** the **outbox, producer side only** — Ordering writes
+an event row inside the order's own `SaveChangesAsync` and a hosted publisher drains it to a durable
+topic exchange with publisher confirms on (Ordering decision **O19**). The **inbox stays deferred**:
+nothing consumes a message yet, so there is no delivery to deduplicate. So are the saga, dead-letter
+queues and consumer retry — each needs a consumer to be for. Two settings are deliberately temporary
+and listed in `docs/KNOWN-ISSUES.md`: `mandatory: false`, because no queue is bound yet, and
+Confirmed-only emission, because reservation is still synchronous. Nothing else on the list above has
+been unblocked.
 
 Three of those carry a rule that is easy to get wrong, and only one of them is fully test-guarded.
 **Do not extend retry to another outbound call before reading O18** — the exemption on reserve is what

@@ -32,6 +32,13 @@
     <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.19.1" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.19.0" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.Http" Version="1.19.0" />
+    <!--
+      7.x is a rewrite, not an increment: IModel became IChannel, the whole surface is async, and
+      BasicProperties is instantiated directly rather than obtained from the channel. Nothing in
+      this repository used 6.x, so there is no migration to perform — but a snippet found online
+      is more likely than not to be 6.x and will not compile here.
+    -->
+    <PackageVersion Include="RabbitMQ.Client" Version="7.2.2" />
     <PackageVersion Include="Scalar.AspNetCore" Version="2.17.8" />
     <PackageVersion Include="Serilog.AspNetCore" Version="10.0.0" />
   </ItemGroup>
@@ -41,6 +48,13 @@
     <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.12" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageVersion Include="Testcontainers.PostgreSql" Version="4.15.0" />
+    <!--
+      Held at 4.15.0 to match Testcontainers.PostgreSql rather than floated to the latest. The 4.16.0
+      release asks for Testcontainers >= 4.16.0, so taking it would drag the shared core assembly up
+      under the PostgreSQL harness that the whole suite already runs on; 4.15.0 asks for >= 4.15.0
+      and changes nothing. Verified against the published dependency list, not assumed.
+    -->
+    <PackageVersion Include="Testcontainers.RabbitMQ" Version="4.15.0" />
     <PackageVersion Include="xunit" Version="2.9.3" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.4" />
   </ItemGroup>

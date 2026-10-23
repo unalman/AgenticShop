@@ -1,7 +1,10 @@
+using System.Diagnostics;
+using System.Text.Json;
 using AgenticShop.Ordering.Clients;
 using AgenticShop.Ordering.Contracts;
 using AgenticShop.Ordering.Data;
 using AgenticShop.Ordering.Domain;
+using AgenticShop.Ordering.Messaging;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 
@@ -433,9 +436,51 @@ public sealed class OrderPlacer(
         claim.Complete(order.Id, statusCode);
 
         db.Orders.Add(order);
+
+        // Written here rather than published here, so the event joins the order's transaction and
+        // the two cannot disagree. OutboxPublisher drains it afterwards.
+        if (status == OrderStatus.Confirmed)
+        {
+            db.OutboxMessages.Add(CreateOrderPlacedMessage(order));
+        }
+
         await db.SaveChangesAsync(NotCancellable);
 
         return order;
+    }
+
+    /// <summary>
+    /// Builds the outbox row for a placed order.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Only <see cref="OrderStatus.Confirmed"/> publishes, and that condition is deliberately
+    /// temporary.</b> In this increment reservation has already happened synchronously by the time
+    /// <see cref="WriteAsync"/> runs, so a <see cref="OrderStatus.Failed"/> order was never placed,
+    /// and a <see cref="OrderStatus.PartiallyConfirmed"/> one already holds stock a consumer must not
+    /// reserve a second time. When reservation moves behind the event the rule inverts: the row is
+    /// written at acceptance, before any hold exists, and the saga decides the outcome. What survives
+    /// that change is the contract and this row's place inside the order's transaction; what does not
+    /// is the <c>if</c> around it.
+    /// </para>
+    /// <para>
+    /// The traceparent is captured here rather than in the publisher because this is the last point at
+    /// which there is a request to capture it from. The publisher runs on a background loop with no
+    /// ambient <see cref="Activity"/>, so reading it there would silently publish an untraceable
+    /// message — and the gap would only be visible in a trace nobody thought to look at.
+    /// </para>
+    /// </remarks>
+    private static OutboxMessage CreateOrderPlacedMessage(Order order)
+    {
+        var messageId = Guid.NewGuid();
+
+        return OutboxMessage.Create(
+            messageId,
+            OrderEventTopology.Exchange,
+            OrderEventTopology.OrderPlacedRoutingKey,
+            JsonSerializer.Serialize(OrderPlaced.From(order, messageId), OrderPlaced.JsonOptions),
+            Activity.Current?.Id,
+            DateTimeOffset.UtcNow);
     }
 
     private sealed record WantedLine(Guid ProductId, int Quantity);

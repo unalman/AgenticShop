@@ -207,12 +207,18 @@ Verified at closure: `dotnet build` clean under `TreatWarningsAsErrors`; **519 t
   reachable off-machine.
 - Replace synchronous reservation with events: `OrderPlaced` → Stock consumes → `StockReserved` /
   `StockReservationRejected`
-- **Outbox pattern** — only justified now, because it exists to make "write a row and publish an
-  event" atomic. **Correction to what this bullet used to claim:** the design is *nearly*
-  outbox-ready, but placement is not a single `SaveChangesAsync`. Ordering runs two — the
-  idempotency claim at `OrderPlacer.cs:101`, before any reservation happens, and the order + lines
-  + key completion at `:436`. An outbox row is atomic with the order only in the second, which is
-  where it belongs; the claim transaction holds no order row to be atomic with
+- ~~**Outbox pattern.**~~ **Done on the producer side (2026-10-23).** An `outbox_messages` table, an
+  `OutboxPublisher` hosted service and an `OrderPlaced` contract — carrying the stable message id
+  this bullet called cheap to decide now and expensive to retrofit. The row joins the order's own
+  `SaveChangesAsync`, so the two commit together or not at all. Nothing consumes the message yet and
+  reservation is still synchronous; 2b adds the consumer and deletes the sync path in one commit.
+  `src/AgenticShop.Ordering/docs/DECISIONS.md` → **O19**.
+  **Correction to what this bullet used to claim:** the design was *nearly* outbox-ready, but
+  placement is not a single `SaveChangesAsync`. Ordering runs two — the idempotency claim in
+  `ClaimAsync`, before any reservation happens, and the order + lines + key completion in
+  `WriteAsync`. An outbox row is atomic with the order only in the second, which is where it went;
+  the claim transaction holds no order row to be atomic with. Both saves are cited by method name
+  rather than line number now, because implementing this bullet moved them
 - **Inbox** for consumer-side deduplication. Prerequisite: the Phase 2 event contracts must carry
   a stable message id from the start — cheap to decide then, expensive to retrofit
 - Saga / process manager in Ordering owning the order lifecycle and compensation — including

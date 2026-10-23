@@ -22,6 +22,7 @@ Everything here describes the verified current state.
 | Web | ASP.NET Core **Minimal APIs** — no controllers | 10.0.12 |
 | Database | PostgreSQL, image `postgres:17-alpine` | 17 |
 | Broker | RabbitMQ, image `rabbitmq:4-alpine` — arrived in Phase 2 | 4 |
+| Messaging | `RabbitMQ.Client` — Ordering only, the sole service that publishes. 7.x is a rewrite of 6.x (`IModel` → `IChannel`, fully async) | 7.2.2 |
 | ORM / provider | EF Core / `Npgsql.EntityFrameworkCore.PostgreSQL` | 10.0.12 / 10.0.3 |
 | Naming | `EFCore.NamingConventions` → snake_case | 10.0.1 |
 | API docs | `Microsoft.AspNetCore.OpenApi` + `Scalar.AspNetCore` | 10.0.12 / 2.17.8 |
@@ -31,7 +32,7 @@ Everything here describes the verified current state.
 | Health | ASP.NET Core health checks (framework) + `…HealthChecks.EntityFrameworkCore` for the database check | 10.0.12 |
 | Containers | Docker / Compose | 29.9.2 / 5.6.1 |
 | Service images | `mcr.microsoft.com/dotnet/sdk` (build) → `…/aspnet` (runtime). One Dockerfile for all three services, parameterised by project name; tags float the minor | 10.0 |
-| Test DB / host | `Testcontainers.PostgreSql` / `Mvc.Testing` | 4.15.0 / 10.0.12 |
+| Test DB / host | `Testcontainers.PostgreSql` + `Testcontainers.RabbitMQ` / `Mvc.Testing` | 4.15.0 / 10.0.12 |
 | Tests | xunit + FluentAssertions | 2.9.3 / 8.11.0 |
 | Solution | `.slnx` | — |
 

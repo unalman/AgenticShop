@@ -3,6 +3,7 @@ using AgenticShop.Ordering.Data;
 using AgenticShop.Ordering.Endpoints;
 using AgenticShop.Ordering.Errors;
 using AgenticShop.Ordering.Health;
+using AgenticShop.Ordering.Messaging;
 using AgenticShop.Shared.Health;
 using AgenticShop.Shared.Logging;
 using AgenticShop.Shared.Middleware;
@@ -65,6 +66,13 @@ builder.Services
 // SaveChangesAsync.
 builder.Services.AddScoped<OrderPlacer>();
 
+// The repository's first hosted service. Registered rather than started by hand so the host owns its
+// lifetime and stops it on shutdown, which is what lets the publisher drain in-flight work instead of
+// being killed mid-publish. It must never be allowed to throw out of ExecuteAsync: an unhandled
+// exception in a hosted service stops the whole host, so a broker outage would take down an API that
+// can still serve reads and still write outbox rows.
+builder.Services.AddHostedService<OutboxPublisher>();
+
 builder.Services.AddProblemDetails();
 builder.Services.AddExceptionHandler<OrderingExceptionHandler>();
 
@@ -114,6 +122,13 @@ RequireConnectionString(app.Configuration);
 // reserved. Refusing to start is strictly better than compensating for a configuration typo.
 RequireServiceBaseUrl(app.Configuration, "Catalog");
 RequireServiceBaseUrl(app.Configuration, "Stock");
+
+// Same reasoning, and it is the publisher's turn to be covered: a missing or malformed broker URL
+// would otherwise surface as a warning from a background loop every five seconds rather than as a
+// startup failure naming the key that is wrong. Note this validates the *configuration*, not the
+// connection — Ordering must still start when the broker is down, because the outbox exists precisely
+// so that a placement can be written while the broker is unreachable.
+OutboxPublisher.RequireBrokerUrl(app.Configuration);
 
 // Correlation id first so failures raised by later middleware still carry it. The middleware also
 // makes the id ambient for every log line of the request, which is why it has to be out here — and

@@ -868,7 +868,7 @@ Each was considered and declined, with the phase that would justify it:
 
 | Declined | Why not yet |
 |---|---|
-| Outbox / Inbox | An outbox makes "write a row and publish an event" atomic; there are no events. The design is *nearly* outbox-ready — and less so than this row claimed until it was checked on 2026-10-23. Ordering's placement runs **two** `SaveChangesAsync` calls: the idempotency claim at `OrderPlacer.cs:101`, before any reservation, and the order + lines + key completion at `:436`. An outbox row is therefore atomic with the order only in the second save, which is where it belongs; the claim transaction holds no order row to be atomic with. Stock's reserve genuinely is one save, committing the counter and the reservation row together |
+| Inbox | Consumer-side deduplication. Nothing consumes a message yet, so there is no delivery to deduplicate. Its prerequisite is settled — `OrderPlaced` has carried a stable message id since the first event was designed, which is the part that was cheap to decide early and expensive to retrofit |
 | Redis | No cache pressure, no distributed idempotency store to hold |
 | Authentication / authorization | Deferred by the project owner. Adding it later needs a customer identity column on `Order` plus a cross-cutting policy — a migration and a concern, which is why no placeholder seam was pre-built |
 | Kubernetes / Helm, YARP gateway | Phase 4 |
@@ -922,3 +922,19 @@ outbox and the event contracts are the next increment and neither can be written
 that does not exist. Those two rows stay on the table above. See "RabbitMQ, in compose's default
 profile" for the shape it arrived in, including the `administrator` tag it accepts and the credential
 guard hole it exposed.
+
+**The outbox was on this list until Phase 2 opened it too, one increment behind the broker.** Added
+2026-10-23 on Ordering's producer side only: `outbox_messages`, an `OutboxPublisher` hosted service
+and an `OrderPlaced` contract. Nothing consumes the message and reservation is still synchronous, so
+a placement behaves exactly as it did before — see
+`src/AgenticShop.Ordering/docs/DECISIONS.md` → **O19**. The sequencing is the interesting part: the
+broker landed first precisely because an outbox without somewhere to publish is dead weight, and the
+outbox landed before any consumer because publishing without one is the dual-write bug it exists to
+prevent. Each arrived when the increment before it made it necessary, not before.
+
+The correction this row carried is worth keeping now that the outbox exists, because it changed where
+the row went. Placement runs **two** `SaveChangesAsync` calls: the idempotency claim in `ClaimAsync`,
+before any reservation, and the order + lines + key completion in `WriteAsync`. An outbox row is
+atomic with the order only in the second, which is where it is written; the claim transaction holds no
+order row to be atomic with. Stock's reserve genuinely is one save, committing the counter and the
+reservation row together.

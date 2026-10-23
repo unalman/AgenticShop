@@ -54,6 +54,39 @@ public class ComposeConfigurationTests
             .Should().Be(TestPostgreSql.Image);
     }
 
+    /// <summary>
+    /// The broker's tag, guarded the same way the database's is.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This test exists in Ordering's copy <b>only</b>, and the asymmetry is deliberate rather than
+    /// an omission in the other two. <see cref="TestRabbitMq"/> lives here because Ordering is the
+    /// only service with a broker container in its test harness; Catalog and Stock have no such
+    /// constant to drift from, so copying this test to them would assert nothing and pass vacuously —
+    /// the failure mode <c>AGENTS.md</c> §10 warns about for guards that match nothing.
+    /// </para>
+    /// <para>
+    /// It was added because the alternative had already happened: <see cref="TestRabbitMq"/>'s
+    /// remarks claimed this guard existed before it did. A documented guard that is not enforced is
+    /// worse than no documentation, because it stops anyone looking.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void TheComposeBrokerImageMatchesTheOneTheTestsRunAgainst()
+    {
+        var images = DeclaredImages();
+
+        images.Should().ContainSingle(
+            image => image.StartsWith("rabbitmq:", StringComparison.Ordinal),
+            "docker-compose.yml declares exactly one RabbitMQ image");
+
+        images.Single(image => image.StartsWith("rabbitmq:", StringComparison.Ordinal))
+            .Should().Be(TestRabbitMq.Image,
+                "a broker version drift between compose and the messaging tests shows up as a client " +
+                "incompatibility rather than as a failing assertion, which is quieter than the " +
+                "database equivalent and therefore worth the same two lines");
+    }
+
     [Fact]
     public void TheDatabasePortIsPublishedOnTheLoopbackInterfaceOnly()
     {

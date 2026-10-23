@@ -217,8 +217,36 @@ that only has `10.0.1xx`. Deliberate for reproducibility, but it will surprise a
 
 **`CentralPackageTransitivePinningEnabled` is repo-wide.** *Info.* Any future `PackageVersion`
 entry also overrides transitive versions of that package everywhere, so adding a direct reference
-can silently shift a transitive dependency elsewhere. Contained today because only EF Core packages
-are declared.
+can silently shift a transitive dependency elsewhere. No longer confined to EF Core: Phase 2 added
+`RabbitMQ.Client`, which pulls `System.IO.Pipelines` and `System.Threading.RateLimiting`. Adding it
+raised no MSB3277 and the suite stayed green — but that was measured, not predicted, and the first
+package that pulls something EF Core also pulls has not happened yet.
+
+**The outbox never deletes a row.** *Medium · Phase 3.* `outbox_messages` grows without bound: one row
+per placed order, marked published and then kept. Nothing prunes it. That is fine at this scale and
+was deliberately not solved with a cleanup worker nothing has asked for — but it is a retention
+decision deferred by omission rather than by choice, so it is recorded here instead of being left for
+whoever first notices a slow query. Phase 3's data work is where it belongs.
+
+**Publishing is `mandatory: false`, and 2b must flip it.** *Medium · Phase 2b.* With no queue bound to
+`agenticshop.orders`, a mandatory publish would come back as `basic.return`, surface as a
+`PublishException`, and leave the row unpublished to be retried forever — so `false` is correct today
+and messages are accepted and discarded. The risk is that it stays `false`: once a consumer binds a
+queue, `mandatory: true` is what turns a missing or mis-keyed binding into a loud failure instead of an
+event that silently goes nowhere. Recorded because a flag whose correct value depends on a later
+increment is exactly what gets forgotten, and the failure it prevents is invisible by construction.
+
+**RabbitMQ 4 rejects a transient non-exclusive queue.** *Info.* Declaring one closes the channel with
+`code=541 INTERNAL_ERROR — Feature 'transient_nonexcl_queues' is deprecated`. Found by a failing test
+rather than by documentation, and 2b's consumer queue hits the same wall if it is declared
+`durable: false` without also being `exclusive: true`. A durable queue is the right answer anyway for
+a consumer that must not lose work between restarts.
+
+**The broker's image tag is declared in two places.** *Info.* `docker-compose.yml` and Ordering's
+`TestRabbitMq.Image`. Ordering's `ComposeConfigurationTests` fails if they diverge — the same
+arrangement as the PostgreSQL tag, which is declared in four places and guarded three times. Only
+Ordering guards the broker because only Ordering has a broker container; adding the test to Catalog or
+Stock would assert nothing and pass vacuously.
 
 **PostgreSQL image tag is declared in four places.** *Info.* `docker-compose.yml` plus one
 `TestPostgreSql.Image` per integration project. All three `ComposeConfigurationTests` fail if they

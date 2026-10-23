@@ -201,6 +201,18 @@ services:
       # after stock has been reserved.
       Services__Catalog__BaseUrl: "http://catalog:8080"
       Services__Stock__BaseUrl: "http://stock:8080"
+
+      # Compose DNS name `rabbitmq`, not localhost: inside the container localhost is the container
+      # itself. Credentials are substituted rather than written literally so
+      # ComposeConfigurationTests keeps holding for every credential line in this file.
+      RabbitMq__Url: "amqp://${RABBITMQ_DEFAULT_USER:?create a .env file from .env.example}:${RABBITMQ_DEFAULT_PASS:?create a .env file from .env.example}@rabbitmq:5672/"
+
+      # There is deliberately no `depends_on: rabbitmq` here, unlike catalog and stock above. Those
+      # are waited on because a placement that reaches them mid-request fails in a way the caller
+      # sees as the order's fault. The broker is different: the outbox absorbs an unreachable
+      # broker, so Ordering can serve every request it serves today with the broker down, and the
+      # publisher simply retries. Declaring the dependency would claim otherwise. Phase 2b, where
+      # reservation moves behind the event, is what makes it true — and is when it should be added.
     ports:
       - "127.0.0.1:5083:8080"
     healthcheck:

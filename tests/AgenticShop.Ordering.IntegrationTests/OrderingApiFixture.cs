@@ -90,6 +90,12 @@ public sealed class OrderingApiFixture : IAsyncLifetime
         // deliberately does not reference it, so a stranded claim can outlive the row it points at.
         // That means the delete order here is free, unlike order_lines → orders.
         await db.IdempotencyKeys.ExecuteDeleteAsync();
+
+        // Same shape, same reason: an outbox row carries a serialised payload and no key into
+        // orders, so nothing cascades and a row left behind would be republished by the next test's
+        // publisher against an order that no longer exists.
+        await db.OutboxMessages.ExecuteDeleteAsync();
+
         await db.OrderLines.ExecuteDeleteAsync();
         await db.Orders.ExecuteDeleteAsync();
 

@@ -443,6 +443,81 @@ exemption stops being the mechanism that keeps it safe.
 
 ---
 
+## O19 · The outbox, producer side only — **added 2026-10-23, Phase 2**
+
+**Decision.** `outbox_messages` table, an `OutboxPublisher` hosted service that drains it, and an
+`OrderPlaced` contract. The row is written inside the order's own `SaveChangesAsync`
+(`OrderPlacer.WriteAsync`), so the order and the event commit together or not at all. **Nothing
+consumes the message yet**, and the synchronous reserve/confirm path is untouched — that is Phase 2b,
+and both change in one commit so the two reservation paths are never live at once.
+
+**Why an outbox rather than publishing inline.** Publishing after the commit loses the event if the
+process dies in between; publishing before it can announce an order that never committed. Neither
+ordering is safe, and there is no way to make a broker participate in a PostgreSQL transaction. The
+row is what removes the choice: commit it with the order, publish it afterwards, and a crash leaves
+an unpublished row instead of a lost or phantom event. This is the dual-write problem, and the outbox
+is deferred infrastructure that a broker finally justified.
+
+**Why the message id is the outbox row's id, not the order's.** A consumer's inbox deduplicates on
+message identity. Keyed on the order id it would collide the moment a second event type exists for
+one order — `OrderConfirmed`, `OrderCancelled` — and two different messages would look like one
+delivery. The row id is also what the AMQP `messageId` property carries, set from the same value as
+the payload field so the two cannot disagree. This is the decision `docs/ROADMAP.md` calls cheap now
+and expensive to retrofit.
+
+**Why the traceparent is a column.** The correlation id is the W3C trace id and ASP.NET Core makes it
+ambient per request, but the publisher is a background loop with no request and therefore no
+`Activity`. Captured at write time — the last moment there is a request to capture from — and put
+back onto the message as a `traceparent` header. Without it the trace stops at the broker and the
+consumer's work is an orphan tree. There is no AMQP instrumentation to do this the way the
+`HttpClient` pipeline does it for the downstream calls, so it is explicit.
+
+**Why publisher confirms are on.** Without them a successful `BasicPublishAsync` only proves the
+bytes reached the socket, so a broker that dies before persisting would leave the row marked
+published and the event gone — the outbox would have traded a dual-write bug for a quieter version of
+itself. With them the call throws `PublishException` on a nack and the row stays unpublished.
+
+**Why `mandatory` is false, temporarily.** Nothing binds a queue to the exchange until 2b, so a
+mandatory publish would return as `basic.return`, surface as `PublishException`, and leave the row to
+be retried forever. Messages published now are accepted and discarded. **2b binds a queue and should
+flip this to `true`**, where it earns its keep by turning a missing binding into a loud failure.
+Recorded in `../../../docs/KNOWN-ISSUES.md` because a flag whose correct value depends on a later
+increment is exactly what gets forgotten.
+
+**Why only `Confirmed` publishes, temporarily.** Reservation has already happened synchronously by
+the time `WriteAsync` runs, so a `Failed` order was never placed and a `PartiallyConfirmed` one
+already holds stock a consumer must not reserve twice. When reservation moves behind the event the
+rule inverts — the row is written at acceptance and the saga decides the outcome. What survives is the
+contract and the row's place in the transaction; what does not is the `if` around it.
+
+**Topology ownership.** Ordering declares the exchange; the consumer declares its own queue and binds
+it. Ordering stays ignorant of who is listening, which is what lets a second consumer subscribe to
+`order.*` later without a change here. The exchange is durable and the messages persistent, so
+neither a broker restart nor a slow consumer loses an event.
+
+**Why the broker URL is read per connection attempt.** Ordering's readiness probe once built its
+target `Uri` at registration and froze `appsettings.Development.json`, so a test host's override never
+applied — and the test passed because nothing was listening. Same trap, same fix.
+
+**Verified.** Full suite **536/536**. The delivery path is proven against a real broker rather than a
+fake: `OutboxPublisherTests` starts a `rabbitmq:4-alpine` container, binds a queue, places an order
+over HTTP and asserts the message that arrives — payload fields, `messageId` matching the row id, the
+`traceparent` header carrying the same trace id as the response's `X-Correlation-Id`, persistent
+delivery mode — and then that the row is marked published. End to end through compose: exchange
+declared `topic`/`durable`, and a real placement produced a row published **136 ms** after it was
+written. The row-level assertions live in a separate broker-less collection on purpose: asserting
+"still unpublished" against a reachable broker would be a race with the background loop.
+
+**What it does not do.** No consumer, no inbox, no saga, no dead-letter queue, no retry policy on the
+message. Reservation is still synchronous, so a placement behaves exactly as it did before this
+decision — which is what keeps all 78 pre-existing Ordering integration tests passing unchanged.
+
+**Revisit.** Phase 2b, which moves the emission point, flips `mandatory`, adds the consumer-side
+inbox and deletes the synchronous reserve. And Phase 3 for retention: rows are never deleted, so the
+table grows without bound.
+
+---
+
 ## Not in the approval list, decided during implementation
 
 - **Refusals are values and faults are exceptions** in both clients, so the placement path never has

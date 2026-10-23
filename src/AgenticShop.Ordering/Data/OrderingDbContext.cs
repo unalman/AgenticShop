@@ -11,6 +11,8 @@ public class OrderingDbContext(DbContextOptions<OrderingDbContext> options) : Db
 
     public DbSet<OrderIdempotencyKey> IdempotencyKeys => Set<OrderIdempotencyKey>();
 
+    public DbSet<OutboxMessage> OutboxMessages => Set<OutboxMessage>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
         => modelBuilder.ApplyConfigurationsFromAssembly(typeof(OrderingDbContext).Assembly);
 }

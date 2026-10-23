@@ -29,13 +29,22 @@ internal sealed class OrderingApiFactory(
     string connectionString,
     Action<IServiceCollection>? configureServices = null,
     string catalogBaseUrl = OrderingApiFactory.CatalogBaseUrl,
-    string stockBaseUrl = OrderingApiFactory.StockBaseUrl) : WebApplicationFactory<Program>
+    string stockBaseUrl = OrderingApiFactory.StockBaseUrl,
+    string brokerUrl = OrderingApiFactory.BrokerUrl) : WebApplicationFactory<Program>
 {
     /// <summary>The environment the suite requires; see remarks.</summary>
     internal const string TestEnvironmentName = "Development";
 
     internal const string CatalogBaseUrl = "http://catalog.invalid";
     internal const string StockBaseUrl = "http://stock.invalid";
+
+    /// <summary>
+    /// Unresolvable for the same reason the two base addresses are, and it has to be present at all
+    /// because Program.cs validates the broker URL at startup. Nothing in the suite should reach a
+    /// real broker by accident; the one test that wants a real one — the outbox publisher — supplies
+    /// its own and starts a container for it.
+    /// </summary>
+    internal const string BrokerUrl = "amqp://guest:guest@rabbitmq.invalid:5672/";
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -49,7 +58,8 @@ internal sealed class OrderingApiFactory(
             {
                 ["ConnectionStrings:Ordering"] = connectionString,
                 ["Services:Catalog:BaseUrl"] = catalogBaseUrl,
-                ["Services:Stock:BaseUrl"] = stockBaseUrl
+                ["Services:Stock:BaseUrl"] = stockBaseUrl,
+                ["RabbitMq:Url"] = brokerUrl
             }));
 
         // ConfigureTestServices, not ConfigureServices: this callback runs after Program.cs has
