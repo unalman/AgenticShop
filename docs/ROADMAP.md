@@ -118,7 +118,9 @@ Now that a network hop exists, make its failure modes survivable and visible.
 - ~~Dockerfiles for all three services plus a `full` compose profile.~~ **Done.** One shared
   `docker/Dockerfile.service`, parameterised by project name and built against the repository root,
   behind an opt-in profile so the default `docker compose up -d` still starts PostgreSQL alone and
-  the host inner loop keeps working. Verified with all four containers healthy, an end-to-end
+  the host inner loop keeps working. *(Phase 2 added RabbitMQ to the default profile, so it now
+  starts PostgreSQL **and** the broker; the reasoning here is about the three APIs and is unchanged.)*
+  Verified with all four containers healthy, an end-to-end
   placement driven across them, and one trace id in all three logs.
   `docs/DECISIONS.md` → "One Dockerfile for three services". Bringing the services up on the host's
   own ports also exposed a latent test-isolation defect — the readiness probe froze its target URL at
@@ -188,7 +190,21 @@ Verified at closure: `dotnet build` clean under `TreatWarningsAsErrors`; **519 t
 
 ## Phase 2 — Asynchronous messaging ← the inflection point
 
-- RabbitMQ in compose
+- ~~RabbitMQ in compose.~~ **Done (2026-10-23).** `rabbitmq:4-alpine` in the **default** profile
+  rather than behind `full`: a broker has no host-process equivalent and no port to collide with, so
+  hiding it would leave `dotnet watch` — the loop this phase is developed in — with nothing to
+  publish to. AMQP only on `127.0.0.1:5672`, no management plugin, a named volume so durable queues
+  survive a recreate, and a `rabbitmq-diagnostics ping` probe because the alpine image ships no
+  `curl`. Nothing publishes to it yet; the outbox is the next increment.
+  `docs/DECISIONS.md` → "RabbitMQ, in compose's default profile".
+
+  It surfaced two things worth carrying forward. The compose credential guard filtered on the
+  literal word `PASSWORD`, which RabbitMQ's canonical `RABBITMQ_DEFAULT_PASS` does not contain — a
+  literal broker password would have passed all three services' tests, and the classifier now matches
+  an assignment *shape* with a regression test pinning it. And the broker user arrives with the
+  `administrator` tag, because the image's env-var bootstrap cannot create a scoped one; accepted for
+  a loopback-bound throwaway container and recorded as a divergence to revisit the moment it is
+  reachable off-machine.
 - Replace synchronous reservation with events: `OrderPlaced` → Stock consumes → `StockReserved` /
   `StockReservationRejected`
 - **Outbox pattern** — only justified now, because it exists to make "write a row and publish an

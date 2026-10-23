@@ -13,9 +13,10 @@ C# · .NET 10 (LTS) · ASP.NET Core · PostgreSQL 17 · EF Core 10 · Docker
 
 ## Architecture
 
-Three independently deployed ASP.NET Core hosts. They communicate over HTTP only —
-there is no broker, gateway, service discovery or shared library yet. Each is
-deliberately introduced later, when it starts paying for itself. See **Roadmap**.
+Three independently deployed ASP.NET Core hosts, sharing one cross-cutting library
+(`AgenticShop.Shared`). They communicate over HTTP today; RabbitMQ arrives with Phase 2's
+events. There is no gateway or service discovery yet — each is deliberately introduced
+later, when it starts paying for itself. See **Roadmap**.
 
 | Service | Port | Database | Role | Responsibility | Status |
 |---|---|---|---|---|---|
@@ -118,7 +119,10 @@ shares; the service files document only what differs.
 ## Getting started
 
 ```powershell
-# 1. local config — defines the bootstrap superuser and the three service roles
+# 1. local config — the bootstrap superuser, the three service roles, and the broker credentials.
+#    Compose interpolates the whole file, so a .env copied before Phase 2 must be refreshed from
+#    .env.example: otherwise every compose command fails on the missing RABBITMQ_* variables,
+#    including `up -d db`, which does not use the broker.
 copy .env.example .env
 
 # 2. database (creates all three databases and their owning roles on first boot)
@@ -141,13 +145,13 @@ dotnet run --project src/AgenticShop.Stock
 dotnet run --project src/AgenticShop.Ordering
 ```
 
-That is the default, and the fast inner loop: PostgreSQL in a container, the APIs on the host.
-To run the services in containers as well — a shape check on the system, not a deployment:
+That is the default, and the fast inner loop: PostgreSQL and RabbitMQ in containers, the APIs on
+the host. To run the services in containers as well — a shape check on the system, not a deployment:
 
 ```powershell
 docker compose --profile full build
-docker compose --profile full up -d      # PostgreSQL plus all three APIs
-docker compose --profile full ps         # wait until all four report healthy
+docker compose --profile full up -d      # PostgreSQL, RabbitMQ and all three APIs
+docker compose --profile full ps         # wait until all five report healthy
 ```
 
 The containerised services publish the same `127.0.0.1:5081`–`5083`, so `http/*.http` works
@@ -156,8 +160,11 @@ unchanged against either — but **never run both at once**: a container binding
 that is the only environment in which a service applies its own migrations at startup.
 `docs/DECISIONS.md` → "One Dockerfile for three services".
 
-PostgreSQL is published on `127.0.0.1:5432` only. Binding it to `0.0.0.0` would expose
-the bootstrap superuser to everything else on the local network.
+Both containers publish on `127.0.0.1` only — PostgreSQL on `5432`, RabbitMQ's AMQP port on
+`5672`. Binding either to `0.0.0.0` would expose the bootstrap superuser, or a broker with no
+authorisation beyond a placeholder login, to everything else on the local network. The management
+plugin is deliberately not enabled, so there is no second broker port; queue state is readable with
+`docker compose exec rabbitmq rabbitmqctl list_queues name messages consumers`.
 
 The init script runs only when the data volume is empty. After changing it, recreate the
 volume with `docker compose down -v` — this discards all local data.
@@ -289,14 +296,17 @@ database** — not a secret, and never to be reused.
 
 The guards that keep this true:
 
-- `docker-compose.yml` publishes PostgreSQL on `127.0.0.1` only.
+- `docker-compose.yml` publishes PostgreSQL and RabbitMQ on `127.0.0.1` only.
 - Applications connect with least-privilege roles; the superuser exists only to bootstrap.
 - No `appsettings.json` (non-Development) contains a connection string, and startup fails
   if one is absent — so a real environment must supply `ConnectionStrings__<Service>`
   through the environment or a secret store. Ordering's two downstream base URLs follow the
   same rule and are likewise absent from non-Development configuration.
-- All three `ComposeConfigurationTests` fail if a literal password appears in the compose file or
-  if the port binding stops being loopback-only.
+- All three `ComposeConfigurationTests` fail if a literal credential appears in the compose file or
+  if a port binding stops being loopback-only. The credential check matches an assignment *shape*
+  rather than the word `PASSWORD`, because RabbitMQ's canonical variable is `RABBITMQ_DEFAULT_PASS`
+  and "PASS" is not a substring of "PASSWORD" — a filter on that word would have let a literal
+  broker password through all three guards.
 
 To use different values locally, edit `.env` and run
 `dotnet user-secrets set "ConnectionStrings:Catalog" "..."` (or `:Stock`, `:Ordering`) against the

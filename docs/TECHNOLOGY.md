@@ -21,6 +21,7 @@ Everything here describes the verified current state.
 | TFM | set once in `Directory.Build.props` | `net10.0` |
 | Web | ASP.NET Core **Minimal APIs** — no controllers | 10.0.12 |
 | Database | PostgreSQL, image `postgres:17-alpine` | 17 |
+| Broker | RabbitMQ, image `rabbitmq:4-alpine` — arrived in Phase 2 | 4 |
 | ORM / provider | EF Core / `Npgsql.EntityFrameworkCore.PostgreSQL` | 10.0.12 / 10.0.3 |
 | Naming | `EFCore.NamingConventions` → snake_case | 10.0.1 |
 | API docs | `Microsoft.AspNetCore.OpenApi` + `Scalar.AspNetCore` | 10.0.12 / 2.17.8 |
@@ -45,7 +46,7 @@ file; when the two disagree, the build file is right and this document is stale.
 | `Directory.Build.props` | the TFM, `TreatWarningsAsErrors`, shared build properties |
 | `Directory.Packages.props` | every `PackageReference` version, centrally — a project must omit `Version` |
 | `dotnet-tools.json` | `dotnet-ef` |
-| `docker-compose.yml` | the `postgres:17-alpine` image |
+| `docker-compose.yml` | the `postgres:17-alpine` and `rabbitmq:4-alpine` images |
 | `docker/Dockerfile.service` | the `DOTNET_SDK_TAG` / `DOTNET_RUNTIME_TAG` defaults, the `curl` a healthcheck needs, and the explicit `USER app` |
 
 Change a version in its pinning file and update §1 in the same commit.

@@ -74,8 +74,8 @@ docker compose exec db bash /usr/local/bin/verify-db-isolation   # 22 checks; no
 ## 4. Technology
 
 .NET 10 (`net10.0`) · ASP.NET Core **Minimal APIs**, no controllers · PostgreSQL 17 via EF Core ·
-xunit + FluentAssertions with Testcontainers · `.slnx`. The full stack, its versions and where
-each is pinned: `docs/TECHNOLOGY.md`.
+RabbitMQ 4 in compose (nothing publishes to it yet) · xunit + FluentAssertions with Testcontainers ·
+`.slnx`. The full stack, its versions and where each is pinned: `docs/TECHNOLOGY.md`.
 
 - **`TreatWarningsAsErrors` is on.** A warning fails the build. Fix it; do not suppress it.
 - All package versions live in `Directory.Packages.props`; a `PackageReference` must omit
@@ -193,8 +193,8 @@ Further harness gotchas: §5.4. Concurrency-testing rules and measurements: §5.
 - **`.env` is never committed** (gitignored, `.gitignore:7`). `.env.example` is committed and
   documents every variable.
 - Every credential in the repo is a **published local-only placeholder** (`local_only_bootstrap`,
-  `local_only_catalog`, `local_only_stock`, `local_only_ordering`) and must be labelled as such
-  wherever it appears.
+  `local_only_catalog`, `local_only_stock`, `local_only_ordering`, `local_only_rabbit`) and must be
+  labelled as such wherever it appears.
 - **No literal credential in `docker-compose.yml`** — all use `${VAR:?message}`, so a missing
   value fails loudly. `ComposeConfigurationTests` enforces this.
 - **Validate required configuration at startup**, not on first use.
@@ -214,8 +214,8 @@ each deferral, including the few with no assigned phase: `docs/DECISIONS.md`.
 
 **Still deferred — do not add:**
 
-**RabbitMQ or any broker · Outbox / Inbox · Redis · authentication / authorization ·
-Kubernetes / Helm · API gateway (YARP) · CQRS · DDD tactical patterns · event sourcing.**
+**Outbox / Inbox · Redis · authentication / authorization · Kubernetes / Helm · API gateway (YARP) ·
+CQRS · DDD tactical patterns · event sourcing.**
 
 Also do not add at this size: repository or service layers, an `Application` layer, a mediator,
 `Result<T>` monads, a mapping framework, domain-event plumbing, or a `Money` value object.
@@ -223,7 +223,7 @@ Also do not add at this size: repository or service layers, an `Application` lay
 The ordering matters: retrying without idempotency keys double-reserves stock; an outbox without
 a broker is dead weight; CQRS without read pressure is ceremony.
 
-**Now permitted, because Phase 1 has started — but only the ones that are done:**
+**Now permitted, because Phase 1 and Phase 2 have started — but only the ones that are done:**
 the shared infrastructure library (`AgenticShop.Shared`, §2) · **idempotency keys on `POST /orders`**
 (Ordering decision O17) · **resilience on Ordering's typed clients** (Ordering decision O18) ·
 **Serilog in all three services** (`docs/DECISIONS.md` → "Serilog, adopted in Catalog first",
@@ -233,7 +233,11 @@ configured once in `AgenticShop.Shared/Logging`) · **OpenTelemetry tracing in a
 `AgenticShop.Shared/Health`) · **service containers** — one shared `docker/Dockerfile.service` behind
 compose's opt-in `full` profile (→ "One Dockerfile for three services") · **a CI gate** —
 `.github/workflows/ci.yml`: build, the full suite, and a per-service migrations drift check (→
-"CI as a drift gate, not a deployment pipeline"). Nothing else on the list above has been unblocked.
+"CI as a drift gate, not a deployment pipeline") · **RabbitMQ in compose** — in the **default**
+profile, not `full`, because a broker has no host-process equivalent and no port to collide with, so
+`dotnet watch` keeps working and gains something to publish to (→ "RabbitMQ, in compose's default
+profile"). Nothing else on the list above has been unblocked; the outbox and inbox stay deferred
+until a message actually flows.
 
 Three of those carry a rule that is easy to get wrong, and only one of them is fully test-guarded.
 **Do not extend retry to another outbound call before reading O18** — the exemption on reserve is what

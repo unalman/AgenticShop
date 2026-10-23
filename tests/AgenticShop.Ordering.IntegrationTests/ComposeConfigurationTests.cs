@@ -1,4 +1,5 @@
 using FluentAssertions;
+using System.Text.RegularExpressions;
 
 namespace AgenticShop.Ordering.IntegrationTests;
 
@@ -16,13 +17,41 @@ public class ComposeConfigurationTests
 {
     private static readonly Lazy<string> Compose = new(ReadComposeFile);
 
+    /// <summary>
+    /// A line that assigns a secret, in any of the shapes this repository uses.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This used to be a plain <c>line.Contains("PASSWORD")</c>, which silently missed RabbitMQ's
+    /// canonical <c>RABBITMQ_DEFAULT_PASS</c>: "PASS" is not a substring of "PASSWORD", so a literal
+    /// broker password written into compose would have passed all three services' guards. Matching a
+    /// secret-ish name followed by an assignment operator covers <c>POSTGRES_PASSWORD:</c>,
+    /// <c>RABBITMQ_DEFAULT_PASS:</c> and the inline <c>Password=</c> inside a connection string alike.
+    /// </para>
+    /// <para>
+    /// Case-insensitive because connection strings write <c>Password=</c>, not <c>PASSWORD=</c>. The
+    /// old ordinal filter caught those lines only by accident, through the upper-case variable name
+    /// inside the substitution they happened to contain.
+    /// </para>
+    /// </remarks>
+    private static readonly Regex CredentialAssignment = new(
+        @"(password|passwd|pass|secret|token|credential)\s*[:=]",
+        RegexOptions.IgnoreCase);
+
     [Fact]
     public void TheComposeDatabaseImageMatchesTheOneTheTestsRunAgainst()
     {
         var images = DeclaredImages();
 
-        images.Should().ContainSingle("docker-compose.yml declares exactly one service image");
-        images.Single().Should().Be(TestPostgreSql.Image);
+        // Compose declares a broker image as well now, so this selects the PostgreSQL one rather
+        // than asserting there is only one. ContainSingle with a predicate still fails on an empty
+        // sequence, so the guard cannot pass vacuously if the database image disappears.
+        images.Should().ContainSingle(
+            image => image.StartsWith("postgres:", StringComparison.Ordinal),
+            "docker-compose.yml declares exactly one PostgreSQL image");
+
+        images.Single(image => image.StartsWith("postgres:", StringComparison.Ordinal))
+            .Should().Be(TestPostgreSql.Image);
     }
 
     [Fact]
@@ -50,24 +79,57 @@ public class ComposeConfigurationTests
         var mappings = PublishedPorts();
 
         mappings.Should().NotBeEmpty(
-            "compose publishes PostgreSQL, plus the services behind the full profile");
+            "compose publishes PostgreSQL and the broker, plus the services behind the full profile");
         mappings.Should().OnlyContain(
             mapping => mapping.StartsWith("127.0.0.1:", StringComparison.Ordinal),
             "a mapping with no explicit host address publishes on every interface");
+
+        // Non-vacuity for the one block this guard had not previously had to find. PublishedPorts
+        // locates mappings by indentation, so a block written in flow form — ports: ["..."] — would
+        // be invisible to it and OnlyContain would pass having inspected nothing. Matched on the
+        // container-side port rather than on a substring of the whole mapping, because the host side
+        // is a substitution (${RABBITMQ_PORT:-5672}) and contains no literal ":5672:".
+        mappings.Should().Contain(
+            mapping => mapping.EndsWith(":5672", StringComparison.Ordinal),
+            "the broker's AMQP port must be among the mappings this guard actually inspected");
     }
 
     [Fact]
     public void EveryCredentialComesFromTheEnvironment()
     {
-        var credentialLines = Lines()
-            .Where(line => line.Contains("PASSWORD", StringComparison.Ordinal))
-            .ToList();
+        var credentialLines = Lines().Where(IsCredentialLine).ToList();
 
         credentialLines.Should().NotBeEmpty("the compose file should be configuring credentials");
         credentialLines.Should().OnlyContain(
             line => line.Contains("${", StringComparison.Ordinal),
             "every credential must be substituted from the environment, never written literally");
+
+        // Non-vacuity: the guard above would still pass if compose stopped configuring the broker
+        // at all, and the image would then quietly fall back to guest/guest.
+        credentialLines.Should().Contain(
+            line => line.Contains("RABBITMQ_DEFAULT_PASS", StringComparison.Ordinal),
+            "the broker password is a credential like any other and must come from the environment");
     }
+
+    /// <summary>
+    /// The regression test for the hole <see cref="CredentialAssignment"/>'s remarks describe: a
+    /// literal broker password, which the old <c>Contains("PASSWORD")</c> filter never looked at.
+    /// </summary>
+    [Theory]
+    [InlineData("RABBITMQ_DEFAULT_PASS: local_only_rabbit")]
+    [InlineData("POSTGRES_PASSWORD: local_only_bootstrap")]
+    [InlineData("ConnectionString: \"Host=db;Password=local_only_placeholder\"")]
+    [InlineData("SOME_FUTURE_SECRET: hunter2")]
+    public void ALiteralCredentialIsClassifiedWhateverTheVariableIsCalled(string line)
+    {
+        IsCredentialLine(line).Should().BeTrue(
+            "a literal credential the classifier does not recognise can never be rejected");
+
+        line.Should().NotContain("${",
+            "the fixture is a literal value, which is what the environment guard exists to reject");
+    }
+
+    private static bool IsCredentialLine(string line) => CredentialAssignment.IsMatch(line);
 
     [Fact]
     public void TheOrderingRolePasswordIsSuppliedToTheBootstrapScript()

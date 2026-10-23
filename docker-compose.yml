@@ -1,12 +1,18 @@
 # Two profiles, and the default one is deliberately the smaller.
 #
-#   docker compose up -d                     PostgreSQL only — the APIs run on the host via
-#                                            `dotnet watch`, which stays the fast inner loop
-#   docker compose --profile full up -d      PostgreSQL plus the containerised APIs
+#   docker compose up -d                     PostgreSQL and RabbitMQ — the APIs run on the host
+#                                            via `dotnet watch`, the fast inner loop
+#   docker compose --profile full up -d      those two plus the containerised APIs
 #
-# The services are opt-in behind `full` so that the host inner loop is unaffected: publishing a
+# The APIs are opt-in behind `full` so that the host inner loop is unaffected: publishing a
 # container on 5081 while `dotnet watch` holds the same port is a bind failure, not a merge.
 # Never run both at once.
+#
+# The broker is in the *default* profile, which is a deliberate asymmetry rather than an
+# oversight. `full` exists because a containerised API competes with a host process for the same
+# port; a broker has no host-process equivalent and nothing to collide with. Putting it behind
+# `full` would leave `dotnet watch` — the loop Phase 2 is developed in — with no broker to
+# publish to.
 #
 # `full` is a local shape check — does the system work when the services are containers rather
 # than host processes — and not a deployment. The containers run as Development, which is
@@ -43,6 +49,46 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+
+  rabbitmq:
+    image: rabbitmq:4-alpine
+    container_name: agenticshop-rabbitmq
+    restart: unless-stopped
+    environment:
+      # DEVELOPMENT ONLY placeholder credentials, the same published values as .env.example. Not
+      # secrets, and substituted rather than written literally so ComposeConfigurationTests keeps
+      # holding for every credential line in this file.
+      #
+      # Note the variable names: RabbitMQ's canonical pair is DEFAULT_USER / DEFAULT_PASS, and
+      # "PASS" is not a substring of "PASSWORD" — which is precisely why that test's classifier
+      # matches on an assignment shape rather than on the word PASSWORD alone. A guard filtering
+      # on "PASSWORD" would have let a literal broker password through all three services' tests.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?create a .env file from .env.example}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?create a .env file from .env.example}
+    ports:
+      # AMQP only, loopback only. The management plugin is deliberately not enabled: it would
+      # publish a second port and add guard surface for a browser UI nothing in the code needs.
+      # Queue and consumer state is observable without it —
+      #   docker compose exec rabbitmq rabbitmqctl list_queues name messages consumers
+      - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
+    volumes:
+      # Phase 2 declares durable queues, and a durable queue on an ephemeral container loses its
+      # contents on every recreate — which would make redelivery behaviour impossible to reason
+      # about locally. Same trade as agenticshop-db-data, and `down -v` destroys it the same way.
+      - agenticshop-rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      # The alpine image ships no curl, so the probe cannot copy the services' HTTP shape; it uses
+      # the broker's own diagnostics command instead. The timings keep the ordering the services
+      # argue for — the command's own deadline (8s) under Docker's timeout (10s) — so a slow probe
+      # ends with a real exit code instead of being SIGKILLed at the timeout.
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping", "--timeout", "8"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      # The broker boots an Erlang VM and then initialises the default vhost, which is slower than
+      # PostgreSQL's ready check. Without a start period those first probes fail and count against
+      # retries, so a healthy broker can be marked unhealthy for having been slow to boot.
+      start_period: 30s
 
   catalog:
     profiles: ["full"]
@@ -169,3 +215,4 @@ services:
 
 volumes:
   agenticshop-db-data:
+  agenticshop-rabbitmq-data:

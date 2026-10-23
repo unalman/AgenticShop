@@ -166,9 +166,13 @@ build arg. Two consequences shape everything else:
   small and — the part that is correctness rather than speed — excludes `bin/` and `obj/`, because an
   `obj/project.assets.json` written by a restore on Windows records host paths that do not describe a
   Linux build layer.
-- **The default profile starts PostgreSQL only.** The services sit behind `full`, so
-  `docker compose up -d` leaves the host inner loop untouched. Publishing a container on 5081 while
-  `dotnet watch` holds the same port is a bind failure, not a merge: never run both at once.
+- **The default profile starts PostgreSQL and RabbitMQ; only the APIs sit behind `full`.** So
+  `docker compose up -d` still leaves the host inner loop untouched. Publishing a container on 5081
+  while `dotnet watch` holds the same port is a bind failure, not a merge: never run both at once.
+  The broker is in the default profile deliberately rather than by oversight — `full` exists because
+  a containerised API competes with a host process for a port, and a broker has no host-process
+  equivalent and nothing to collide with. Hiding it behind `full` would leave `dotnet watch`, the
+  loop Phase 2 is developed in, with no broker to publish to.
 
 `full` is a local shape check rather than a deployment. The containers run as `Development`, which is
 load-bearing rather than convenient, because §4.4 confines `MigrateAsync()` to Development and that is

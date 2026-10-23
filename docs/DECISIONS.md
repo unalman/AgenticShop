@@ -105,6 +105,10 @@ the host inner loop is faster and is where debugging happens, so it could not be
 **Decision.** One `docker/Dockerfile.service`, parameterised by a `SERVICE` build arg, plus a compose
 `full` profile that opts the three services in. `docker compose up -d` still starts PostgreSQL alone.
 
+*(No longer literally true as of Phase 2: the default profile now starts PostgreSQL **and** RabbitMQ,
+because a broker has no host-process equivalent and no port to collide with. The reasoning in this
+entry is about the three APIs and is unchanged — see "RabbitMQ, in compose's default profile".)*
+
 **Why one Dockerfile rather than three.** The services differ in exactly one token, the project name.
 Three files would be three copies of every base-image tag, layer-ordering choice and `USER`
 declaration, and the drift would stay invisible until one image behaved differently. Compose supplies
@@ -310,6 +314,59 @@ tables appear.
 `127.0.0.1:${POSTGRES_PORT:-5432}:5432`. Binding `0.0.0.0` exposed a superuser login, with a
 password published in a committed file, to every host on the local network. Found in review.
 `ComposeConfigurationTests` now fails if the binding regresses.
+
+### RabbitMQ, in compose's default profile
+
+**Context.** Phase 2 needs a broker, and compose already had a two-profile shape: the default
+profile starts infrastructure, `full` adds the containerised APIs. The obvious move was to file the
+broker under `full` with the other new containers.
+
+**Decision (2026-10-23).** `rabbitmq:4-alpine` in the **default** profile, publishing only its AMQP
+port on `127.0.0.1`. Nothing publishes to it yet — Ordering's outbox is the next increment.
+
+**Why the default profile rather than `full`.** `full` exists for one concrete reason: a container
+binding 5081 while `dotnet watch` holds 5081 is a bind failure, not a merge. That reasoning is about
+the three APIs and does not transfer. A broker has no host-process equivalent, no port collision and
+nothing to opt out of — and putting it behind `full` would leave `dotnet watch`, the loop Phase 2 is
+developed in, with no broker to publish to. The asymmetry is deliberate and is stated in the compose
+header so it does not read as an oversight.
+
+**Why no management plugin.** It would publish a second port (`15672`) and add guard surface for a
+browser UI that no code needs. Queue depth and consumer count are readable without it:
+`docker compose exec rabbitmq rabbitmqctl list_queues name messages consumers`. Revisit if observing
+broker state becomes a frequent enough task that the CLI is friction.
+
+**Why the healthcheck does not look like the services'.** The alpine image ships no `curl` — the same
+gap `docker/Dockerfile.service` installs it to close — so the probe uses the broker's own
+`rabbitmq-diagnostics -q ping --timeout 8` rather than copying the HTTP shape. The `--timeout 8`
+under Docker's `timeout: 10s` preserves the ordering the services argue for, so a slow probe exits
+with a real status instead of being SIGKILLed. Verified rather than assumed: the probe logged
+`exit=0 | Ping succeeded` and the container reached `healthy`.
+
+**Accepted divergence: the broker user is `administrator`.** This is the one place where the broker
+does *not* follow the least-privilege shape PostgreSQL has, where the superuser bootstraps and no
+application uses it. RabbitMQ's `RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS` create the default
+user with the `administrator` tag and there is no environment variable that creates a scoped one; a
+scoped user needs either a mounted `definitions.json` — loaded verbatim, so it cannot carry a
+substituted credential without writing a literal one into a committed file, which is exactly what
+`ComposeConfigurationTests` forbids — or `rabbitmqctl` calls at startup, which need `administrator`
+anyway. Declaring exchanges and queues needs `configure` on the vhost, not the tag, so the privilege
+is wider than the workload requires. Accepted for a loopback-bound throwaway container with published
+placeholder credentials; **revisit the moment the broker is reachable off-machine.**
+
+**Why a named volume.** Phase 2 declares durable queues, and a durable queue on an ephemeral
+container loses its contents on every recreate, which would make redelivery behaviour impossible to
+reason about locally. `docker compose down -v` destroys it exactly as it destroys the database.
+
+**What this does not unblock.** The outbox and the inbox rows in "Deliberately not done" stay there.
+A broker with nothing publishing to it is infrastructure, not a pattern; the outbox becomes justified
+when Ordering writes an order row and an event in one transaction, and the inbox when a consumer can
+be handed the same message twice.
+
+**One trap this change creates, recorded because it is silent.** Compose interpolates the whole file,
+so `${RABBITMQ_DEFAULT_USER:?...}` fails on *every* compose command — including `up -d db`, which
+does not use the broker — until `.env` gains the two new variables. A `.env` copied before Phase 2
+must be refreshed from `.env.example`.
 
 ---
 
@@ -811,7 +868,6 @@ Each was considered and declined, with the phase that would justify it:
 
 | Declined | Why not yet |
 |---|---|
-| RabbitMQ / any broker | Nothing is asynchronous |
 | Outbox / Inbox | An outbox makes "write a row and publish an event" atomic; there are no events. The design is *nearly* outbox-ready — and less so than this row claimed until it was checked on 2026-10-23. Ordering's placement runs **two** `SaveChangesAsync` calls: the idempotency claim at `OrderPlacer.cs:101`, before any reservation, and the order + lines + key completion at `:436`. An outbox row is therefore atomic with the order only in the second save, which is where it belongs; the claim transaction holds no order row to be atomic with. Stock's reserve genuinely is one save, committing the counter and the reservation row together |
 | Redis | No cache pressure, no distributed idempotency store to hold |
 | Authentication / authorization | Deferred by the project owner. Adding it later needs a customer identity column on `Order` plus a cross-cutting policy — a migration and a concern, which is why no placeholder seam was pre-built |
@@ -856,3 +912,13 @@ and it is the last item Phase 1 named. This was the easiest deferral on the list
 easiest to over-justify: with no deployment there was nothing to build a pipeline *for*, so what
 arrived is a gate rather than a pipeline, and keeping that distinction is the whole decision. See "CI
 as a drift gate, not a deployment pipeline" above.
+
+**RabbitMQ was on this list until Phase 2 opened it.** Added 2026-10-23 as `rabbitmq:4-alpine` in
+compose's default profile. The deferral's stated reason — "nothing is asynchronous" — stayed true
+right up to the phase whose job is to make something asynchronous, which is the sequential-earning
+rule working as intended rather than a change of preference. It is also the first item closed by a
+phase that has only just started: the broker arrives **before** anything publishes to it, because the
+outbox and the event contracts are the next increment and neither can be written against a broker
+that does not exist. Those two rows stay on the table above. See "RabbitMQ, in compose's default
+profile" for the shape it arrived in, including the `administrator` tag it accepts and the credential
+guard hole it exposed.
