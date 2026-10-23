@@ -1,6 +1,7 @@
 using AgenticShop.Stock.Data;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.Configuration;
@@ -28,10 +29,21 @@ namespace AgenticShop.Stock.IntegrationTests;
 /// other service has a two-row read whose atomicity is load-bearing.
 /// </para>
 /// </remarks>
-internal sealed class StockApiFactory(string connectionString) : WebApplicationFactory<Program>
+internal sealed class StockApiFactory(
+    string connectionString,
+    Action<IServiceCollection>? configureServices = null,
+    string brokerUrl = StockApiFactory.BrokerUrl) : WebApplicationFactory<Program>
 {
     /// <summary>The environment the suite requires; see remarks.</summary>
     internal const string TestEnvironmentName = "Development";
+
+    /// <summary>
+    /// Unresolvable, and inert in the default fixture: <c>Program.cs</c> registers no messaging
+    /// service yet, so nothing reads this key. It is supplied anyway because the messaging fixture
+    /// uses this same factory, and because a value that is present-but-unreachable fails loudly
+    /// rather than quietly reaching a broker on the developer's machine.
+    /// </summary>
+    internal const string BrokerUrl = "amqp://guest:guest@rabbitmq.invalid:5672/";
 
     /// <summary>
     /// Records the host's SQL while a test holds a capture window open.
@@ -53,12 +65,18 @@ internal sealed class StockApiFactory(string connectionString) : WebApplicationF
         builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(
             new Dictionary<string, string?>
             {
-                ["ConnectionStrings:Stock"] = connectionString
+                ["ConnectionStrings:Stock"] = connectionString,
+                ["RabbitMq:Url"] = brokerUrl
             }));
 
         builder.ConfigureServices(services => services
             .AddSingleton<IDbContextOptionsConfiguration<StockDbContext>>(
                 new SqlCaptureConfiguration(SqlCapture)));
+
+        // ConfigureTestServices, not ConfigureServices: this callback runs after Program.cs has
+        // registered everything, which is what lets the messaging fixture add the two hosted
+        // services that Program.cs deliberately does not register yet.
+        builder.ConfigureTestServices(services => configureServices?.Invoke(services));
     }
 
     /// <summary>Adds <see cref="SettleSqlCapture"/> to the options EF builds for the host.</summary>

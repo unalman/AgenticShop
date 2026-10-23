@@ -59,11 +59,11 @@ public class ComposeConfigurationTests
     /// </summary>
     /// <remarks>
     /// <para>
-    /// This test exists in Ordering's copy <b>only</b>, and the asymmetry is deliberate rather than
-    /// an omission in the other two. <see cref="TestRabbitMq"/> lives here because Ordering is the
-    /// only service with a broker container in its test harness; Catalog and Stock have no such
-    /// constant to drift from, so copying this test to them would assert nothing and pass vacuously —
-    /// the failure mode <c>AGENTS.md</c> §10 warns about for guards that match nothing.
+    /// This test exists in Ordering's and Stock's copies and not in Catalog's, and the asymmetry tracks
+    /// something real rather than an omission: those two services have a broker container in their
+    /// harness and Catalog does not, so it has no <c>TestRabbitMq</c> constant to drift from. Copying
+    /// the test there would assert nothing and pass vacuously — the failure mode <c>AGENTS.md</c> §10
+    /// warns about for guards that match nothing.
     /// </para>
     /// <para>
     /// It was added because the alternative had already happened: <see cref="TestRabbitMq"/>'s

@@ -206,7 +206,12 @@ Verified at closure: `dotnet build` clean under `TreatWarningsAsErrors`; **519 t
   a loopback-bound throwaway container and recorded as a divergence to revisit the moment it is
   reachable off-machine.
 - Replace synchronous reservation with events: `OrderPlaced` → Stock consumes → `StockReserved` /
-  `StockReservationRejected`
+  `StockReservationRejected`. **Stock's side is built and tested against a real broker, and
+  deliberately not registered** — `Program.cs` starts neither the consumer nor the publisher, so the
+  synchronous reserve is still the only path live and nothing can double-hold. What remains is
+  Ordering's outcome consumer, the move of `OrderPlaced` emission to before reservation, and the flip
+  that deletes the synchronous path and registers both — one commit, because there is no state in
+  between where only one of the two is wired. `src/AgenticShop.Stock/docs/DECISIONS.md` → **D16**.
 - ~~**Outbox pattern.**~~ **Done on the producer side (2026-10-23).** An `outbox_messages` table, an
   `OutboxPublisher` hosted service and an `OrderPlaced` contract — carrying the stable message id
   this bullet called cheap to decide now and expensive to retrofit. The row joins the order's own

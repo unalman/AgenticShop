@@ -155,6 +155,81 @@ capture recorded nothing and would otherwise have asserted on an empty list.
 
 Full account: `../../../docs/KNOWN-ISSUES.md` → "The 'unexplained 5xx' was a read-skew race".
 
+## D16 · The consumer, the inbox, and why neither is registered yet
+
+**Added 2026-10-23, Phase 2b-i.**
+
+**Decision.** `OrderPlacedConsumer` reads `OrderPlaced` from a durable queue Stock owns, holds every
+line of the order or none of them, and publishes `StockReserved` or `StockReservationRejected` through
+an outbox of its own. An `InboxMessage` row keyed on the producer's message id makes redelivery a
+no-op. **Neither this consumer nor Stock's publisher is registered in `Program.cs`.** The test host
+registers both; production does not.
+
+**Why built but not wired.** The synchronous `POST /api/v1/stock/{productId}/reservations` path is
+still the only one Ordering uses. Registering the consumer now would put two reservation paths live at
+once and double-hold every order. Building it unwired is what lets it be tested against a real broker
+without changing a single shipped behaviour — all 68 pre-existing Stock integration tests pass
+untouched, and `POST /orders` still answers exactly as it did. The increment that registers this also
+deletes the synchronous reserve and moves Ordering's emission point, in one commit.
+
+**Why the inbox, when `UNIQUE(order_id, stock_item_id)` already looks like deduplication.** It covers
+a different case, and the gap is not hypothetical — `ARejectedMessageStaysRejectedAfterStockArrives`
+reproduces it. A *refused* hold writes no reservation row, so a redelivery has nothing to collide
+with; if stock arrived in between, the redelivery succeeds and publishes `StockReserved` for an order
+already answered with `StockReservationRejected`. Two contradictory outcomes for one message id. The
+unique index also cannot say whether the outcome event was published, only that a hold exists. The
+inbox row is written in the same transaction as the hold and the outbox row, which makes "processed"
+and "answered" one fact instead of two. The unique index stays and stays load-bearing for the HTTP
+path's 409.
+
+**Why all-or-nothing per order.** The synchronous path reserves line by line and releases the earlier
+holds when a later one fails. Here the whole order is one unit of work, so there is no intermediate
+state to compensate for — which is why the rejection path can simply discard its `DbContext` and write
+the refusal in a fresh one rather than undoing mutations. `OneUnfulfillableLineRollsBackTheWholeOrder`
+pins that the first line's successful hold never reaches the database.
+
+**Why it reserves but does not confirm.** A `Confirmed` reservation is terminal (D3) and Ordering is
+forbidden from releasing one (its O10). Confirming here would discard the only compensation the saga
+has. The holds stay `Pending`, and confirming them is a later increment's decision.
+
+**Why the outbox is a copy rather than shared infrastructure.** Extracting it into
+`AgenticShop.Shared` was considered and declined: it would widen what that assembly is permitted to
+hold, and freezing the shape before a second consumer existed is the mistake Shared's own deferral
+entry names. The project owner chose duplication plus a guard. `OutboxPublisherSafetyTests` asserts the
+safety properties against Stock's copy; Ordering's suite should assert the same list against its own,
+and currently asserts less — recorded in `../../../docs/KNOWN-ISSUES.md`.
+
+**Why `prefetchCount: 1` and an explicit `consumerDispatchConcurrency: 1`.** Serial dispatch actually
+comes from the client's default dispatch concurrency, not from prefetch; prefetch bounds how many
+unacked deliveries the broker hands over. Both are set explicitly because this consumer mutates a row
+other writers also mutate, so its correctness should not rest on two library defaults nobody pinned —
+and the channel-level option does not inherit the factory value unless it is passed as `null`.
+
+**Why the queue is durable.** RabbitMQ 4 rejects a transient non-exclusive queue outright
+(`code=541, "Feature 'transient_nonexcl_queues' is deprecated"`), found by a failing test rather than
+by documentation. Exclusive is not available to a consumer that must survive a restart.
+
+**Why a poison message is logged and acknowledged.** There is no dead-letter queue — `AGENTS.md` §8
+defers them. Nack without a DLQ discards the message and leaves nothing to inspect; requeue loops
+forever filling the log. So the body is logged at `Error` and the delivery is acknowledged. The log
+line is the only surviving copy, which is a real loss and is recorded rather than papered over.
+
+**Verified.** Full suite **545/545**, of which Stock's integration project is 77 (68 before this
+decision, plus one broker-image guard and eight messaging tests). The messaging tests run against a
+real `rabbitmq:4-alpine` container and assert the round trip end to end: a published `OrderPlaced`
+produces a `Pending` reservation, the counters move, an inbox row appears, and a `StockReserved`
+arrives on a queue bound to `stock.#` carrying the producer's `traceparent` across both hops.
+Redelivery of one message id holds once. A refusal followed by restocking and redelivery still holds
+nothing.
+
+**What it does not do.** No saga, no confirmation of the holds, no dead-letter queue, no retry policy
+on the message, and no change to any HTTP endpoint. Ordering still reserves synchronously and still
+publishes `OrderPlaced` only for `Confirmed` orders.
+
+**Revisit.** The very next increment, which registers both hosted services, deletes the synchronous
+reserve, moves Ordering's emission to before reservation, and turns `POST /orders` into a 202 with a
+`Pending` order.
+
 ## Not in the approval list, decided during implementation
 
 - **Domain exceptions carry typed properties**, and the handler builds client text from them rather

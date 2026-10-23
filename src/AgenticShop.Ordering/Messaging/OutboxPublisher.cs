@@ -57,7 +57,9 @@ public sealed class OutboxPublisher(
         {
             while (!stoppingToken.IsCancellationRequested)
             {
-                var idle = true;
+                // How long to wait before the next poll. Three cases, and they are not the same
+                // number: nothing to do, more to do, and something went wrong.
+                var delay = IdleDelay;
 
                 try
                 {
@@ -66,7 +68,12 @@ public sealed class OutboxPublisher(
                         (connection, channel) = await OpenChannelAsync(stoppingToken);
                     }
 
-                    idle = await PublishPendingAsync(channel, stoppingToken) == 0;
+                    if (await PublishPendingAsync(channel, stoppingToken) > 0)
+                    {
+                        // A full batch means there are probably more rows behind it, so go straight
+                        // round instead of idling for a second between them.
+                        delay = TimeSpan.Zero;
+                    }
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
@@ -89,11 +96,13 @@ public sealed class OutboxPublisher(
                     await DisposeAsync(connection, channel);
                     connection = null;
                     channel = null;
+
+                    delay = RetryDelay;
                 }
 
-                if (idle)
+                if (delay > TimeSpan.Zero)
                 {
-                    await Task.Delay(IdleDelay, stoppingToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+                    await Task.Delay(delay, stoppingToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
                 }
             }
         }

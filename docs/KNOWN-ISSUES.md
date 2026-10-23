@@ -176,12 +176,51 @@ Two residuals, both accepted for Phase 0:
   written once at the end of placement. Stock then holds confirmed reservations against an order id
   that exists in neither database's queryable surface, and the endpoint above cannot find it either
   — `orderId` is required. Discovery needs a cross-database query for reservation order ids with no
-  matching order. This is the dual-write problem; the Phase 2 outbox is what closes it.
+  matching order. This is the dual-write problem. Ordering's outbox now exists and closes the
+  *event-delivery* half of it; this residual is the other half, and it closes when Phase 2b writes the
+  order as `Pending` before reserving rather than once, already terminal, afterwards.
 
 Neither can oversell. Confirm decrements both counters and release decrements only `reserved`, so
 `reserved <= quantity_on_hand` holds on every path including the failing ones. The exposure is
 inventory *under*-availability, not negative stock — which is what makes both residuals survivable
 while no money moves.
+
+### Messaging
+
+**A poison outbox row blocks every row behind it.** *Medium.* `OutboxPublisher.PublishPendingAsync`
+reads the oldest unpublished rows and iterates them in order, so the first row whose publish throws
+aborts the whole batch and the loop starts again from the same head. A row that can never be published
+— a misspelled exchange, a payload that overflows a column, an exchange deleted on the broker — stops
+the outbox permanently, and the symptom is that *later* events go missing rather than that one is
+stuck. In production the exchange is declared on connect so the ordinary causes cannot happen, which
+is exactly why this was found by reasoning about a test rather than by a failure. Needs either a
+per-row attempt count with a give-up threshold or per-row error isolation; both are small, neither is
+written.
+
+**No dead-letter queue, so a poison delivery is dropped.** *Medium · Phase 2b/3.* A message that
+cannot be parsed, or that fails in a way redelivery cannot fix, is logged at `Error` **with its full
+body** and then acknowledged. That is a deliberate choice between three bad options: nacking without a
+DLQ discards it anyway and leaves nothing to inspect, requeueing loops forever filling the log, and a
+DLQ is deferred by `AGENTS.md` §8. The body in the log is the only copy that survives. `AGENTS.md`
+defers dead-letter queues on the grounds that each "needs a consumer to be for" — there is now a
+consumer, so the deferral's reasoning has expired even though the item has not been picked up.
+
+**Consumer spans are correlated but not exported.** *Low.* `OrderPlacedConsumer` creates an `Activity`
+directly rather than through an `ActivitySource`, because `StartActivity` returns null when nothing is
+listening and the source this would use is not registered with the tracer provider — and
+`AgenticShop.Shared/Tracing` configures instrumentation for all three services, so a Stock-specific
+source name does not belong there. The consequence is split: log lines carry the producer's trace id,
+which is what makes a delivery grep-able end to end, but the span never reaches an OTLP collector, so
+the consumer's work is absent from the trace tree. Fixing it means letting `AddServiceTracing` accept
+per-service source names.
+
+**The two publisher copies are guarded asymmetrically.** *Low.* Stock's suite asserts that an
+unreachable broker does not stop the host, with a non-vacuity check that the hosted service is actually
+registered — without it, "the host still answers" passes just as happily when the publisher was never
+started. Ordering's suite proves delivery but not that property, so a regression which let an exception
+escape `ExecuteAsync` would be caught in Stock and not in Ordering. The assembly boundary forbids one
+test reading both implementations, so parity means two tests asserting the same list; only one list is
+complete.
 
 ### Data and API
 
@@ -242,11 +281,11 @@ rather than by documentation, and 2b's consumer queue hits the same wall if it i
 `durable: false` without also being `exclusive: true`. A durable queue is the right answer anyway for
 a consumer that must not lose work between restarts.
 
-**The broker's image tag is declared in two places.** *Info.* `docker-compose.yml` and Ordering's
-`TestRabbitMq.Image`. Ordering's `ComposeConfigurationTests` fails if they diverge — the same
-arrangement as the PostgreSQL tag, which is declared in four places and guarded three times. Only
-Ordering guards the broker because only Ordering has a broker container; adding the test to Catalog or
-Stock would assert nothing and pass vacuously.
+**The broker's image tag is declared in three places.** *Info.* `docker-compose.yml` plus one
+`TestRabbitMq.Image` per service that has a broker container — Ordering's and Stock's. Both services'
+`ComposeConfigurationTests` fail if either diverges. Catalog has no copy and must not gain one: it has
+no broker container, so a guard there would assert nothing and pass vacuously. Same arrangement as the
+PostgreSQL tag, which is declared in four places and guarded three times.
 
 **PostgreSQL image tag is declared in four places.** *Info.* `docker-compose.yml` plus one
 `TestPostgreSql.Image` per integration project. All three `ComposeConfigurationTests` fail if they

@@ -868,7 +868,7 @@ Each was considered and declined, with the phase that would justify it:
 
 | Declined | Why not yet |
 |---|---|
-| Inbox | Consumer-side deduplication. Nothing consumes a message yet, so there is no delivery to deduplicate. Its prerequisite is settled — `OrderPlaced` has carried a stable message id since the first event was designed, which is the part that was cheap to decide early and expensive to retrofit |
+| Inbox | Consumer-side deduplication. **Implemented in Stock but not registered** — `InboxMessage`, its table and the consumer that writes it exist and are tested against a real broker, while `Program.cs` starts neither, so the shipped system still has one reservation path. It moves from "declined" to "live" in the increment that deletes the synchronous reserve. Its prerequisite was settled first: `OrderPlaced` has carried a stable message id since the first event was designed, which is the part that was cheap to decide early and expensive to retrofit |
 | Redis | No cache pressure, no distributed idempotency store to hold |
 | Authentication / authorization | Deferred by the project owner. Adding it later needs a customer identity column on `Order` plus a cross-cutting policy — a migration and a concern, which is why no placeholder seam was pre-built |
 | Kubernetes / Helm, YARP gateway | Phase 4 |

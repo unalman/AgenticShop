@@ -27,9 +27,9 @@ calls, and the one that forced the conventions to be re-derived rather than copi
 correlation middleware, `IRequestContract`, the logging, tracing and health-response configuration
 and the exception-handler skeleton.
 
-Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **519 pass**
-(Shared 45 unit; Catalog 68 unit + 40 integration; Stock 82 unit + 64 integration; Ordering 142 unit
-+ 78 integration). Database isolation verified 22/22.
+Verified baseline: `dotnet build` → 0 errors, 0 warnings. `dotnet test` → **545 pass**
+(Shared 45 unit; Catalog 68 unit + 44 integration; Stock 82 unit + 77 integration; Ordering 142 unit
++ 87 integration). Database isolation verified 22/22.
 
 ## 2. Service boundaries
 
@@ -215,7 +215,7 @@ each deferral, including the few with no assigned phase: `docs/DECISIONS.md`.
 
 **Still deferred — do not add:**
 
-**Inbox · Redis · authentication / authorization · Kubernetes / Helm · API gateway (YARP) ·
+**Redis · authentication / authorization · Kubernetes / Helm · API gateway (YARP) ·
 CQRS · DDD tactical patterns · event sourcing.**
 
 Also do not add at this size: repository or service layers, an `Application` layer, a mediator,
@@ -239,14 +239,16 @@ profile, not `full`, because a broker has no host-process equivalent and no port
 `dotnet watch` keeps working and gains something to publish to (→ "RabbitMQ, in compose's default
 profile").
 
-**Also permitted, because a message now flows:** the **outbox, producer side only** — Ordering writes
-an event row inside the order's own `SaveChangesAsync` and a hosted publisher drains it to a durable
-topic exchange with publisher confirms on (Ordering decision **O19**). The **inbox stays deferred**:
-nothing consumes a message yet, so there is no delivery to deduplicate. So are the saga, dead-letter
-queues and consumer retry — each needs a consumer to be for. Two settings are deliberately temporary
-and listed in `docs/KNOWN-ISSUES.md`: `mandatory: false`, because no queue is bound yet, and
-Confirmed-only emission, because reservation is still synchronous. Nothing else on the list above has
-been unblocked.
+**Also permitted, because a message now flows:** the **outbox** (Ordering decision **O19**) and
+**Stock's consumer with its inbox** — the latter built and tested against a real broker but **not
+registered in `Program.cs`**, so nothing consumes a message in the shipped system and the synchronous
+reserve is still the only live path (Stock decision **D16**). Registering the consumer before that path
+is deleted would double-hold every order, which is why the two change in one commit. The saga,
+dead-letter queues and consumer retry stay deferred — though the DLQ deferral's own reasoning, "each
+needs a consumer to be for", has now expired, and what not having one costs is recorded in
+`docs/KNOWN-ISSUES.md`. Two settings are deliberately temporary and listed there too: `mandatory:
+false`, because no queue is bound in production yet, and Confirmed-only emission, because reservation
+is still synchronous. Nothing else on the list above has been unblocked.
 
 Three of those carry a rule that is easy to get wrong, and only one of them is fully test-guarded.
 **Do not extend retry to another outbound call before reading O18** — the exemption on reserve is what
