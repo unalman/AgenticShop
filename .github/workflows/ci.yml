@@ -1,0 +1,81 @@
+# CI: build, test, and a migrations drift gate. Nothing else — no image build, no publish, no
+# deployment, no cache. What each omission costs is recorded in docs/DECISIONS.md under
+# "CI as a drift gate, not a deployment pipeline".
+#
+# One job, deliberately. The whole suite runs in about a minute, so splitting build / unit /
+# integration into parallel jobs would pay for a second restore and an artifact handoff to save
+# less than the handoff costs.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The default token is enough for checkout and nothing else. This pipeline publishes nowhere.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Build, test, migrations drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # global-json-file rather than a hardcoded dotnet-version: global.json already states the SDK
+      # and its rollForward policy, and a second version written here would be a second source of
+      # truth for the same number — the reason docker-compose.yml does not parameterise its ports.
+      - name: Install the pinned SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # dotnet-ef is a local tool pinned in dotnet-tools.json, and the drift gate below needs it.
+      - name: Restore pinned local tools
+        run: dotnet tool restore
+
+      # Release, because that is what docker/Dockerfile.service publishes — this tests the
+      # configuration that ships rather than the one that is convenient locally. TreatWarningsAsErrors
+      # is on, so this step is itself a gate: a warning fails the build.
+      - name: Build
+        run: dotnet build AgenticShop.slnx --configuration Release
+
+      # 517 tests. The 180 integration tests need Docker, which ubuntu-latest provides, and they
+      # need nothing else: each project starts its own PostgreSQL through Testcontainers. No compose
+      # stack and no `services:` block belongs here — the harness was verified isolated by running it
+      # with `docker compose stop db`, and starting compose would only compete for the same ports.
+      - name: Test
+        run: dotnet test AgenticShop.slnx --configuration Release --no-build
+
+      # Each service owns its migration history, so each is gated separately. A model change with no
+      # migration behind it is a silent divergence between code and schema, and nothing else in this
+      # pipeline would catch it.
+      #
+      # Three details here were measured rather than assumed:
+      #
+      #   --configuration, never -c. In `dotnet ef`, -c means --context, the DbContext name, so
+      #     `-c Release` does not select a configuration — it fails with "No DbContext named 'Release'
+      #     was found." `dotnet build` and `dotnet test` use -c for configuration, which makes the
+      #     inconsistency easy to carry across by habit. Every flag below is long-form for that reason.
+      #   --no-build, after the Release build above. Without it each invocation rebuilds; with it the
+      #     three share the assemblies already produced. The configuration must match the build's,
+      #     or --no-build looks for assemblies that were never produced.
+      #   No database is needed. The check compares the model against the last migration in memory.
+      #     `dotnet ef` runs the app in Development by default, where appsettings.Development.json
+      #     supplies a connection string that is never dialled. Setting ASPNETCORE_ENVIRONMENT to
+      #     anything else here would make RequireConnectionString throw at startup, and the gate
+      #     would then fail for a reason that has nothing to do with drift.
+      - name: Migrations drift gate
+        run: |
+          dotnet ef migrations has-pending-model-changes --configuration Release --no-build --project src/AgenticShop.Catalog --startup-project src/AgenticShop.Catalog
+          dotnet ef migrations has-pending-model-changes --configuration Release --no-build --project src/AgenticShop.Stock --startup-project src/AgenticShop.Stock
+          dotnet ef migrations has-pending-model-changes --configuration Release --no-build --project src/AgenticShop.Ordering --startup-project src/AgenticShop.Ordering
+
+      # Deliberately absent: `docker compose --profile full build`. It is the only thing that would
+      # catch a broken docker/Dockerfile.service, and declining it is a recorded trade-off rather than
+      # an oversight — see docs/DECISIONS.md. Add it when a Dockerfile change has actually gone
+      # unnoticed, not before.

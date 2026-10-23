@@ -85,7 +85,9 @@ within a major.
 blast radius grows with the file.
 
 **Revisit.** When a Npgsql provider release targets a newer Relational, the pinning can be
-dropped. Also add `dotnet list package --vulnerable` once CI exists.
+dropped. The second trigger recorded here has fired: CI exists as of 2026-10-22, and
+`dotnet list package --vulnerable` was deliberately **not** added along with it — see "CI as a drift
+gate, not a deployment pipeline" for what that pipeline declined and why.
 
 ### Fixed ports
 
@@ -160,6 +162,46 @@ compose has no collector, so spans have only ever reached the console exporter. 
 to a registry or built for a second architecture; everything measured here is local amd64. None of the
 three is a gap this profile was meant to close, but "verified in a container" could otherwise be read
 as covering them.
+
+### CI as a drift gate, not a deployment pipeline
+
+**Context.** Phase 1's last item. Three failures were possible that nothing between two commits would
+catch: a warning, which `TreatWarningsAsErrors` turns into a build break but only for whoever happens
+to build; a model change with no migration behind it; and a broken test.
+
+**Decision.** One GitHub Actions workflow, `.github/workflows/ci.yml`, one job: build in Release, run
+all 517 tests, then run `dotnet ef migrations has-pending-model-changes` per service. Triggers on a
+push to `main` and on every pull request. Publishes nothing.
+
+**Why one job.** The suite runs in about a minute. Splitting build, unit and integration across
+parallel jobs would pay for a second restore and an artifact handoff to save less than the handoff
+costs.
+
+**Why Release.** It is what `docker/Dockerfile.service` publishes, so the pipeline tests the
+configuration that ships rather than the one that is convenient locally.
+
+**Why the drift gate earns its step even though the tests already catch drift.** Measured, because the
+answer is not the obvious one. Adding an unmapped property to `Product` and running Catalog's
+integration suite failed **35 of 40 tests** — but not with a missing column. EF Core throws
+`PendingModelChangesWarning` from inside `MigrateAsync()`, so the test host never starts. That check is
+Development-only, because §4.4 confines `MigrateAsync()` to Development: in a real deployment nothing
+runs migrations at startup, the warning never fires, and the same drift surfaces much later as a
+`42703` on the first query selecting the column. The gate covers that path, and it names the problem —
+"Add a new migration" — instead of leaving 35 host-startup failures to be read back to a cause.
+
+**Declined, with the cost recorded.** No image build, so nothing catches a broken
+`docker/Dockerfile.service` — add it when a Dockerfile change has actually gone unnoticed, not before.
+No NuGet cache, because `setup-dotnet`'s `cache: true` wants a lock file this repository does not
+generate. No `dotnet list package --vulnerable`, even though the revisit trigger for it was "once CI
+exists" and has now fired. No publish, no registry, no deployment.
+
+**Two traps the workflow records rather than rediscovering.** In `dotnet ef`, `-c` is `--context`, the
+DbContext name: `-c Release` fails with `No DbContext named 'Release' was found`, while the same `-c`
+means configuration to `dotnet build` and `dotnet test`. Every flag in the workflow is long-form for
+that reason. And the gate needs no database, but only because `dotnet ef` runs the app in Development
+by default, where `appsettings.Development.json` supplies a connection string that is never dialled —
+setting `ASPNETCORE_ENVIRONMENT` in the workflow would make `RequireConnectionString` throw at startup
+and fail the gate for a reason that has nothing to do with drift.
 
 ---
 
@@ -778,7 +820,6 @@ Each was considered and declined, with the phase that would justify it:
 | Reservation expiry / `ExpiresAtUtc` | Phase 3. Release is an explicit call only; no background worker. The cost became concrete with Ordering: a release that fails during compensation strands the hold, and nothing lifts it. Since Phase 1 the same worker would also lift a stranded idempotency claim |
 | Payment / any money movement | Not in scope at any phase. It is also what keeps the confirm-phase residual survivable — a `PartiallyConfirmed` order strands *inventory*, not money. Adding a payment step would turn it into a financial inconsistency and would need the outbox and the saga first |
 | Compensating return-to-stock for a confirmed reservation | Stock's `Confirmed` is terminal by decision D3 and confirm decrements `quantity_on_hand`, so undoing one needs a new inventory-adjustment transition with its own audit trail. Ordering records a terminal `PartiallyConfirmed` order instead — see `src/AgenticShop.Ordering/docs/DECISIONS.md` → O14 |
-| CI pipeline | Phase 1 |
 | CORS policy | No browser client |
 | Rate limiting, HTTPS, HSTS, tightened `AllowedHosts` | No non-local deployment |
 | Stock list/paging endpoint | Nothing needed it; symmetry is not a reason |
@@ -809,3 +850,9 @@ they still do unless `--profile full` is asked for. What closed it was not a cha
 Phase 1 itself — health checks and tracing are properties of a *running* system, and until now there
 was no way to observe the three as containers rather than as three processes sharing one machine. See
 "One Dockerfile for three services" above.
+
+**CI was on this list until Phase 1 closed it too.** Added 2026-10-22 as one GitHub Actions workflow,
+and it is the last item Phase 1 named. This was the easiest deferral on the list to justify and the
+easiest to over-justify: with no deployment there was nothing to build a pipeline *for*, so what
+arrived is a gate rather than a pipeline, and keeping that distinction is the whole decision. See "CI
+as a drift gate, not a deployment pipeline" above.

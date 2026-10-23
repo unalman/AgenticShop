@@ -124,7 +124,14 @@ Now that a network hop exists, make its failure modes survivable and visible.
   own ports also exposed a latent test-isolation defect — the readiness probe froze its target URL at
   registration, so it dialled `localhost:5081` instead of the factory's unresolvable override — now
   fixed and pinned by a guard.
-- CI: build, test, and `dotnet ef migrations has-pending-model-changes` as a drift gate
+- ~~CI: build, test, and `dotnet ef migrations has-pending-model-changes` as a drift gate.~~
+  **Done.** One GitHub Actions workflow, one job, Release configuration: build, all 517 tests, then the
+  drift gate per service. `docs/DECISIONS.md` → "CI as a drift gate, not a deployment pipeline". The
+  gate earns its step for a measured reason rather than a tidy one: adding an unmapped property to
+  `Product` failed **35 of Catalog's 40 integration tests**, but through EF's `PendingModelChangesWarning`
+  thrown inside `MigrateAsync()` — which §4.4 confines to Development. On the production path nothing
+  runs migrations at startup, so that warning never fires and the same drift surfaces much later as a
+  `42703` on the first query selecting the column. The gate is what covers that path.
 
 The extraction came first on purpose: Serilog and OpenTelemetry both touch the logging arms, so
 wiring them before consolidating would have meant writing the same change three times.

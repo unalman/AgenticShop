@@ -317,8 +317,8 @@ through `http/ordering.http`. **The suite is now at 517.**
 Shared infrastructure library — **done** · idempotency keys on `POST /orders` — **done** ·
 retry/circuit-breaker/timeout policies on Ordering's typed clients — **done** · Serilog structured
 logging — **done in all three services** · OpenTelemetry distributed tracing — **done in all three** ·
-dependency-aware health checks — **done** · Dockerfiles and a `full` compose profile — **done** · CI.
-Retry is driven by a measured problem:
+dependency-aware health checks — **done** · Dockerfiles and a `full` compose profile — **done** ·
+CI — **done**. Retry is driven by a measured problem:
 a 40-way burst against 10 units of stock held only 4, because `xmin` conflicts are not retried.
 Idempotency keys came first, because retrying without them double-reserves stock — and they closed
 the largest residual the repository had, since a retried `POST /orders` used to create a second order
