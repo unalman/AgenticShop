@@ -9,7 +9,7 @@ namespace AgenticShop.Ordering.Domain;
 /// because a refused hold writes no reservation row, so a redelivery had nothing to collide with and
 /// could take a second hold. Here the domain already refuses the second settlement:
 /// <see cref="Order.TransitionTo"/> is reachable only from <c>Pending</c>, so a redelivered
-/// <c>StockReserved</c> finds a terminal order and changes nothing. Copying Stock's justification
+/// <c>StockCommitted</c> finds a terminal order and changes nothing. Copying Stock's justification
 /// across would have been a plausible sentence and a wrong one.
 /// </para>
 /// <para>

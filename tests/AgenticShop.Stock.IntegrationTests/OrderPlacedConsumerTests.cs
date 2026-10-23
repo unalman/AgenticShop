@@ -35,7 +35,7 @@ public sealed class OrderPlacedConsumerTests(StockMessagingFixture fixture) : IA
     public Task DisposeAsync() => Task.CompletedTask;
 
     [Fact]
-    public async Task AnOrderPlacedIsHeldAndAnsweredWithStockReserved()
+    public async Task AnOrderPlacedTakesTheStockAndAnswersWithStockCommitted()
     {
         var productId = Guid.NewGuid();
         await fixture.SeedStockAsync(productId, quantityOnHand: 10);
@@ -60,31 +60,31 @@ public sealed class OrderPlacedConsumerTests(StockMessagingFixture fixture) : IA
         reservations.Should().ContainSingle();
         reservations[0].OrderId.Should().Be(orderId);
         reservations[0].Quantity.Should().Be(2);
-        reservations[0].Status.Should().Be(ReservationStatus.Pending,
-            "the consumer holds; confirming is the saga's decision, and a Confirmed reservation is " +
-            "terminal and can never be released as compensation");
+        reservations[0].Status.Should().Be(ReservationStatus.Confirmed,
+            "the consumer reserves and confirms in one transaction, so Pending is never persisted from " +
+            "this path — the same shape Order.Pending had in Phase 0");
 
         var item = await fixture.ReadItemAsync(productId);
 
         item.Should().NotBeNull();
-        item!.QuantityOnHand.Should().Be(10, "a hold does not ship anything");
-        item.Reserved.Should().Be(2);
+        item!.QuantityOnHand.Should().Be(8, "two units were shipped, not merely held");
+        item.Reserved.Should().Be(0, "reserve added two and confirm took them back off in the same transaction");
         item.Available.Should().Be(8);
 
         // And the outcome reaches a consumer of Stock's exchange, carrying the producer's trace.
         var outcome = await fixture.ConsumeOutcomeAsync();
 
-        outcome.RoutingKey.Should().Be(StockEventTopology.ReservedRoutingKey);
+        outcome.RoutingKey.Should().Be(StockEventTopology.CommittedRoutingKey);
 
-        var reserved = JsonSerializer.Deserialize<StockReserved>(outcome.Body, StockMessageJson.Options);
+        var committed = JsonSerializer.Deserialize<StockCommitted>(outcome.Body, StockMessageJson.Options);
 
-        reserved.Should().NotBeNull();
-        reserved!.OrderId.Should().Be(orderId);
-        reserved.Lines.Should().ContainSingle();
-        reserved.Lines[0].ProductId.Should().Be(productId);
-        reserved.Lines[0].Quantity.Should().Be(2);
+        committed.Should().NotBeNull();
+        committed!.OrderId.Should().Be(orderId);
+        committed.Lines.Should().ContainSingle();
+        committed.Lines[0].ProductId.Should().Be(productId);
+        committed.Lines[0].Quantity.Should().Be(2);
 
-        outcome.MessageId.Should().Be(reserved.MessageId.ToString(),
+        outcome.MessageId.Should().Be(committed.MessageId.ToString(),
             "the AMQP property and the payload are set from one value");
 
         outcome.TraceParent.Should().Be(TraceParent,
@@ -94,8 +94,8 @@ public sealed class OrderPlacedConsumerTests(StockMessagingFixture fixture) : IA
         var outbox = await fixture.ReadOutboxAsync();
 
         outbox.Should().ContainSingle();
-        outbox[0].Id.Should().Be(reserved.MessageId);
-        outbox[0].RoutingKey.Should().Be(StockEventTopology.ReservedRoutingKey);
+        outbox[0].Id.Should().Be(committed.MessageId);
+        outbox[0].RoutingKey.Should().Be(StockEventTopology.CommittedRoutingKey);
 
         await WaitUntilAsync(
             async () => (await fixture.ReadOutboxAsync()).Single().IsPublished,
@@ -103,7 +103,7 @@ public sealed class OrderPlacedConsumerTests(StockMessagingFixture fixture) : IA
     }
 
     [Fact]
-    public async Task ARedeliveredMessageDoesNotHoldTwice()
+    public async Task ARedeliveredMessageDoesNotCommitTwice()
     {
         var productId = Guid.NewGuid();
         await fixture.SeedStockAsync(productId, quantityOnHand: 10);
@@ -137,14 +137,16 @@ public sealed class OrderPlacedConsumerTests(StockMessagingFixture fixture) : IA
 
         var reservations = await fixture.ReadReservationsAsync();
 
-        reservations.Should().HaveCount(2, "one hold per message, and the redelivery is not a message");
+        reservations.Should().HaveCount(2, "one reservation per message, and the redelivery is not a message");
         reservations.Count(r => r.OrderId == orderId).Should().Be(1);
         reservations.Single(r => r.OrderId == orderId).Quantity.Should().Be(3);
 
         var item = await fixture.ReadItemAsync(productId);
 
-        item!.Reserved.Should().Be(4, "3 for the first order plus 1 for the second, never 6");
-        item.QuantityOnHand.Should().Be(10);
+        item!.QuantityOnHand.Should().Be(6,
+            "3 for the first order plus 1 for the second — a redelivery that committed would make it 3");
+        item.Reserved.Should().Be(0,
+            "each line is confirmed in the transaction that reserves it, so nothing is left held");
 
         var inbox = await fixture.ReadInboxAsync();
 
@@ -159,7 +161,7 @@ public sealed class OrderPlacedConsumerTests(StockMessagingFixture fixture) : IA
     /// <remarks>
     /// A refused hold writes no reservation row, so a redelivery has nothing to collide with. If the
     /// consumer relied on the unique index alone, this sequence would answer one order with
-    /// <c>StockReservationRejected</c> and then, once stock arrived, with <c>StockReserved</c> — two
+    /// <c>StockReservationRejected</c> and then, once stock arrived, with <c>StockCommitted</c> — two
     /// contradictory outcomes for one message id, and a saga that cannot tell which to believe.
     /// </remarks>
     [Fact]
@@ -219,7 +221,11 @@ public sealed class OrderPlacedConsumerTests(StockMessagingFixture fixture) : IA
             "the redelivery must not have held anything: the order was already answered with a refusal, " +
             "and answering it again with a hold is the contradiction the inbox exists to prevent");
 
-        (await fixture.ReadItemAsync(productId))!.Reserved.Should().Be(0,
+        // Asserted on quantity_on_hand rather than reserved, and that is not a stylistic choice: with
+        // reserve-and-confirm in one transaction `reserved` ends at zero on every path, including the
+        // one where the redelivery wrongly succeeded. An assertion that cannot distinguish success from
+        // failure is not a guard.
+        (await fixture.ReadItemAsync(productId))!.QuantityOnHand.Should().Be(10,
             "stock arrived after the refusal, and the redelivery must not have retroactively taken it");
 
         (await fixture.ReadInboxAsync()).Should().ContainSingle(m => m.MessageId == messageId);

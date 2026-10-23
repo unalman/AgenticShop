@@ -160,7 +160,7 @@ Full account: `../../../docs/KNOWN-ISSUES.md` → "The 'unexplained 5xx' was a r
 **Added 2026-10-23, Phase 2b-i.**
 
 **Decision.** `OrderPlacedConsumer` reads `OrderPlaced` from a durable queue Stock owns, holds every
-line of the order or none of them, and publishes `StockReserved` or `StockReservationRejected` through
+line of the order or none of them, and publishes `StockCommitted` or `StockReservationRejected` through
 an outbox of its own. An `InboxMessage` row keyed on the producer's message id makes redelivery a
 no-op. **Neither this consumer nor Stock's publisher is registered in `Program.cs`.** The test host
 registers both; production does not.
@@ -175,7 +175,7 @@ deletes the synchronous reserve and moves Ordering's emission point, in one comm
 **Why the inbox, when `UNIQUE(order_id, stock_item_id)` already looks like deduplication.** It covers
 a different case, and the gap is not hypothetical — `ARejectedMessageStaysRejectedAfterStockArrives`
 reproduces it. A *refused* hold writes no reservation row, so a redelivery has nothing to collide
-with; if stock arrived in between, the redelivery succeeds and publishes `StockReserved` for an order
+with; if stock arrived in between, the redelivery succeeds and publishes `StockCommitted` for an order
 already answered with `StockReservationRejected`. Two contradictory outcomes for one message id. The
 unique index also cannot say whether the outcome event was published, only that a hold exists. The
 inbox row is written in the same transaction as the hold and the outbox row, which makes "processed"
@@ -217,7 +217,7 @@ line is the only surviving copy, which is a real loss and is recorded rather tha
 **Verified.** Full suite **545/545**, of which Stock's integration project is 77 (68 before this
 decision, plus one broker-image guard and eight messaging tests). The messaging tests run against a
 real `rabbitmq:4-alpine` container and assert the round trip end to end: a published `OrderPlaced`
-produces a `Pending` reservation, the counters move, an inbox row appears, and a `StockReserved`
+produces a `Pending` reservation, the counters move, an inbox row appears, and a `StockCommitted`
 arrives on a queue bound to `stock.#` carrying the producer's `traceparent` across both hops.
 Redelivery of one message id holds once. A refusal followed by restocking and redelivery still holds
 nothing.
@@ -229,6 +229,35 @@ publishes `OrderPlaced` only for `Confirmed` orders.
 **Revisit.** The very next increment, which registers both hosted services, deletes the synchronous
 reserve, moves Ordering's emission to before reservation, and turns `POST /orders` into a 202 with a
 `Pending` order.
+
+### Revised 2026-10-23, the same day — it now commits, and the event was renamed
+
+Two things in this entry were superseded within hours of being written, both by the same realisation.
+
+**"Why it reserves but does not confirm" is no longer the design.** That paragraph argued that
+confirming early would discard the saga's only compensation, because a `Confirmed` reservation is
+terminal (D3) and Ordering may not release one (its O10). The argument was sound but it was answering a
+question this design does not have: the two-phase split existed so Ordering could undo a *partial*
+hold, and an all-or-nothing hold has no partial state to undo. With every line taken or none taken in
+one transaction, there is nothing left to compensate for, so the consumer reserves and confirms
+together and the units leave `quantity_on_hand` before the outcome event exists.
+
+The cost is stated rather than hidden: if cancellation ever arrives there is nothing to release.
+`StockItem.ReleaseReservation` and the `Released` status are kept for that conversation — which makes
+them unreachable from this path, the same shape `Order.Pending` had in Phase 0.
+
+**`StockReserved` became `StockCommitted`, and `stock.reserved` became `stock.committed`.** Not
+cosmetics: a consumer reading "reserved" would reasonably assume the units were still held and could
+be given back, and would design its own compensation around a guarantee Stock no longer offers.
+Renaming was free here and would not have been later, which is the same argument `docs/ROADMAP.md`
+makes about deciding a message id early. Note the deliberate vocabulary split — the table stays
+`stock_reservations` and the entity stays `StockReservation`, because that is the audit record, while
+the event is named for what happened to inventory.
+
+So the "Verified" paragraph above is historical: the counters it describes moving now move further
+(`quantity_on_hand` drops, `reserved` returns to zero), the reservation it calls `Pending` is written
+`Confirmed`, and the suite has grown since. The current numbers are in the increment that made the
+change.
 
 ## Not in the approval list, decided during implementation
 

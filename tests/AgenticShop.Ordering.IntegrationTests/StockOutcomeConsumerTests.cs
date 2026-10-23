@@ -36,7 +36,7 @@ public sealed class StockOutcomeConsumerTests(OrderingMessagingFixture fixture) 
     public Task DisposeAsync() => Task.CompletedTask;
 
     [Fact]
-    public async Task StockReservedSettlesAPendingOrderAsConfirmed()
+    public async Task StockCommittedSettlesAPendingOrderAsConfirmed()
     {
         var productId = Guid.NewGuid();
         var order = await fixture.SeedPendingOrderAsync(productId, quantity: 2);
@@ -46,10 +46,10 @@ public sealed class StockOutcomeConsumerTests(OrderingMessagingFixture fixture) 
 
         var messageId = Guid.NewGuid();
 
-        await fixture.PublishStockReservedAsync(
+        await fixture.PublishStockCommittedAsync(
             messageId,
             order.Id,
-            [new StockReservedLine(productId, 2)],
+            [new StockCommittedLine(productId, 2)],
             TraceParent);
 
         await WaitUntilAsync(
@@ -67,7 +67,7 @@ public sealed class StockOutcomeConsumerTests(OrderingMessagingFixture fixture) 
 
         inbox.Should().ContainSingle();
         inbox[0].MessageId.Should().Be(messageId);
-        inbox[0].EventType.Should().Be(StockEventTopology.ReservedRoutingKey,
+        inbox[0].EventType.Should().Be(StockEventTopology.CommittedRoutingKey,
             "the row records which event settled the order, which is what makes a later contradiction diagnosable");
     }
 
@@ -109,9 +109,9 @@ public sealed class StockOutcomeConsumerTests(OrderingMessagingFixture fixture) 
         var order = await fixture.SeedPendingOrderAsync(productId, quantity: 2);
 
         var messageId = Guid.NewGuid();
-        var lines = new[] { new StockReservedLine(productId, 2) };
+        var lines = new[] { new StockCommittedLine(productId, 2) };
 
-        await fixture.PublishStockReservedAsync(messageId, order.Id, lines);
+        await fixture.PublishStockCommittedAsync(messageId, order.Id, lines);
 
         await WaitUntilAsync(
             async () => (await fixture.ReadOrderAsync(order.Id))!.IsTerminal,
@@ -121,7 +121,7 @@ public sealed class StockOutcomeConsumerTests(OrderingMessagingFixture fixture) 
 
         // The same message again — what a producer whose outbox row was lost after the broker
         // acknowledged it would send.
-        await fixture.PublishStockReservedAsync(messageId, order.Id, lines);
+        await fixture.PublishStockCommittedAsync(messageId, order.Id, lines);
 
         await PublishCanaryAndWaitAsync();
 
@@ -155,8 +155,8 @@ public sealed class StockOutcomeConsumerTests(OrderingMessagingFixture fixture) 
 
         var settlingMessageId = Guid.NewGuid();
 
-        await fixture.PublishStockReservedAsync(
-            settlingMessageId, order.Id, [new StockReservedLine(productId, 2)]);
+        await fixture.PublishStockCommittedAsync(
+            settlingMessageId, order.Id, [new StockCommittedLine(productId, 2)]);
 
         await WaitUntilAsync(
             async () => (await fixture.ReadOrderAsync(order.Id))!.IsTerminal,
@@ -201,8 +201,8 @@ public sealed class StockOutcomeConsumerTests(OrderingMessagingFixture fixture) 
         var canaryProduct = Guid.NewGuid();
         var canary = await fixture.SeedPendingOrderAsync(canaryProduct, quantity: 1);
 
-        await fixture.PublishStockReservedAsync(
-            Guid.NewGuid(), canary.Id, [new StockReservedLine(canaryProduct, 1)]);
+        await fixture.PublishStockCommittedAsync(
+            Guid.NewGuid(), canary.Id, [new StockCommittedLine(canaryProduct, 1)]);
 
         await WaitUntilAsync(
             async () => (await fixture.ReadOrderAsync(canary.Id))!.IsTerminal,

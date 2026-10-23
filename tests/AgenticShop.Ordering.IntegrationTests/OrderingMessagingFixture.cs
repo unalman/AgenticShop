@@ -127,7 +127,7 @@ public sealed class OrderingMessagingFixture : IAsyncLifetime
 
         foreach (var routingKey in new[]
                  {
-                     StockEventTopology.ReservedRoutingKey,
+                     StockEventTopology.CommittedRoutingKey,
                      StockEventTopology.ReservationRejectedRoutingKey
                  })
         {
@@ -204,14 +204,14 @@ public sealed class OrderingMessagingFixture : IAsyncLifetime
     }
 
     /// <summary>Publishes an outcome as Stock's outbox would, properties and header included.</summary>
-    public Task PublishStockReservedAsync(
+    public Task PublishStockCommittedAsync(
         Guid messageId,
         Guid orderId,
-        IReadOnlyList<StockReservedLine> lines,
+        IReadOnlyList<StockCommittedLine> lines,
         string? traceParent = null)
         => PublishOutcomeAsync(
-            StockEventTopology.ReservedRoutingKey,
-            new StockReserved(messageId, orderId, DateTimeOffset.UtcNow, lines),
+            StockEventTopology.CommittedRoutingKey,
+            new StockCommitted(messageId, orderId, DateTimeOffset.UtcNow, lines),
             messageId,
             traceParent);
 

@@ -5,34 +5,39 @@ namespace AgenticShop.Stock.Messaging;
 
 /// <summary>
 /// What Stock publishes when it has finished with an <see cref="OrderPlaced"/>: either every line was
-/// held, or none was.
+/// taken from inventory, or none was.
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>All-or-nothing per order, in one transaction.</b> The synchronous path this replaces reserves
-/// line by line and releases the earlier holds when a later one fails. Here the whole order is a unit
-/// of work: every line is held and the outcome row is written in one <c>SaveChangesAsync</c>, or
+/// <b>All-or-nothing per order, in one transaction.</b> The synchronous path this replaces reserved
+/// line by line and released the earlier holds when a later one failed. Here the whole order is a unit
+/// of work: every line is taken and the outcome row is written in one <c>SaveChangesAsync</c>, or
 /// nothing is and a rejection is written instead. That removes the compensation the synchronous path
-/// needed, because there is no intermediate state to undo — and it is why <see cref="StockReserved"/>
+/// needed, because there is no intermediate state to undo — and it is why <see cref="StockCommitted"/>
 /// carries the lines back rather than a count.
 /// </para>
 /// <para>
-/// <b>Reserved, not confirmed.</b> These are holds in <c>Pending</c>, which is what the event name
-/// says. Confirming them is the saga's decision, not the consumer's, and the difference is not
-/// cosmetic: a <c>Confirmed</c> reservation is terminal (Stock's D3) and Ordering is forbidden from
-/// releasing one (its O10). Reserving and confirming in the same breath would therefore throw away the
-/// only compensation the saga has. Confirming these holds is Phase 2b's later increment, and until it
-/// lands they stay <c>Pending</c>.
+/// <b>Committed, not merely held.</b> The consumer reserves and confirms in the same transaction, so by
+/// the time this event exists the units have already left <c>quantity_on_hand</c> and the reservation
+/// row is <c>Confirmed</c>. An earlier revision of this design held in <c>Pending</c> and left
+/// confirmation to a saga; it changed because the two-phase split existed to let Ordering undo a
+/// <i>partial</i> hold, and an all-or-nothing hold has no partial state to undo. See D16's revision —
+/// the earlier reasoning was not careless, it was answering a question the design no longer has.
+/// </para>
+/// <para>
+/// The cost is recorded rather than hidden: <c>Confirmed</c> is terminal (D3), so if cancellation ever
+/// arrives there is nothing left to release. <c>StockItem.ReleaseReservation</c> is kept for that
+/// conversation, which is Phase 3's at the earliest.
 /// </para>
 /// </remarks>
-public sealed record StockReserved(
+public sealed record StockCommitted(
     Guid MessageId,
     Guid OrderId,
     DateTimeOffset OccurredAtUtc,
-    IReadOnlyList<StockReservedLine> Lines);
+    IReadOnlyList<StockCommittedLine> Lines);
 
-/// <summary>One hold that was taken.</summary>
-public sealed record StockReservedLine(Guid ProductId, int Quantity);
+/// <summary>One line that was taken from inventory.</summary>
+public sealed record StockCommittedLine(Guid ProductId, int Quantity);
 
 /// <summary>
 /// No line was held, and why. Carrying the reason is what lets the saga distinguish "sell less" from
@@ -94,7 +99,14 @@ public static class StockEventTopology
     /// <summary>Stock's own exchange, for the outcomes it publishes.</summary>
     public const string StockExchange = "agenticshop.stock";
 
-    public const string ReservedRoutingKey = "stock.reserved";
+    /// <summary>
+    /// Named for the effect on inventory rather than for the row it writes. The table is
+    /// <c>stock_reservations</c> and the entity is <see cref="Domain.StockReservation"/>, because that
+    /// is the audit record; the event says what happened to stock, because that is what a consumer
+    /// acts on. The two vocabularies deliberately differ — <c>stock.reserved</c> would have invited a
+    /// consumer to assume the units were still merely held and could be given back.
+    /// </summary>
+    public const string CommittedRoutingKey = "stock.committed";
 
     public const string ReservationRejectedRoutingKey = "stock.reservation-rejected";
 

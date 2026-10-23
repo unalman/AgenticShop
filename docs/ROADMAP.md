@@ -205,7 +205,7 @@ Verified at closure: `dotnet build` clean under `TreatWarningsAsErrors`; **519 t
   `administrator` tag, because the image's env-var bootstrap cannot create a scoped one; accepted for
   a loopback-bound throwaway container and recorded as a divergence to revisit the moment it is
   reachable off-machine.
-- Replace synchronous reservation with events: `OrderPlaced` → Stock consumes → `StockReserved` /
+- Replace synchronous reservation with events: `OrderPlaced` → Stock consumes → `StockCommitted` /
   `StockReservationRejected`. **Both consumers are built and tested against a real broker, and both
   are deliberately not registered** — neither service's `Program.cs` starts them, so the synchronous
   reserve is still the only path live and nothing can double-hold. Stock holds an order's lines or none

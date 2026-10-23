@@ -22,14 +22,14 @@ namespace AgenticShop.Ordering.Messaging;
 /// <param name="OrderId">The order that was held.</param>
 /// <param name="OccurredAtUtc">When Stock decided, not when it published — a broker outage can separate the two arbitrarily.</param>
 /// <param name="Lines">What was held. Echoed back so the saga can reconcile against the order without reading Stock.</param>
-public sealed record StockReserved(
+public sealed record StockCommitted(
     Guid MessageId,
     Guid OrderId,
     DateTimeOffset OccurredAtUtc,
-    IReadOnlyList<StockReservedLine> Lines);
+    IReadOnlyList<StockCommittedLine> Lines);
 
 /// <summary>One hold Stock took.</summary>
-public sealed record StockReservedLine(Guid ProductId, int Quantity);
+public sealed record StockCommittedLine(Guid ProductId, int Quantity);
 
 /// <summary>
 /// Nothing was held, and why. All-or-nothing per order on the producing side, so there is no partial
@@ -76,7 +76,13 @@ public static class StockEventTopology
     /// <summary>Stock's exchange. Declared idempotently on connect, because a consumer that starts before its producer must not fail on a missing exchange.</summary>
     public const string StockExchange = "agenticshop.stock";
 
-    public const string ReservedRoutingKey = "stock.reserved";
+    /// <summary>
+    /// Named for the effect on inventory rather than for the row Stock writes. Stock reserves and
+    /// confirms in one transaction, so by the time this event exists the units have left
+    /// <c>quantity_on_hand</c>; <c>stock.reserved</c> would have invited a consumer to assume they were
+    /// still merely held and could be given back.
+    /// </summary>
+    public const string CommittedRoutingKey = "stock.committed";
 
     public const string ReservationRejectedRoutingKey = "stock.reservation-rejected";
 

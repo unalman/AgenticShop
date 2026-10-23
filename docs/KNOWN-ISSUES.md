@@ -231,7 +231,7 @@ building a timer now would be the repository's first piece of scheduling machine
 stranded order is findable by query (`status = 'Pending'` and `updated_at_utc IS NULL`, which is why
 that column is nullable rather than defaulted to the placement time) but not self-healing.
 
-**The outcome consumer trusts Stock's echo of the lines.** *Low.* `StockReserved` carries the product
+**The outcome consumer trusts Stock's echo of the lines.** *Low.* `StockCommitted` carries the product
 ids and quantities Stock held, and the consumer transitions the order without reconciling them against
 the order's own lines. A mismatch — Stock held 2 of a line that asked for 3 — would settle the order as
 `Confirmed` while under-fulfilled, and nothing would notice. It is only reachable through a bug in

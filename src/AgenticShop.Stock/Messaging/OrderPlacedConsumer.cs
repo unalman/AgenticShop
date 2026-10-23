@@ -27,14 +27,19 @@ namespace AgenticShop.Stock.Messaging;
 /// mutations and the outcome event are written in a single <c>SaveChangesAsync</c>, which is what makes
 /// "processed" and "answered" one fact instead of two. Splitting them reopens the hole the inbox exists
 /// to close: a first attempt that was refused writes no reservation, so a redelivery has nothing to
-/// collide with — and if stock arrived in between, it succeeds and publishes <c>StockReserved</c> for
+/// collide with — and if stock arrived in between, it succeeds and publishes <c>StockCommitted</c> for
 /// an order already answered with <c>StockReservationRejected</c>.
 /// </para>
 /// <para>
-/// <b>It reserves; it does not confirm.</b> The holds stay <c>Pending</c>. A <c>Confirmed</c>
-/// reservation is terminal (Stock's D3) and Ordering is forbidden from releasing one (its O10), so
-/// confirming here would throw away the only compensation the saga has. Confirming these holds is a
-/// later increment's decision, and until then they sit <c>Pending</c>.
+/// <b>It commits, not merely holds.</b> Each line is reserved and confirmed inside the one
+/// transaction, so the units leave <c>quantity_on_hand</c> before the outcome event exists and the
+/// reservation row is written <c>Confirmed</c>. An earlier revision of this design held in
+/// <c>Pending</c> and left confirmation to a saga, reasoning that a <c>Confirmed</c> reservation is
+/// terminal (D3) and confirming early would destroy the only compensation available. That reasoning
+/// answered a question this design does not have: the two-phase split existed so Ordering could undo a
+/// <i>partial</i> hold, and an all-or-nothing hold has no partial state to undo. The cost is real and
+/// recorded — if cancellation ever arrives there is nothing to release — and
+/// <see cref="StockItem.ReleaseReservation"/> is kept for that conversation.
 /// </para>
 /// </remarks>
 public sealed class OrderPlacedConsumer(
@@ -230,7 +235,7 @@ public sealed class OrderPlacedConsumer(
             var byProduct = items.ToDictionary(item => item.ProductId);
 
             var reservations = new List<StockReservation>(payload.Lines.Count);
-            var reservedLines = new List<StockReservedLine>(payload.Lines.Count);
+            var committedLines = new List<StockCommittedLine>(payload.Lines.Count);
 
             foreach (var line in payload.Lines)
             {
@@ -245,6 +250,13 @@ public sealed class OrderPlacedConsumer(
                 {
                     // Guards before mutation, so a refusal leaves the entity byte-identical.
                     item.Reserve(line.Quantity);
+
+                    // Confirmed in the same transaction. The net effect on the counters is that the
+                    // units leave quantity_on_hand and reserved ends where it started: this is a
+                    // shipment, not a hold. Reserve-then-confirm rather than decrementing directly,
+                    // because both guards live in the entity and reaching past them to move a counter
+                    // would put the invariant in two places.
+                    item.ConfirmReservation(line.Quantity);
                 }
                 catch (InsufficientStockException)
                 {
@@ -253,22 +265,30 @@ public sealed class OrderPlacedConsumer(
                     break;
                 }
 
-                reservations.Add(StockReservation.Create(item.Id, payload.OrderId, line.Quantity));
+                var reservation = StockReservation.Create(item.Id, payload.OrderId, line.Quantity);
+
+                // Through the state machine rather than constructed already-Confirmed: the transition
+                // is strict, so a row that arrived here by any other route throws instead of being
+                // written in a state nothing decided on. Pending is therefore never persisted from
+                // this path, which is the same shape Order.Pending had in Phase 0.
+                reservation.Confirm();
+
+                reservations.Add(reservation);
 
                 // Built from the requested line rather than read back off the reservation, because a
                 // reservation carries the *stock item's* id and the product id lives on StockItem. The
-                // event speaks in product ids: the saga reads Catalog's products, not Stock's internal
+                // event speaks in product ids: Ordering reads Catalog's products, not Stock's internal
                 // rows, and handing it a stock item id would invite a cross-service key.
-                reservedLines.Add(new StockReservedLine(line.ProductId, line.Quantity));
+                committedLines.Add(new StockCommittedLine(line.ProductId, line.Quantity));
             }
 
             if (reason is null)
             {
-                var reserved = new StockReserved(
+                var committed = new StockCommitted(
                     Guid.NewGuid(),
                     payload.OrderId,
                     now,
-                    reservedLines);
+                    committedLines);
 
                 db.InboxMessages.Add(InboxMessage.Create(
                     messageId, StockEventTopology.OrderPlacedRoutingKey, now));
@@ -276,10 +296,10 @@ public sealed class OrderPlacedConsumer(
                 db.StockReservations.AddRange(reservations);
 
                 db.OutboxMessages.Add(OutboxMessage.Create(
-                    reserved.MessageId,
+                    committed.MessageId,
                     StockEventTopology.StockExchange,
-                    StockEventTopology.ReservedRoutingKey,
-                    JsonSerializer.Serialize(reserved, StockMessageJson.Options),
+                    StockEventTopology.CommittedRoutingKey,
+                    JsonSerializer.Serialize(committed, StockMessageJson.Options),
                     traceParent,
                     now));
 

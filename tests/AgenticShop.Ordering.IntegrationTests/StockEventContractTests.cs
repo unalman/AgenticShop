@@ -41,7 +41,7 @@ public sealed class StockEventContractTests
     [Fact]
     public void TheContractReadsAReservedOutcome()
     {
-        var parsed = JsonSerializer.Deserialize<StockReserved>(ReservedPayload, OrderPlaced.JsonOptions);
+        var parsed = JsonSerializer.Deserialize<StockCommitted>(ReservedPayload, OrderPlaced.JsonOptions);
 
         parsed.Should().NotBeNull();
 
@@ -88,7 +88,7 @@ public sealed class StockEventContractTests
             {"message_id":"3f2b8c14-9d47-4e6a-b0f5-1c8a7d2e4b90","order_id":"ef696416-5bf3-450d-a17a-4146423f43ab","occurred_at_utc":"2026-10-23T05:12:44.8123456+00:00","lines":[{"product_id":"6963107d-f9a8-4d2b-9a05-bfd44a3673dc","quantity":2}]}
             """;
 
-        var parsed = JsonSerializer.Deserialize<StockReserved>(snakeCased, OrderPlaced.JsonOptions);
+        var parsed = JsonSerializer.Deserialize<StockCommitted>(snakeCased, OrderPlaced.JsonOptions);
 
         parsed.Should().NotBeNull("unknown fields are ignored rather than rejected, which is its own risk");
 

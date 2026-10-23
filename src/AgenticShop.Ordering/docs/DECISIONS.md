@@ -40,7 +40,7 @@ would leave every order holding stock indefinitely and would make `Reserved` a n
 grows. Settling inside the request is also what makes the confirm-phase problem visible now rather
 than after a queue exists to hide it behind.
 
-**Revisit.** Phase 2 replaces this with `OrderPlaced` → Stock consumes → `StockReserved`, at which
+**Revisit.** Phase 2 replaces this with `OrderPlaced` → Stock consumes → `StockCommitted`, at which
 point the order is written as `Pending` first and a saga drives it.
 
 ## O3 · Statuses `Pending | Confirmed | Failed | PartiallyConfirmed` — **revised 2026-09-24**
@@ -550,7 +550,7 @@ table grows without bound.
 **Added 2026-10-23, Phase 2b-ii.**
 
 **Decision.** `StockOutcomeConsumer` binds `ordering.stock-outcomes` to Stock's exchange on
-`stock.reserved` and `stock.reservation-rejected`, and settles the order the event answers:
+`stock.committed` and `stock.reservation-rejected`, and settles the order the event answers:
 `Pending → Confirmed` on a hold, `Pending → Failed` on a refusal. The transition and an
 `InboxMessage` row commit in one `SaveChangesAsync`. **Not registered in `Program.cs`**, for the same
 reason Stock's consumer is not.
@@ -561,7 +561,7 @@ The increment that registers this consumer also deletes the synchronous reserve 
 `OrderPlaced` emission to before reservation, so there is no state in between where both are live.
 
 **Why the transition is binary.** Stock holds every line of an order or none of them (its D16), so an
-outcome is `StockReserved` or `StockReservationRejected` and never a mixture. **This is why O14's
+outcome is `StockCommitted` or `StockReservationRejected` and never a mixture. **This is why O14's
 confirm-phase policy has no equivalent here.** O14 exists to classify partial outcomes — including the
 "some confirmed and cannot be undone" case that produces `PartiallyConfirmed` — and the event path
 cannot reach that state. `PartiallyConfirmed` stays in the enum and the CHECK constraint because rows
@@ -571,7 +571,7 @@ path is deleted, O14 becomes historical rather than merely unreached.
 **Why the inbox, when it is not what makes redelivery safe.** This is the part worth stating plainly,
 because Stock's inbox *is* load-bearing for correctness and copying its justification across would
 have produced a plausible sentence and a wrong one. Here `TransitionTo` only fires from `Pending`, so
-a redelivered `StockReserved` finds a terminal order and changes nothing — the domain already refuses
+a redelivered `StockCommitted` finds a terminal order and changes nothing — the domain already refuses
 the double settlement.
 
 What the inbox buys is the ability to **distinguish two situations that otherwise look identical**. A
@@ -609,7 +609,7 @@ scheduling machinery; the reservation-expiry worker is Phase 3. Recorded in
 `../../../docs/KNOWN-ISSUES.md`, along with the query that finds such an order.
 
 **Verified.** Full suite **552/552**, Ordering's integration project 94 (87 before this decision). The
-messaging tests run against a real `rabbitmq:4-alpine` container: a published `StockReserved` settles a
+messaging tests run against a real `rabbitmq:4-alpine` container: a published `StockCommitted` settles a
 seeded `Pending` order to `Confirmed` with `UpdatedAtUtc` set and one inbox row; a
 `StockReservationRejected` settles it to `Failed`; a redelivery leaves both the status and the
 timestamp untouched and adds no row. `StockEventContractTests` pins the wire format from the other
@@ -617,7 +617,7 @@ direction — the field names are the ones Stock's own suite asserts its seriali
 services hold independent assertions on one format rather than a shared fixture neither can see.
 
 **What it does not do.** No saga, no compensation, no `OrderPlaced` emission change, no API change, and
-no reconciliation of `StockReserved.Lines` against the order's own lines. `POST /orders` still answers
+no reconciliation of `StockCommitted.Lines` against the order's own lines. `POST /orders` still answers
 201 with a terminal status.
 
 **Revisit.** The next increment: register both consumers, move `OrderPlaced` emission to before

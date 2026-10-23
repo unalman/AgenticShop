@@ -349,7 +349,7 @@ them left the loser deciding from a stale `Pending` reservation and a fresh `Res
 
 **Phase 2 — Asynchronous messaging** ← the inflection point *(in progress)*
 ~~RabbitMQ~~ **done** · ~~outbox~~ **done, producer side** · replace synchronous reservation with
-`OrderPlaced` / `StockReserved` events · saga with compensation · dead-letter queues.
+`OrderPlaced` / `StockCommitted` events · saga with compensation · dead-letter queues.
 
 The broker is in compose's **default** profile rather than behind `full`: it has no host-process
 equivalent and no port to collide with, so hiding it would leave `dotnet watch` with nothing to
@@ -373,7 +373,7 @@ already held by the time the row is written.
 `src/AgenticShop.Ordering/docs/DECISIONS.md` → O19.
 
 **Both consumers now exist and neither is registered.** Stock consumes `OrderPlaced`, holds an order's
-lines or none of them, and answers with `StockReserved` or `StockReservationRejected` through an outbox
+lines or none of them, and answers with `StockCommitted` or `StockReservationRejected` through an outbox
 of its own; Ordering consumes those outcomes and settles the order, `Pending → Confirmed` or
 `Pending → Failed`. Both are tested end to end against a real broker — the test host registers them,
 `Program.cs` does not — so the synchronous reserve is still the only path live and nothing can

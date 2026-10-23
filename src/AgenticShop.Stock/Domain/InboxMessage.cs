@@ -15,7 +15,7 @@ namespace AgenticShop.Stock.Domain;
 /// it looks like it should. That index catches a duplicate only when the first attempt <i>succeeded</i>
 /// and left a reservation row to collide with. A first attempt that was <b>refused</b> writes no
 /// reservation at all, so a redelivery has nothing to conflict against — and if stock arrived in
-/// between, the redelivery now succeeds and publishes <c>StockReserved</c> for an order already
+/// between, the redelivery now succeeds and publishes <c>StockCommitted</c> for an order already
 /// answered with <c>StockReservationRejected</c>. Two contradictory outcomes for one message. The
 /// index also cannot say whether the outcome event was published, only that a hold exists; this row,
 /// written in the same transaction as the hold and the outbox row, is what makes "processed" and

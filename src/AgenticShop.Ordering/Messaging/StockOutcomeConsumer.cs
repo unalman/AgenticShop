@@ -23,7 +23,7 @@ namespace AgenticShop.Ordering.Messaging;
 /// <para>
 /// <b>The transition is binary, and that is a consequence of Stock's design rather than a
 /// simplification here.</b> Stock holds every line of an order or none of them, so an outcome is either
-/// <c>StockReserved</c> or <c>StockReservationRejected</c> and never a mixture. That is why O14's
+/// <c>StockCommitted</c> or <c>StockReservationRejected</c> and never a mixture. That is why O14's
 /// confirm-phase policy table — which existed to classify partial outcomes, including the
 /// "some confirmed and cannot be undone" case that produced <c>PartiallyConfirmed</c> — has no
 /// equivalent on this path. <c>PartiallyConfirmed</c> stays in the vocabulary and in the CHECK
@@ -284,7 +284,7 @@ public sealed class StockOutcomeConsumer(
         orderId = Guid.Empty;
         reserved = false;
 
-        var isReserved = routingKey == StockEventTopology.ReservedRoutingKey;
+        var isReserved = routingKey == StockEventTopology.CommittedRoutingKey;
         var isRejected = routingKey == StockEventTopology.ReservationRejectedRoutingKey;
 
         if (!isReserved && !isRejected)
@@ -310,7 +310,7 @@ public sealed class StockOutcomeConsumer(
         {
             if (isReserved)
             {
-                var payload = JsonSerializer.Deserialize<StockReserved>(body, OrderPlaced.JsonOptions);
+                var payload = JsonSerializer.Deserialize<StockCommitted>(body, OrderPlaced.JsonOptions);
 
                 if (payload is null)
                 {
@@ -440,7 +440,7 @@ public sealed class StockOutcomeConsumer(
 
                 foreach (var routingKey in new[]
                          {
-                             StockEventTopology.ReservedRoutingKey,
+                             StockEventTopology.CommittedRoutingKey,
                              StockEventTopology.ReservationRejectedRoutingKey
                          })
                 {

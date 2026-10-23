@@ -94,11 +94,11 @@ public sealed class OrderPlacedContractTests
     public void TheOutcomesSerialiseAsCamelCaseWithNamedEnums()
     {
         var reserved = JsonSerializer.Serialize(
-            new StockReserved(
+            new StockCommitted(
                 Guid.NewGuid(),
                 Guid.NewGuid(),
                 DateTimeOffset.UtcNow,
-                [new StockReservedLine(Guid.NewGuid(), 3)]),
+                [new StockCommittedLine(Guid.NewGuid(), 3)]),
             StockMessageJson.Options);
 
         reserved.Should().Contain("\"orderId\"").And.Contain("\"lines\"").And.Contain("\"productId\"");
