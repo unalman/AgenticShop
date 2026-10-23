@@ -99,8 +99,8 @@ public sealed class TestHostIsolationTests(OrderingApiFixture fixture)
     public void TheHostRefusesToStartWithoutADownstreamBaseUrl()
     {
         // Ordering is the first service with a required non-connection-string setting. A typed client
-        // with no base address fails on the first outbound call — which is the middle of a placement,
-        // after stock has been reserved — so refusing to start is strictly better.
+        // with no base address fails on the first outbound call — which is the middle of a placement —
+        // so refusing to start is strictly better.
         using var factory = new OrderingApiFactory(fixture.ConnectionString, catalogBaseUrl: string.Empty);
 
         var act = () => _ = factory.Services;
@@ -112,14 +112,15 @@ public sealed class TestHostIsolationTests(OrderingApiFixture fixture)
     [Fact]
     public void TheHostRefusesToStartWithADownstreamBaseUrlThatHasNoScheme()
     {
-        // "localhost:5082" reads as a valid absolute URI — Uri.TryCreate takes "localhost" for the
+        // "localhost:5081" reads as a valid absolute URI — Uri.TryCreate takes "localhost" for the
         // scheme — so the startup check has to require http or https, or a missing scheme would pass
-        // validation and then fail on the first outbound call.
-        using var factory = new OrderingApiFactory(fixture.ConnectionString, stockBaseUrl: "localhost:5082");
+        // validation and then fail on the first outbound call. Asserted against Catalog because it is
+        // the only downstream base URL left; Stock is reached through the broker and has none.
+        using var factory = new OrderingApiFactory(fixture.ConnectionString, catalogBaseUrl: "localhost:5081");
 
         var act = () => _ = factory.Services;
 
         act.Should().Throw<InvalidOperationException>()
-            .WithMessage("*Services:Stock:BaseUrl*");
+            .WithMessage("*Services:Catalog:BaseUrl*");
     }
 }

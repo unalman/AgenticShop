@@ -16,44 +16,33 @@ namespace AgenticShop.Ordering.Errors;
 /// specified once there; <c>OrderingExceptionHandlerTests</c> covers only what is Ordering-specific.
 /// </para>
 /// <para>
-/// Two divergences from the other services, both forced by orchestration, and both expressed
-/// through the shared surface rather than by forking it:
+/// <b>One divergence from the other services</b>, forced by orchestration and expressed through the
+/// shared surface rather than by forking it: a 502 bucket. Catalog and Stock have no dependencies, so
+/// their 5xx means only "this assembly has a bug". Here it also means "we asked and were let down",
+/// which operators triage differently, so it gets its own status rather than sharing 500. An
+/// <i>unexpected</i> 4xx from a downstream service is still a 500 — it means we sent something its
+/// contract does not allow.
 /// </para>
-/// <list type="bullet">
-/// <item><description>
-/// A 502 bucket. Catalog and Stock have no dependencies, so their 5xx means only "this assembly has
-/// a bug". Here it also means "we asked and were let down", which operators triage differently, so
-/// it gets its own status rather than sharing 500. An <i>unexpected</i> 4xx from a downstream
-/// service is still a 500 — it means we sent something its contract does not allow.
-/// </description></item>
-/// <item><description>
-/// An <c>orderId</c> extension, supplied through
-/// <see cref="ExceptionClassification.WithExtension"/>. A failed placement still writes a row, so a
-/// 409 or 502 that names no order leaves the client unable to tell "nothing was created" from
-/// "something was created and is broken" — and that ambiguity is what causes blind retries against
-/// a non-idempotent endpoint.
-/// </description></item>
-/// </list>
+/// <para>
+/// There was a second, and it is worth knowing why it went quiet rather than assuming it is still
+/// load-bearing. An <c>orderId</c> extension, attached through
+/// <see cref="ExceptionClassification.WithExtension"/>, existed because a failed placement used to
+/// write a row — and a 409 or 502 naming no order left the client unable to tell "nothing was created"
+/// from "something was created and is broken", which is the ambiguity that causes blind retries against
+/// a non-idempotent endpoint. <b>Nothing emits it now.</b> A placement fails while resolving against
+/// Catalog, before any row exists, and an order is settled later by <c>StockOutcomeConsumer</c>, which
+/// has no response to attach an extension to. The mechanism stays in Shared deliberately: it is a
+/// general capability of the classification, and the hazard it was built for returns with any path that
+/// writes a row and then fails inside the request.
+/// </para>
 /// </remarks>
 public sealed class OrderingExceptionHandler(ILogger<OrderingExceptionHandler> logger)
     : ProblemDetailsExceptionHandler(logger)
 {
     private const string DownstreamTitle = "Downstream failure.";
 
-    /// <summary>
-    /// Exposed for <c>OrderEndpoints</c>' idempotency replay path, which rebuilds a recorded failure
-    /// without going through this handler and must therefore produce the same titles rather than
-    /// inventing parallel ones.
-    /// </summary>
-    internal const string ConflictFailureTitle = ConflictTitle;
-
-    internal const string DownstreamFailureTitle = DownstreamTitle;
-
     private const string DownstreamDetail =
         "The request could not be completed because a downstream service did not respond.";
-
-    private const string PartiallyConfirmedDetail =
-        "The order was partially confirmed and requires reconciliation.";
 
     protected override string ConcurrencyDetail =>
         "The order was changed by another request. Reload it and try again.";
@@ -73,27 +62,6 @@ public sealed class OrderingExceptionHandler(ILogger<OrderingExceptionHandler> l
         // message reaches the client. The offending codes are on the exception's typed property and
         // in the log line, where the correlation id ties them to this response.
         MixedCurrencyException => new(StatusCodes.Status400BadRequest, BadRequestTitle, null),
-
-        // Stock refused a line, so every hold taken was released and the order was written as
-        // Failed. The order id goes back with it: the row exists and is queryable, and without the
-        // id the client cannot reach it.
-        StockUnavailableException noStock => ExceptionClassification.WithExtension(
-            StatusCodes.Status409Conflict,
-            ConflictTitle,
-            $"Not enough stock is available for product {noStock.ProductId}.",
-            "orderId",
-            noStock.OrderId),
-
-        // Placement reached a terminal state that is not Confirmed because a dependency failed. The
-        // row is already written, so the id is returned with the failure.
-        OrderPlacementIncompleteException incomplete => ExceptionClassification.WithExtension(
-            StatusCodes.Status502BadGateway,
-            DownstreamTitle,
-            incomplete.Status == OrderStatus.PartiallyConfirmed
-                ? PartiallyConfirmedDetail
-                : DownstreamDetail,
-            "orderId",
-            incomplete.OrderId),
 
         // Another request holds this key and has not recorded an outcome yet, so there is nothing to
         // replay. A 409 rather than a 425 or a 503: the request is well-formed and conflicts with

@@ -208,12 +208,12 @@ services:
       # DEVELOPMENT ONLY placeholder password, the same published value as .env.example.
       ConnectionStrings__Ordering: "Host=db;Port=5432;Database=agenticshop_ordering;Username=ordering_svc;Password=${ORDERING_DB_PASSWORD:?create a .env file from .env.example}"
 
-      # Compose DNS names and port 8080 — the port inside the downstream container, not the 5081 and
-      # 5082 published on the host, which are unreachable from here. These are the two keys
-      # Program.cs validates at startup, so a typo fails the boot instead of failing mid-placement
-      # after stock has been reserved.
+      # Compose DNS name and port 8080 — the port inside the downstream container, not the 5081
+      # published on the host, which is unreachable from here. This is the one base-URL key
+      # Program.cs validates at startup, so a typo fails the boot instead of failing mid-placement.
+      # There is no Services__Stock__BaseUrl: Ordering reaches Stock through the broker, so it has no
+      # HTTP address to configure and startup does not require one.
       Services__Catalog__BaseUrl: "http://catalog:8080"
-      Services__Stock__BaseUrl: "http://stock:8080"
 
       # Compose DNS name `rabbitmq`, not localhost: inside the container localhost is the container
       # itself. Credentials are substituted rather than written literally so

@@ -56,11 +56,6 @@ builder.Services
         client.BaseAddress = new Uri(RequireServiceBaseUrl(builder.Configuration, "Catalog")))
     .AddDownstreamResilience();
 
-builder.Services
-    .AddHttpClient<IStockClient, StockClient>(client =>
-        client.BaseAddress = new Uri(RequireServiceBaseUrl(builder.Configuration, "Stock")))
-    .AddDownstreamResilience();
-
 // The one collaborator the "no service layer" rule was written to allow; see its remarks and
 // docs/DECISIONS.md. Scoped, so it shares the request's DbContext and therefore its single
 // SaveChangesAsync.
@@ -131,10 +126,11 @@ var app = builder.Build();
 RequireConnectionString(app.Configuration);
 
 // Same reasoning, and it is not covered by the check above: a typed client with no base address
-// fails on the first outbound call, which is the middle of a placement, after stock has been
-// reserved. Refusing to start is strictly better than compensating for a configuration typo.
+// fails on the first outbound call, which is the middle of a placement. Refusing to start is
+// strictly better than compensating for a configuration typo. Catalog is the only downstream this
+// service calls over HTTP now — Stock is reached through the broker, so it has no base URL to
+// validate and none is required.
 RequireServiceBaseUrl(app.Configuration, "Catalog");
-RequireServiceBaseUrl(app.Configuration, "Stock");
 
 // Same reasoning, and it is the publisher's turn to be covered: a missing or malformed broker URL
 // would otherwise surface as a warning from a background loop every five seconds rather than as a

@@ -9,7 +9,7 @@ using Polly.Timeout;
 namespace AgenticShop.Ordering.UnitTests;
 
 /// <summary>
-/// The resilience pipeline on the typed clients: what gets retried, what must not be, and how a
+/// The resilience pipeline on the typed client: what gets retried, what does not, and how a
 /// pipeline-level failure is still classified as a dependency failure.
 /// </summary>
 /// <remarks>
@@ -20,15 +20,18 @@ namespace AgenticShop.Ordering.UnitTests;
 /// second.
 /// </para>
 /// <para>
-/// The integration suite cannot cover this. It replaces <c>ICatalogClient</c> and <c>IStockClient</c>
-/// with fakes, which sits above the HTTP pipeline entirely — so it still proves the wiring in
-/// <c>Program.cs</c> builds a host, and nothing else here.
+/// The integration suite cannot cover this. It replaces <c>ICatalogClient</c> with a fake, which sits
+/// above the HTTP pipeline entirely — so it still proves the wiring in <c>Program.cs</c> builds a
+/// host, and nothing else here.
 /// </para>
 /// <para>
-/// There used to be a test here asserting that every retry attempt carried the ambient correlation
-/// id. It went with <c>CorrelationIdPropagatingHandler</c>: trace context on an outbound call is now
-/// the HttpClient instrumentation's job, so there is no code of ours left to assert. Testing it here
-/// would mean testing OpenTelemetry.
+/// Two tests that used to live here went with code rather than with coverage. One asserted that every
+/// retry attempt carried the ambient correlation id; it went with
+/// <c>CorrelationIdPropagatingHandler</c>, because trace context on an outbound call is now the
+/// HttpClient instrumentation's job and testing it here would mean testing OpenTelemetry. The other
+/// asserted the per-request retry exemption; it went with the synchronous reserve call that was the
+/// only thing needing one. The reasoning behind that exemption still binds a future outbound write
+/// and is recorded in <see cref="DownstreamResilience"/> and <c>docs/DECISIONS.md</c> → O18.
 /// </para>
 /// </remarks>
 public class DownstreamResilienceTests
@@ -87,55 +90,6 @@ public class DownstreamResilienceTests
 
         response.StatusCode.Should().Be(status);
         downstream.Attempts.Should().Be(1);
-    }
-
-    [Fact]
-    public async Task DoesNotRetryACallMarkedNotRetryable()
-    {
-        // The reserve case. A retry here is not merely wasteful: if the first attempt committed and
-        // only its response was lost, Stock answers the retry 409 from its unique index, the client
-        // reads that as "cannot be held", and the hold from the first attempt is stranded while the
-        // order is reported out of stock.
-        var downstream = new ScriptedHandler(_ => Respond(HttpStatusCode.ServiceUnavailable));
-
-        var request = new HttpRequestMessage(HttpMethod.Post, "api/v1/stock/1/reservations");
-        request.Options.Set(DownstreamResilience.NotRetryable, true);
-
-        await SendAsync(downstream, request);
-
-        downstream.Attempts.Should().Be(1);
-    }
-
-    [Fact]
-    public async Task RetriesTheSameFailureWhenTheCallIsNotMarked()
-    {
-        // The control for the test above. Without it, "the marked call was not retried" would also
-        // pass if retry were broken or never wired, which is the failure this policy exists to avoid.
-        var downstream = new ScriptedHandler(_ => Respond(HttpStatusCode.ServiceUnavailable));
-
-        await SendAsync(downstream, new HttpRequestMessage(HttpMethod.Post, "api/v1/reservations/1/confirm"));
-
-        downstream.Attempts.Should().Be(1 + DownstreamResilience.MaxRetryAttempts);
-    }
-
-    [Fact]
-    public async Task ReserveMarksItsRequestAsNotRetryable()
-    {
-        // The seam the two tests above cannot see. Deleting one line in StockClient would leave the
-        // pipeline correct and the reserve path unsafe, with every other test still green.
-        var downstream = new ScriptedHandler(_ => Respond(
-            HttpStatusCode.Created,
-            """{"id":"4c1e7a5a-2b0b-4b1a-9a3a-2f0d5c9b8a71","productId":"8f1b0a63-6b6a-4d2a-9a10-0b6d2c4f7a11","quantity":2,"status":"Pending"}"""));
-
-        var client = new StockClient(CreateBareClient(downstream));
-
-        await client.ReserveAsync(Guid.NewGuid(), Guid.NewGuid(), 2, CancellationToken.None);
-
-        downstream.LastRequest!.Options
-            .TryGetValue(DownstreamResilience.NotRetryable, out var marked)
-            .Should().BeTrue("ReserveAsync must mark the request");
-
-        marked.Should().BeTrue();
     }
 
     [Fact]

@@ -7,13 +7,14 @@ using FluentAssertions;
 namespace AgenticShop.Ordering.IntegrationTests;
 
 /// <summary>
-/// Everything that can go wrong before a single hold is settled: an unorderable product, a
-/// mixed-currency order, a refused reserve, and a downstream that disappears mid-reservation.
+/// Everything that can go wrong during a placement: an unorderable product, a mixed-currency order,
+/// and a Catalog that disappears while lines are being resolved.
 /// </summary>
 /// <remarks>
-/// These are the cases decision B covers — fail fast, release what was held, fail the order. The
-/// confirm-phase cases, which cannot be undone so cleanly, are in
-/// <see cref="ConfirmPhaseFailureTests"/>.
+/// All of them happen while resolving lines against Catalog, before the idempotency key is claimed,
+/// so every one writes nothing — no order row and no queued event. Stock cannot fail a placement any
+/// more, because a placement does not call it: a refusal arrives later as an outcome and is
+/// <see cref="StockOutcomeConsumerTests"/>' subject.
 /// </remarks>
 [Collection("Ordering API")]
 public sealed class PlacementFailureTests(OrderingApiFixture fixture) : OrderApiTestBase(fixture)
@@ -32,7 +33,7 @@ public sealed class PlacementFailureTests(OrderingApiFixture fixture) : OrderApi
         problem.Detail.Should().Be($"Product {unknown} cannot be ordered.");
         problem.Extensions.Should().NotContainKey("orderId", "nothing was reserved, so no order was written");
 
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0);
+        (await ReadAllOutboxMessagesAsync()).Should().BeEmpty();
         (await ReadAllOrdersAsync()).Should().BeEmpty();
     }
 
@@ -47,7 +48,7 @@ public sealed class PlacementFailureTests(OrderingApiFixture fixture) : OrderApi
         var response = await PlaceAsync(OrderWith((deactivated, 1)));
 
         response.StatusCode.Should().Be(HttpStatusCode.Conflict);
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0);
+        (await ReadAllOutboxMessagesAsync()).Should().BeEmpty();
         (await ReadAllOrdersAsync()).Should().BeEmpty();
     }
 
@@ -74,7 +75,7 @@ public sealed class PlacementFailureTests(OrderingApiFixture fixture) : OrderApi
         var raw = await response.Content.ReadAsStringAsync();
         raw.Should().NotContain("USD").And.NotContain("EUR");
 
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0);
+        (await ReadAllOutboxMessagesAsync()).Should().BeEmpty();
         (await ReadAllOrdersAsync()).Should().BeEmpty();
     }
 
@@ -87,8 +88,8 @@ public sealed class PlacementFailureTests(OrderingApiFixture fixture) : OrderApi
         await PlaceAsync(OrderWith((known, 1), (unknown, 1)));
 
         Catalog.Requested.Should().Equal(known, unknown);
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0,
-            "nothing is reserved until every line has been resolved");
+        (await ReadAllOutboxMessagesAsync()).Should().BeEmpty(
+            "nothing is queued until every line has been resolved");
     }
 
     // Five tests lived here that drove Stock failures through a placement: a refused line releasing
@@ -119,7 +120,7 @@ public sealed class PlacementFailureTests(OrderingApiFixture fixture) : OrderApi
         problem.Detail.Should().NotContain("Catalog", "naming a dependency discloses internal topology");
         problem.Extensions.Should().NotContainKey("orderId", "nothing was held, so nothing was written");
 
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0);
+        (await ReadAllOutboxMessagesAsync()).Should().BeEmpty();
         (await ReadAllOrdersAsync()).Should().BeEmpty();
     }
 

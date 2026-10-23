@@ -60,29 +60,28 @@ public sealed class ServiceBoundaryTests(OrderingApiFixture fixture)
             .ToList();
 
         loaded.Should().BeEmpty(
-            "Ordering declares its own CatalogProduct and StockReservationSnapshot; there is no shared " +
-            "contract assembly and must not be one");
+            "Ordering declares its own CatalogProduct; there is no shared contract assembly and must " +
+            "not be one");
     }
 
     [Fact]
-    public void BothClientSeamsAreRegistered()
+    public void TheClientSeamIsRegistered()
     {
+        // One seam, not two: Stock is reached through the broker now, so Catalog is the only
+        // downstream this service calls over HTTP.
         using var scope = fixture.CreateScope();
 
         scope.ServiceProvider.GetService<ICatalogClient>().Should().NotBeNull();
-        scope.ServiceProvider.GetService<IStockClient>().Should().NotBeNull();
     }
 
     [Fact]
     public void TheSeamIsTheInterfaceNotTheConcreteClient()
     {
-        // What makes the clients fakeable, and what a broker-based implementation would swap into in
-        // Phase 2. If the registration were keyed on CatalogClient and StockClient, replacing them
-        // would need a different mechanism and the tests would be reaching into the HTTP stack.
+        // What makes the client fakeable. If the registration were keyed on CatalogClient, replacing
+        // it would need a different mechanism and the tests would be reaching into the HTTP stack.
         using var scope = fixture.CreateScope();
 
         scope.ServiceProvider.GetRequiredService<ICatalogClient>().Should().BeSameAs(fixture.Catalog);
-        scope.ServiceProvider.GetRequiredService<IStockClient>().Should().BeSameAs(fixture.Stock);
     }
 
     [Fact]

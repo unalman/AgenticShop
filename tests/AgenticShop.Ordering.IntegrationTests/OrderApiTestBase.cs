@@ -33,8 +33,6 @@ public abstract class OrderApiTestBase(OrderingApiFixture fixture) : IAsyncLifet
 
     protected FakeCatalogClient Catalog => Fixture.Catalog;
 
-    protected FakeStockClient Stock => Fixture.Stock;
-
     public Task InitializeAsync() => Fixture.ResetAsync();
 
     public Task DisposeAsync() => Task.CompletedTask;
@@ -158,17 +156,6 @@ public abstract class OrderApiTestBase(OrderingApiFixture fixture) : IAsyncLifet
         response.Content.Headers.ContentType?.MediaType.Should().Be("application/problem+json");
 
         return (await response.Content.ReadFromJsonAsync<ProblemDetails>())!;
-    }
-
-    /// <summary>
-    /// The order id a failed placement echoes back. Without it a client cannot reach the row that was
-    /// written, and cannot tell "nothing was created" from "something was created and is broken".
-    /// </summary>
-    protected static Guid OrderIdFrom(ProblemDetails problem)
-    {
-        problem.Extensions.Should().ContainKey("orderId");
-
-        return Guid.Parse(problem.Extensions["orderId"]!.ToString()!);
     }
 
     protected async Task<Order?> ReadOrderAsync(Guid id)

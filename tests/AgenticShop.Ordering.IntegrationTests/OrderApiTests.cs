@@ -51,14 +51,11 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
         body.Lines[0].LineTotal.Should().Be(25.00m);
         body.Lines[0].ProductName.Should().Be("Blue Widget");
 
-        // Stock is not called at all, and that is the whole change. Asserted on the fake rather than
-        // inferred from the status code, because a test that only checked for 202 would still pass if
-        // the synchronous call were added back — and the failure that would cause is a double
-        // reservation, not a wrong status.
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0);
-        Stock.CountCalls(FakeStockClient.ConfirmOperation).Should().Be(0);
-        Stock.CountCalls(FakeStockClient.ReleaseOperation).Should().Be(0);
-        Stock.Reservations.Should().BeEmpty();
+        // One placement, one queued event. This used to assert that a Stock fake was never called;
+        // there is no fake to call now, because a placement reaches Stock only through the broker and
+        // ServiceBoundaryTests pins Catalog as the single HTTP seam. What is left to prove is the
+        // positive half: the placement did the one piece of work it owes, exactly once.
+        (await ReadAllOutboxMessagesAsync()).Should().ContainSingle();
     }
 
     [Fact]
@@ -254,7 +251,7 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
 
         problem.Errors.Should().ContainKey("Lines");
         Catalog.Requested.Should().BeEmpty("rejected at the boundary, before any outbound call");
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0);
+        (await ReadAllOutboxMessagesAsync()).Should().BeEmpty();
     }
 
     [Fact]
@@ -275,7 +272,7 @@ public sealed class OrderApiTests(OrderingApiFixture fixture) : OrderApiTestBase
         problem.Errors.Should().ContainKey("Lines[0].Quantity");
         problem.Errors["Lines[0].Quantity"].Should().NotBeEmpty();
 
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0);
+        (await ReadAllOutboxMessagesAsync()).Should().BeEmpty();
     }
 
     [Fact]

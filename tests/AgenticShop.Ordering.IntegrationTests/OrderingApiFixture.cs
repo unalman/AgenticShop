@@ -9,21 +9,26 @@ using Testcontainers.PostgreSql;
 namespace AgenticShop.Ordering.IntegrationTests;
 
 /// <summary>
-/// One real PostgreSQL container per test run, shared by every test in the collection, with the two
-/// downstream services faked at the interface seam.
+/// One real PostgreSQL container per test run, shared by every test in the collection, with the
+/// downstream service faked at the interface seam.
 /// </summary>
 /// <remarks>
 /// <para>
-/// The database is real and the clients are not, and that split is the point. Only PostgreSQL can
+/// The database is real and the client is not, and that split is the point. Only PostgreSQL can
 /// raise the 23505 behind a duplicate order number, enforce the CHECK constraints, apply the xmin
-/// token or translate the order/lines join. Only a fake can make Stock refuse the second line of a
-/// three-line order, or time out after applying a confirm — the two behaviours the whole
-/// confirm-phase policy exists for, and neither of which can be provoked deterministically against a
-/// live host without a proxy in front of it.
+/// token or translate the order/lines join. Only a fake can make Catalog refuse a product, return a
+/// price in a second currency, or time out mid-placement — behaviours a test has to provoke
+/// deterministically, which a live host cannot do without a proxy in front of it.
 /// </para>
 /// <para>
 /// Faking here is sanctioned rather than a shortcut: <c>docs/ROADMAP.md</c> names the typed-client
 /// interface "the seam the integration tests fake". EF Core is never mocked.
+/// </para>
+/// <para>
+/// Stock is not faked, because nothing calls it: since the flip a placement publishes
+/// <c>OrderPlaced</c> and stops, so there is no synchronous Stock call to script. The fixture's
+/// broker is unresolvable for the same reason — see <see cref="OrderingMessagingFixture"/> for the
+/// suite that wants a real one on the other end.
 /// </para>
 /// </remarks>
 public sealed class OrderingApiFixture : IAsyncLifetime
@@ -44,9 +49,6 @@ public sealed class OrderingApiFixture : IAsyncLifetime
 
     /// <summary>Stand-in for Catalog. Configured per test; reset by <see cref="ResetAsync"/>.</summary>
     public FakeCatalogClient Catalog { get; } = new();
-
-    /// <summary>Stand-in for Stock, holding real reservation state so reconciliation is honest.</summary>
-    public FakeStockClient Stock { get; } = new();
 
     public HttpClient Client { get; private set; } = null!;
 
@@ -69,17 +71,15 @@ public sealed class OrderingApiFixture : IAsyncLifetime
         {
             services.RemoveAll<ICatalogClient>();
             services.AddSingleton<ICatalogClient>(Catalog);
-            services.RemoveAll<IStockClient>();
-            services.AddSingleton<IStockClient>(Stock);
         });
 
         Client = _factory.CreateClient();
     }
 
     /// <summary>
-    /// Tests share a database and a pair of fakes, so each one starts from empty rather than
-    /// depending on execution order. Lines go first even though the foreign key cascades, so the
-    /// reset does not depend on that behaviour staying.
+    /// Tests share a database and a fake, so each one starts from empty rather than depending on
+    /// execution order. Lines go first even though the foreign key cascades, so the reset does not
+    /// depend on that behaviour staying.
     /// </summary>
     public async Task ResetAsync()
     {
@@ -100,7 +100,6 @@ public sealed class OrderingApiFixture : IAsyncLifetime
         await db.Orders.ExecuteDeleteAsync();
 
         Catalog.Reset();
-        Stock.Reset();
     }
 
     /// <summary>

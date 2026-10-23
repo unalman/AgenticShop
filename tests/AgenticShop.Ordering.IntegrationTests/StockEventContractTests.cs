@@ -16,14 +16,16 @@ namespace AgenticShop.Ordering.IntegrationTests;
 /// that silently reads an empty order rather than an exception.
 /// </para>
 /// <para>
-/// <b>These payloads were not captured from a live run, and the reason matters.</b> Stock's consumer
-/// is built but not registered, so nothing in the compose stack produces a real outcome event to
-/// capture. Instead the field names below are the ones Stock's own suite asserts its serializer
-/// produces: <c>TheOutcomesSerialiseAsCamelCaseWithNamedEnums</c> pins <c>orderId</c>, <c>lines</c>,
-/// <c>productId</c> and <c>"reason":"InsufficientStock"</c>, and asserts no PascalCase form appears.
-/// That makes this two independent assertions on one wire format rather than one shared fixture — the
-/// same arrangement that keeps the duplicated PostgreSQL image tag honest. If either side drifts, one
-/// of the two tests fails, and it fails naming the field.
+/// <b>These payloads are hand-written rather than captured from a live run, and that is now a choice
+/// rather than a constraint.</b> They were written when Stock's consumer was built but not registered,
+/// so nothing in the compose stack produced a real outcome event to capture. The consumer is registered
+/// now and a real one could be captured. The field names below are still the ones Stock's own suite
+/// asserts its serializer produces: <c>TheOutcomesSerialiseAsCamelCaseWithNamedEnums</c> pins
+/// <c>orderId</c>, <c>lines</c>, <c>productId</c> and <c>"reason":"InsufficientStock"</c>, and asserts
+/// no PascalCase form appears. Keeping the two independent is the point — a captured payload would be
+/// one shared fixture both sides read, which would pass no matter how the format drifted, exactly as a
+/// shared PostgreSQL image tag would. Two assertions on one wire format means a drift fails one of them
+/// naming the field.
 /// </para>
 /// </remarks>
 public sealed class StockEventContractTests

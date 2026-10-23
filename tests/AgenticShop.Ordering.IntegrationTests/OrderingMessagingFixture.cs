@@ -54,9 +54,6 @@ public sealed class OrderingMessagingFixture : IAsyncLifetime
     /// <summary>Stand-in for Catalog, reset per test.</summary>
     public FakeCatalogClient Catalog { get; } = new();
 
-    /// <summary>Stand-in for Stock, reset per test.</summary>
-    public FakeStockClient Stock { get; } = new();
-
     public HttpClient Client { get; private set; } = null!;
 
     /// <summary>The broker the host publishes to and the test consumes from — the same one.</summary>
@@ -77,8 +74,6 @@ public sealed class OrderingMessagingFixture : IAsyncLifetime
             {
                 services.RemoveAll<ICatalogClient>();
                 services.AddSingleton<ICatalogClient>(Catalog);
-                services.RemoveAll<IStockClient>();
-                services.AddSingleton<IStockClient>(Stock);
 
                 // The one hosted service Program.cs deliberately does not register yet. Everything
                 // else the host runs — including the outbox publisher — comes from Program.cs, so
@@ -168,19 +163,19 @@ public sealed class OrderingMessagingFixture : IAsyncLifetime
         await channel.QueuePurgeAsync(StockEventTopology.OutcomeQueue);
 
         Catalog.Reset();
-        Stock.Reset();
     }
 
     /// <summary>
     /// Writes a <c>Pending</c> order straight to the database, bypassing the endpoint.
     /// </summary>
     /// <remarks>
-    /// Necessary rather than convenient. <c>POST /orders</c> still runs the synchronous path, which
-    /// settles an order before it saves one — <c>OrderPlacer.WriteAsync</c> throws on
-    /// <see cref="OrderStatus.Pending"/> — so the API cannot produce the state this consumer acts on.
-    /// Seeding through it would mean testing a consumer against a state production cannot reach. This
-    /// seeds the state it will actually see once the flip lands, and the order goes through
-    /// <see cref="Order.Create"/> so the domain's own guards still run.
+    /// Convenient rather than necessary, and it used to be the other way round: before the flip
+    /// <c>POST /orders</c> settled an order before saving it, so the API could not produce a
+    /// <c>Pending</c> row at all. It can now. Seeding directly is still what these tests want, because
+    /// it isolates the consumer under test from the placement path — no Catalog fake to script and no
+    /// <c>OrderPlaced</c> published into a broker this fixture has no Stock on the other end of. The
+    /// order goes through <see cref="Order.Create"/>, so the domain's own guards still run and the row
+    /// is shaped exactly as the endpoint would have written it.
     /// </remarks>
     public async Task<Order> SeedPendingOrderAsync(
         Guid productId,

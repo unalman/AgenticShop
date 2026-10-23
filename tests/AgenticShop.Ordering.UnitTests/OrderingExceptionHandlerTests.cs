@@ -79,63 +79,17 @@ public class OrderingExceptionHandlerTests
     }
 
     [Fact]
-    public async Task RefusedStock_Returns409AndEchoesTheOrderId()
-    {
-        var productId = Guid.NewGuid();
-        var orderId = Guid.NewGuid();
-
-        var outcome = await HandleAsync(new StockUnavailableException(productId, orderId));
-
-        outcome.Status.Should().Be(409);
-        outcome.Problem!.Detail.Should().Be($"Not enough stock is available for product {productId}.");
-
-        // The row was written as Failed, so a client that cannot see the id cannot query it — and a
-        // blind retry against a non-idempotent endpoint is exactly what that ambiguity causes.
-        outcome.Problem.OrderId.Should().Be(orderId);
-    }
-
-    [Fact]
-    public async Task AnOrderFailedByADownstreamFault_Returns502WithTheOrderId()
-    {
-        var orderId = Guid.NewGuid();
-
-        var outcome = await HandleAsync(
-            new OrderPlacementIncompleteException(orderId, OrderStatus.Failed));
-
-        outcome.Status.Should().Be(502);
-        outcome.Problem!.Title.Should().Be("Downstream failure.");
-        outcome.Problem.Detail.Should().Be(
-            "The request could not be completed because a downstream service did not respond.");
-        outcome.Problem.OrderId.Should().Be(orderId);
-    }
-
-    [Fact]
-    public async Task APartiallyConfirmedOrder_Returns502SayingReconciliationIsRequired()
-    {
-        // The status is the whole point of the fourth value: a body that said only "failed" would
-        // invite a re-order that ships the already-confirmed lines a second time.
-        var orderId = Guid.NewGuid();
-
-        var outcome = await HandleAsync(
-            new OrderPlacementIncompleteException(orderId, OrderStatus.PartiallyConfirmed));
-
-        outcome.Status.Should().Be(502);
-        outcome.Problem!.Detail.Should().Be("The order was partially confirmed and requires reconciliation.");
-        outcome.Problem.OrderId.Should().Be(orderId);
-    }
-
-    [Fact]
     public async Task ADownstreamFailure_DoesNotNameTheServiceThatFailed()
     {
         // The service name is typed onto the exception for the log line and must stop there: naming
         // our dependencies in a response body discloses internal topology to any caller.
         var outcome = await HandleAsync(
-            new DownstreamServiceException("Stock", "ConfirmAsync", statusCode: 503, innerException: null));
+            new DownstreamServiceException("Catalog", "GetProductAsync", statusCode: 503, innerException: null));
 
         outcome.Status.Should().Be(502);
-        outcome.Problem!.Detail.Should().NotContain("Stock");
-        outcome.Problem.Detail.Should().NotContain("ConfirmAsync");
-        outcome.RawBody.Should().NotContain("Stock");
+        outcome.Problem!.Detail.Should().NotContain("Catalog");
+        outcome.Problem.Detail.Should().NotContain("GetProductAsync");
+        outcome.RawBody.Should().NotContain("Catalog");
         outcome.Problem.OrderId.Should().BeNull("nothing was written: Catalog failed before any hold");
     }
 

@@ -75,9 +75,6 @@ public sealed class OrderIdempotencyTests(OrderingApiFixture fixture) : OrderApi
         // status is written for; StockOutcomeConsumerTests covers the settled half, where the same key
         // replays a 200.
         secondBody.Status.Should().Be(nameof(OrderStatus.Pending));
-
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should()
-            .Be(0, "Stock is not called during a placement at all any more");
     }
 
     // Two tests lived here: ARepeatedKeyAfterAStockRefusalReplaysThe409WithTheSameOrderId and
@@ -162,7 +159,7 @@ public sealed class OrderIdempotencyTests(OrderingApiFixture fixture) : OrderApi
 
         // Fail closed: the request was refused, so nothing was placed and no stock was held.
         (await ReadAllOrdersAsync()).Should().BeEmpty();
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0);
+        (await ReadAllOutboxMessagesAsync()).Should().BeEmpty();
     }
 
     [Fact]
@@ -201,7 +198,7 @@ public sealed class OrderIdempotencyTests(OrderingApiFixture fixture) : OrderApi
 
         (await ReadAllOrdersAsync()).Should().BeEmpty();
         (await ReadAllIdempotencyKeysAsync()).Should().BeEmpty();
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0);
+        (await ReadAllOutboxMessagesAsync()).Should().BeEmpty();
     }
 
     [Theory]
@@ -217,7 +214,7 @@ public sealed class OrderIdempotencyTests(OrderingApiFixture fixture) : OrderApi
 
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest, because);
         (await ReadAllOrdersAsync()).Should().BeEmpty();
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0);
+        (await ReadAllOutboxMessagesAsync()).Should().BeEmpty();
     }
 
     [Theory]
@@ -240,7 +237,7 @@ public sealed class OrderIdempotencyTests(OrderingApiFixture fixture) : OrderApi
         // before there is a request. OrderIdempotencyKeyTests covers that character directly.
         response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
         (await ReadAllOrdersAsync()).Should().BeEmpty();
-        Stock.CountCalls(FakeStockClient.ReserveOperation).Should().Be(0);
+        (await ReadAllOutboxMessagesAsync()).Should().BeEmpty();
     }
 
     [Theory]

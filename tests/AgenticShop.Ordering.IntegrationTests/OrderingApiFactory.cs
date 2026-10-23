@@ -8,7 +8,7 @@ namespace AgenticShop.Ordering.IntegrationTests;
 
 /// <summary>
 /// Boots the real Ordering API in-process, overriding the environment, the connection string and
-/// the two downstream clients.
+/// the downstream client.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -18,28 +18,26 @@ namespace AgenticShop.Ordering.IntegrationTests;
 /// exist.
 /// </para>
 /// <para>
-/// The downstream base addresses point at <c>.invalid</c>, a TLD RFC 2606 reserves so it can never
-/// resolve. The real clients are replaced, so nothing should ever dial them; if a replacement ever
-/// stops applying, a test fails on an unresolvable host instead of quietly writing to a Catalog or
-/// Stock running on this machine. Program.cs validates both URLs at startup, so they have to be
-/// present and absolute even though they are never used.
+/// The downstream base address points at <c>.invalid</c>, a TLD RFC 2606 reserves so it can never
+/// resolve. The real client is replaced, so nothing should ever dial it; if a replacement ever
+/// stops applying, a test fails on an unresolvable host instead of quietly writing to a Catalog
+/// running on this machine. Program.cs validates the URL at startup, so it has to be present and
+/// absolute even though it is never used.
 /// </para>
 /// </remarks>
 internal sealed class OrderingApiFactory(
     string connectionString,
     Action<IServiceCollection>? configureServices = null,
     string catalogBaseUrl = OrderingApiFactory.CatalogBaseUrl,
-    string stockBaseUrl = OrderingApiFactory.StockBaseUrl,
     string brokerUrl = OrderingApiFactory.BrokerUrl) : WebApplicationFactory<Program>
 {
     /// <summary>The environment the suite requires; see remarks.</summary>
     internal const string TestEnvironmentName = "Development";
 
     internal const string CatalogBaseUrl = "http://catalog.invalid";
-    internal const string StockBaseUrl = "http://stock.invalid";
 
     /// <summary>
-    /// Unresolvable for the same reason the two base addresses are, and it has to be present at all
+    /// Unresolvable for the same reason the base address is, and it has to be present at all
     /// because Program.cs validates the broker URL at startup. Nothing in the suite should reach a
     /// real broker by accident; the one test that wants a real one — the outbox publisher — supplies
     /// its own and starts a container for it.
@@ -58,7 +56,6 @@ internal sealed class OrderingApiFactory(
             {
                 ["ConnectionStrings:Ordering"] = connectionString,
                 ["Services:Catalog:BaseUrl"] = catalogBaseUrl,
-                ["Services:Stock:BaseUrl"] = stockBaseUrl,
                 ["RabbitMq:Url"] = brokerUrl
             }));
 

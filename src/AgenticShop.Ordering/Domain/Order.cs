@@ -15,15 +15,15 @@ namespace AgenticShop.Ordering.Domain;
 /// number needs no sequence.
 /// </para>
 /// <para>
-/// <b>An order is write-once in Phase 0.</b> The status is decided before the single
-/// <c>SaveChangesAsync</c>, so <see cref="PlacedAtUtc"/> is the only timestamp and there is
-/// deliberately no <c>UpdatedAtUtc</c> — a column that could only ever equal it would imply an
-/// update path that does not exist. Phase 2's saga adds both the path and the column.
+/// <b>An order is written once and settled once.</b> A placement writes it as <c>Pending</c> in one
+/// <c>SaveChangesAsync</c>, and the outcome consumer updates it to <c>Confirmed</c> or <c>Failed</c>.
+/// It used to be write-once with the status decided before the save; Phase 2 split that, which is why
+/// <see cref="UpdatedAtUtc"/> exists and is nullable — its own remarks carry the reasoning.
 /// </para>
 /// <para>
-/// For the same reason the <c>xmin</c> token is currently inert: nothing issues an UPDATE against
-/// this row. It is declared anyway, because optimistic concurrency is mandatory on every entity
-/// and Phase 2 will need it.
+/// For the same reason the <c>xmin</c> token is no longer inert: the settle is an UPDATE, so two
+/// deliveries racing on one row is a real conflict rather than a hypothetical one. It is declared on
+/// every entity regardless, because optimistic concurrency is mandatory here.
 /// </para>
 /// </remarks>
 public class Order
